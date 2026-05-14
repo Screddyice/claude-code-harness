@@ -1,0 +1,56 @@
+{
+  "_comment": "Example user-level ~/.claude/settings.json. Copy to ~/.claude/settings.json and adjust paths. The 'allow' list is intentionally minimal here — your local file will accumulate command-specific allowlist entries over time as you grant permissions.",
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(claude --version)"
+    ],
+    "defaultMode": "bypassPermissions"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/scripts/auto-init-harness.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "$HOME/.claude/statusline.sh"
+  },
+  "enabledPlugins": {
+    "claude-mem@thedotmack": true,
+    "superpowers@claude-plugins-official": true,
+    "holyclaude@screddy-local": true,
+    "github@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "playwright@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": true,
+    "deep-research@daymade-skills": true,
+    "swift-lsp@claude-plugins-official": true
+  },
+  "extraKnownMarketplaces": {
+    "screddy-local": {
+      "source": {
+        "source": "directory",
+        "path": "$HOME/projects/local-marketplaces/screddy-local"
+      },
+      "autoUpdate": true
+    },
+    "daymade-skills": {
+      "source": {
+        "source": "github",
+        "repo": "daymade/claude-code-skills"
+      }
+    }
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark",
+  "agentPushNotifEnabled": true
+}

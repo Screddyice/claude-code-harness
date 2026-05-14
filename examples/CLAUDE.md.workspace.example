@@ -1,0 +1,188 @@
+# Workspace CLAUDE.md — Example
+
+This file is a **template** for a multi-company workspace directory (e.g.
+`~/projects/`). Replace `<COMPANY_A>`, `<COMPANY_B>`, `<COMPANY_C>` with your own
+organizations.
+
+## Workspace overview
+
+`~/projects/` is the **top-level workspace** for multiple companies and personal
+projects. It is **not** a single git repo — each subdirectory is an independent project
+or monorepo with its own git history, tooling, and `CLAUDE.md`.
+
+**Always `cd` into the specific project directory and read its `CLAUDE.md` before doing
+any work.**
+
+---
+
+## Directory map
+
+| Directory | Belongs to | Description |
+|-----------|-----------|-------------|
+| `<company-a>/` | Company A | Primary monorepo — see its `CLAUDE.md` for full project list |
+| `<company-b>/` | Company B | Company B projects |
+| `<company-c>/` | Company C | Company C projects |
+| `personal/` | Personal | Your personal tools |
+| `Tools/` | Cross-company | MCP configs, scripts, persistent memory |
+
+---
+
+## MCP / integration tool selection
+
+External service integrations should be **scoped per company**. Each company has its
+own integration account. Always use the correct company's MCP server or CLI account.
+
+For [Composio](https://composio.dev/), declare one MCP server per company in
+`~/.claude.json`, using a per-company Tool Router session scoped to the correct user
+and toolkits.
+
+**Anti-patterns:**
+
+- Do not cross-wire company credentials (e.g. Company A's API key in Company B's
+  config)
+- Do not use Claude.ai's built-in integrations alongside Composio — pick one
+  integration layer
+- Treat the workspace `.env` as the single source of truth for org-scoped credentials;
+  prefix variables by org (`<COMPANY_A>_API_KEY`, etc.). Never commit it.
+
+---
+
+## Per-company server / infrastructure pattern
+
+Each company runs on its own dedicated cloud instance. They are fully separate hosts
+with separate cloud accounts, agent installs, configs, services, and credentials.
+Never assume "the server" — always specify which one.
+
+| Company | Instance | SSH alias | Region |
+|---------|----------|-----------|--------|
+| Company A | `<company-a>-main` | `<company-a>-server` | (region) |
+| Company B | `<company-b>-main` | `<company-b>-server` | (region) |
+| Company C | `<company-c>-main` | `<company-c>-server` | (region) |
+
+Each company also runs its **own independent overlay network** (e.g. Tailscale). They
+do not share the network and must not depend on each other.
+
+### Webhook / trigger architecture
+
+Automations that react to external events should be **webhook-triggered, not
+cron-polled**. Each server runs a webhook receiver exposed via a public tunnel (e.g.
+Tailscale Funnel or DuckDNS + nginx + Let's Encrypt), plus a Pub/Sub pull daemon for
+Google services.
+
+**Anti-patterns:**
+
+- Do not re-introduce polling crons for events that can fire as webhooks (Gmail,
+  Calendar, Slack, GitHub repo events, etc.)
+- Do not use third-party trigger services that poll on a 2-minute interval — that is no
+  better than cron
+
+**What stays as cron (genuinely time-based):** daily reports, weekly digests, health
+checks, scheduled posts.
+
+---
+
+## Universal architecture pattern
+
+All projects follow **Domain-Driven Design**:
+
+- Business / domain logic lives in `pipeline/`, `domains/`, or `services/`
+- External API wrappers are infrastructure adapters — external types must not leak
+  into domain logic
+- API routes / entry points are thin controllers (validate → call service → return)
+- No business logic in delivery mechanisms (MCP tools, Express routes, Next.js API
+  routes, cron wrappers)
+
+### Stack quick reference
+
+| Pattern | Stack | Dev command |
+|---------|-------|-------------|
+| Python automation | Python 3.10+ / venv | `source venv/bin/activate && python -m pipeline.orchestrator` |
+| Node MCP server | Node.js / TypeScript | `npm install && npm run dev` |
+| Next.js + Bun | Next.js / Bun | `bun install && bun run dev` |
+| Next.js + npm | Next.js / npm | `npm install && npm run dev` |
+| React + Express | Vite + Express | `npm run install:all` then run client and server separately |
+
+---
+
+## Git workflow (all projects)
+
+**Never commit directly to `main`.** Branch naming:
+
+| Pattern | Use for |
+|---------|---------|
+| `feat/fe-<name>` | Frontend features |
+| `feat/be-<name>` | Backend features |
+| `bug-fix/<name>` | Bug fixes |
+| `hot-fix/<name>` | Production hotfixes |
+
+Commit format (Conventional Commits):
+
+```
+type(scope): short description (max 72 chars)
+
+Explanation of what changed and why.
+```
+
+Allowed types: `feat` `fix` `chore` `docs` `refactor` `test` `ci` `perf` `style`
+`build`
+
+`--no-verify` is prohibited.
+
+### Linear ↔ PR linking convention
+
+If your project tracker (Linear, Jira, etc.) supports auto-linking from PR body magic
+words, prefer that over branch-name auto-linking. Branch-name conventions (`feat/`,
+`bug-fix/`) typically conflict with project-tracker branch patterns
+(`username/TEAM-123-...`).
+
+**The rule for every PR:**
+
+1. If the work corresponds to an existing tracker issue, include exactly one line in
+   the PR body:
+   ```
+   Closes <TEAM>-123
+   ```
+2. If the issue should stay open after merge, use `Refs <TEAM>-123` instead of
+   `Closes`.
+3. If there is no tracker issue, omit the line entirely. **Do not fabricate IDs.**
+4. To find the right ID: ask, grep the branch's commit messages, or query the tracker
+   API.
+
+**Anti-patterns:**
+
+- Do not put the tracker ID in the branch name — your pre-push hook will reject it
+- Do not skip the magic word — it is the only auto-link mechanism that works in this
+  setup
+- Do not use tracker URLs in the body as a substitute — they typically do not trigger
+  auto-attach
+
+---
+
+## Parallel agent dispatch (optional)
+
+If you use a parallel-agent orchestrator (e.g.
+[legion / HolyClaude](https://github.com/holyclaude/holyclaude-cloud)), drop a config
+file (`legion.toml` or equivalent) at the workspace root as a template, and use a
+`chpwd` hook in your shell rc to auto-seed it into any new git repo under the
+workspace.
+
+For high-stakes client repos, add a **lockdown rule** that skips auto-seed and disables
+auto-merge automation. The cost of a wrong AI-driven change on a high-stakes client
+(reputational + commercial) far outweighs time saved by automation.
+
+---
+
+## Email / message formatting rules
+
+When drafting emails or messages on your behalf, Claude should follow these rules:
+
+- **Plain text only** — no Markdown, no asterisks, no headers, no bullets with symbols
+- Paragraphs separated by a single blank line
+- Lists use line breaks only (no hyphens, numbers, or bullet characters)
+- Avoid em dashes — use commas, periods, or parentheses
+- Friendly, human tone — not cringe, not mechanical
+- Output must be copy-paste ready without any cleanup
+- Always include a clear CTA or next step
+
+Run a mental sanity pass before returning any email: no Markdown artifacts, clear
+paragraph breaks, skimmable, human-sounding.

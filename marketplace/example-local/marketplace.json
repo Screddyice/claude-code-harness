@@ -1,0 +1,13 @@
+{
+  "_comment": "Example local plugin marketplace manifest. Point ~/.claude/settings.json `extraKnownMarketplaces` at the directory containing this file. Use a local marketplace when you want to ship in-house plugins to your own machine without publishing them to a public registry.",
+  "name": "example-local",
+  "plugins": [
+    {
+      "name": "example-plugin",
+      "source": {
+        "type": "directory",
+        "path": "./plugins/example-plugin"
+      }
+    }
+  ]
+}

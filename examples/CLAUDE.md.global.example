@@ -1,0 +1,50 @@
+# Global CLAUDE.md — Example
+
+User-level instructions that apply to every Claude Code session on this machine.
+Project-level `CLAUDE.md` files (e.g. `~/projects/CLAUDE.md`) layer on top of this and
+take precedence on conflict.
+
+This file is a **template**. Replace `<COMPANY>` placeholders with your own
+organizations and adjust per-company rules to match your workflow.
+
+---
+
+## Slash command stack
+
+Install [gstack](https://github.com/garrytan/gstack) at `~/.claude/skills/gstack/` for the
+structured-methodology slash commands referenced below.
+
+**Browser rule:** use the `/browse` skill for all web browsing. Never use third-party
+chrome MCPs that bypass it.
+
+**Available slash commands (gstack-installed):**
+
+`/office-hours` `/plan-ceo-review` `/plan-eng-review` `/plan-design-review`
+`/plan-devex-review` `/design-consultation` `/design-shotgun` `/design-html` `/review`
+`/ship` `/land-and-deploy` `/canary` `/benchmark` `/browse` `/connect-chrome` `/qa`
+`/qa-only` `/design-review` `/devex-review` `/setup-browser-cookies` `/setup-deploy`
+`/setup-gbrain` `/retro` `/investigate` `/document-release` `/codex` `/cso` `/autoplan`
+`/careful` `/freeze` `/guard` `/unfreeze` `/gstack-upgrade` `/learn` `/pair-agent`
+
+**The sprint flow:** Think (`/office-hours`) → Plan (`/plan-ceo-review`,
+`/plan-eng-review`, `/plan-design-review`) → Build → Review (`/review`, `/cso`) → Test
+(`/qa`) → Ship (`/ship`, `/land-and-deploy`) → Reflect (`/retro`).
+
+**Upgrade:** run `/gstack-upgrade` at any time to pull the latest.
+
+---
+
+## Per-org automation hooks (example)
+
+After successfully creating a PR for any **`<COMPANY_A>/*`** repository, run a local
+script to mirror the PR into your project tracker:
+
+```
+~/.local/bin/<company-a>-pr-tracker-done <PR_URL>
+```
+
+For PRs in `<COMPANY_B>/*` and `<COMPANY_C>/*`, do **not** run the local script — those
+orgs use a server-side webhook that auto-creates project-tracker tickets on PR open.
+Only the org without an owner-level webhook needs the local mirror.
+
+Replace `<COMPANY_*>` and adjust per your workflow.
