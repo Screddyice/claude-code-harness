@@ -1,0 +1,2128 @@
+"""legion CLI — the orchestrator skill's hands.
+
+Subcommands are designed to be composable from a bash-driving orchestrator:
+
+    legion init <tasks.json> --repo-url <url> --base-branch <br>
+    legion route <task-id>
+    legion spawn <task-id> [--target local|cloud]   # target required unless already decided
+    legion poll                                     # updates state, prints changes
+    legion ready                                    # prints next ready task IDs
+    legion status                                   # human-readable table
+    legion scale <n>                                # override max_workers
+    legion cost                                     # cost summary (stub in Phase 2)
+    legion stop [--graceful|--force]
+    legion cap                                      # current dynamic max_workers
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from . import critic, dispatch, governor, mediator, reconciler, reviewer, routing, state
+from .config import load as load_config
+
+# Brain retro tracking — module-level so it persists across ticks within one run.
+_brain_written_ids: set[str] = set()
+
+
+def _flush_brain_retros(s: "state.RunState", goal: str = "") -> None:
+    """Write Retros to the brain for any newly-terminal tasks."""
+    from . import brain as _brain
+    try:
+        store = _brain.default_store()
+    except Exception:
+        return
+    for task in s.tasks.values():
+        if task.id in _brain_written_ids:
+            continue
+        terminal = (
+            task.merged_at is not None
+            or task.status in ("no_changes", "failed", "claude_failed", "cancelled")
+            or (task.status == "shipped" and task.merge_blocker is not None)
+        )
+        if not terminal:
+            continue
+        try:
+            retro = _brain.make_retro_from_task(
+                task,
+                repo_url=s.repo_url,
+                goal=goal or s.repo_url,
+                ci_failed_first_try=(task.mediator_attempts > 0),
+            )
+            store.write(retro)
+            _brain_written_ids.add(task.id)
+        except Exception:
+            pass
+
+
+def _run_cmd(cmd: list[str]) -> str:
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+# Code-ish file extensions — used to route code-heavy overflow tasks to the
+# (optional) local coder model instead of the default small model.
+_CODE_EXTS = (
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".rb",
+    ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".php", ".swift", ".kt", ".scala",
+)
+
+
+def _select_local_model(task: "state.Task", lm_cfg) -> str:
+    """Pick the on-device model for a local-model overflow worker.
+
+    Returns coder_model for code-heavy tasks when it's configured; otherwise
+    the default model. coder_model defaults to "" (always default) because the
+    32B coder is slow in the full harness — it's opt-in.
+    """
+    if not lm_cfg.coder_model:
+        return lm_cfg.default_model
+    files = getattr(task, "files_touched", None) or []
+    if any(str(f).endswith(_CODE_EXTS) for f in files):
+        return lm_cfg.coder_model
+    return lm_cfg.default_model
+
+
+# ----------------------------------------------------------------------
+# init
+# ----------------------------------------------------------------------
+
+def cmd_init(args) -> int:
+    """Create .legion/state.json from a tasks.json file."""
+    tasks_path = Path(args.tasks)
+    if not tasks_path.exists():
+        print(f"error: {tasks_path} not found", file=sys.stderr)
+        return 1
+
+    if not Path("legion.toml").exists():
+        print(
+            "warning: no legion.toml found in current directory.\n"
+            "  Copy one: cp ~/holyclaude-cloud/config/legion.toml.example legion.toml\n"
+            "  Without it, legion uses built-in defaults (may not match your repo).",
+            file=sys.stderr,
+        )
+
+    _git_ok = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True,
+    )
+    if _git_ok.returncode != 0 or _git_ok.stdout.strip() != "true":
+        print(
+            "error: `legion init` must be run from inside your target git repository.\n"
+            "  cd into the repo you want to swarm against first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    raw = json.loads(tasks_path.read_text())
+    if not isinstance(raw, list):
+        print("error: tasks.json must be a JSON list of task objects", file=sys.stderr)
+        return 1
+
+    tasks = []
+    for item in raw:
+        tasks.append(state.Task(
+            id=item["id"],
+            title=item["title"],
+            spec=item.get("spec", ""),
+            deps=item.get("deps", []),
+            estimated_minutes=item.get("estimated_minutes", 10),
+            files_touched=item.get("files_touched", []),
+        ))
+
+    repo_url = args.repo_url or _run_cmd(["git", "remote", "get-url", "origin"])
+    base_branch = args.base_branch or _run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+
+    run = state.init_run(repo_url, base_branch, tasks)
+    print(json.dumps({
+        "status": "initialized",
+        "repo_url": run.repo_url,
+        "base_branch": run.base_branch,
+        "task_count": len(run.tasks),
+    }, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# ready
+# ----------------------------------------------------------------------
+
+def cmd_ready(_args) -> int:
+    s = state.read_state()
+    ready = state.ready_tasks(s)
+    print(json.dumps([t.id for t in ready]))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# route
+# ----------------------------------------------------------------------
+
+def cmd_route(args) -> int:
+    s = state.read_state()
+    cfg = load_config()
+    task = s.tasks.get(args.task_id)
+    if not task:
+        print(f"error: no task {args.task_id}", file=sys.stderr)
+        return 1
+    decision = routing.route(task, cfg.dispatch, governor.throttle_active(s))
+    print(json.dumps({"target": decision.target, "reason": decision.reason}))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# spawn
+# ----------------------------------------------------------------------
+
+def cmd_spawn(args) -> int:
+    s = state.read_state()
+    cfg = load_config()
+    task = s.tasks.get(args.task_id)
+    if not task:
+        print(f"error: no task {args.task_id}", file=sys.stderr)
+        return 1
+    if task.status == "in_flight":
+        print(f"error: task {task.id} already in flight", file=sys.stderr)
+        return 1
+
+    # Resolve target
+    target = args.target
+    if not target:
+        decision = routing.route(task, cfg.dispatch, governor.throttle_active(s))
+        target = decision.target
+
+    meta = dispatch.spawn(
+        task,
+        target=target,
+        repo_url=s.repo_url,
+        base_branch=s.base_branch,
+        branch_prefix=cfg.reconciler.branch_prefix,
+        auth_mode=cfg.swarm.auth_mode,
+    )
+
+    if not meta.get("worker_id"):
+        print(json.dumps({"spawn_failed": meta}, indent=2), file=sys.stderr)
+        return 2
+
+    def mut(run: state.RunState):
+        t = run.tasks[task.id]
+        t.status = "in_flight"
+        t.target = target
+        t.worker_id = meta["worker_id"]
+        t.branch = meta.get("branch")
+        t.dispatched_at = meta.get("dispatched_at", time.time())
+        run.events.append({
+            "ts": time.time(),
+            "kind": "spawn",
+            "task_id": task.id,
+            "target": target,
+            "worker_id": meta["worker_id"],
+        })
+
+    state.update_state(mut)
+    print(json.dumps({"task_id": task.id, **meta}, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# poll
+# ----------------------------------------------------------------------
+
+def _pull_cloud_results(s: state.RunState) -> None:
+    """Pull per-task result markers from the worker-cache volume to local."""
+    cloud_in_flight = [t for t in s.tasks.values()
+                       if t.status == "in_flight" and t.target == "cloud"]
+    if not cloud_in_flight:
+        return
+
+    try:
+        modal_bin = dispatch.find_modal_bin()
+    except RuntimeError:
+        return
+
+    Path(".legion/cloud_results").mkdir(parents=True, exist_ok=True)
+    for t in cloud_in_flight:
+        local = Path(f".legion/cloud_results/{t.id}.json")
+        # Best-effort — if the worker hasn't written the marker yet, this fails quietly.
+        subprocess.run(
+            [modal_bin, "volume", "get", "holyclaude-cloud-worker-cache",
+             f"{t.id}/result.json", str(local), "--force"],
+            capture_output=True,
+        )
+
+
+def _scan_for_throttle(s: state.RunState) -> bool:
+    """Scan local + cloud logs for 429 patterns."""
+    hit = False
+    for t in s.tasks.values():
+        if t.status != "in_flight":
+            continue
+        # Local log
+        local_log = Path(f".legion/local_logs/{t.id}.log")
+        if governor.scan_worker_log_for_throttle(local_log):
+            hit = True
+            break
+        # Cloud result
+        cloud_log = Path(f".legion/cloud_results/{t.id}.json")
+        if governor.scan_worker_log_for_throttle(cloud_log):
+            hit = True
+            break
+    return hit
+
+
+def cmd_poll(_args) -> int:
+    s = state.read_state()
+    _pull_cloud_results(s)
+
+    changes = []
+    s2 = state.read_state()  # refresh after pulls
+
+    # Detect throttle before processing status changes
+    if _scan_for_throttle(s2) and not governor.throttle_active(s2):
+        state.update_state(governor.record_throttle)
+        changes.append({"throttle": "engaged"})
+
+    in_flight = state.in_flight_tasks(s2)
+    for task in in_flight:
+        result = dispatch.poll(task, s2.base_branch)
+        if result is None:
+            continue
+        new_status = result.get("status", "failed")
+        changes.append({
+            "task_id": task.id,
+            "status": new_status,
+            **{k: v for k, v in result.items() if k != "status"},
+        })
+
+        def mut(run: state.RunState, tid=task.id, res=result, new_status=new_status):
+            t = run.tasks[tid]
+            t.status = new_status
+            t.finished_at = time.time()
+            if res.get("pr_url"):
+                t.pr_url = res["pr_url"]
+            if res.get("error"):
+                t.error = res["error"]
+            run.events.append({
+                "ts": time.time(),
+                "kind": "finished",
+                "task_id": tid,
+                "status": new_status,
+            })
+
+        state.update_state(mut)
+
+    # Flag stale in-flight
+    cfg = load_config()
+    stale = governor.stale_in_flight(state.read_state(), cfg)
+    if stale:
+        changes.append({"stale_in_flight": stale})
+
+    print(json.dumps(changes, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# status
+# ----------------------------------------------------------------------
+
+def cmd_status(_args) -> int:
+    s = state.read_state()
+    cfg = load_config()
+
+    by_status: dict[str, list] = {}
+    for t in s.tasks.values():
+        by_status.setdefault(t.status, []).append(t)
+
+    cap = governor.current_max_workers(s, cfg)
+    throttle = "engaged" if governor.throttle_active(s) else "clean"
+    elapsed = time.time() - s.started_at
+
+    print(f"LEGION STATUS  —  repo: {s.repo_url}")
+    print(f"  started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s.started_at))}")
+    print(f"  elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s")
+    print(f"  throttle: {throttle}   cap: {cap}/{cfg.swarm.max_workers}")
+    print()
+
+    def _print_group(header: str, tasks: list[state.Task]):
+        if not tasks:
+            return
+        print(f"{header} ({len(tasks)}):")
+        for t in tasks:
+            extra = ""
+            if t.pr_url:
+                extra = f"  {t.pr_url}"
+            elif t.target and t.worker_id:
+                extra = f"  [{t.target}:{t.worker_id}]"
+            if t.dispatched_at and t.status == "in_flight":
+                in_flight_s = int(time.time() - t.dispatched_at)
+                extra += f"  ({in_flight_s}s in flight)"
+            if t.error:
+                extra += f"  ERROR: {t.error[:80]}"
+            print(f"  {t.id:8s} {t.target or '-':6s} {t.title[:60]:60s}{extra}")
+        print()
+
+    _print_group("In flight", by_status.get("in_flight", []))
+    _print_group("Ready", state.ready_tasks(s))
+    _print_group("Shipped", by_status.get("shipped", []))
+    _print_group("No changes", by_status.get("no_changes", []))
+    _print_group("Failed", by_status.get("failed", []) + by_status.get("claude_failed", []))
+    _print_group("Pending", [t for t in s.tasks.values() if t.status == "pending" and t.deps])
+
+    return 0
+
+
+# ----------------------------------------------------------------------
+# scale
+# ----------------------------------------------------------------------
+
+def cmd_scale(args) -> int:
+    # Support `legion scale auto` to clear the override
+    raw = str(args.n).lower()
+    if raw in ("auto", "clear", "none"):
+        def mut(s: state.RunState):
+            s.max_workers_override = None
+            s.events.append({
+                "ts": time.time(), "kind": "scale_cleared",
+            })
+        state.update_state(mut)
+        print(json.dumps({"max_workers_override": None, "mode": "auto"}))
+        return 0
+
+    try:
+        n = int(args.n)
+    except (ValueError, TypeError):
+        print(f"error: scale value must be an integer or 'auto', got {args.n!r}", file=sys.stderr)
+        return 1
+
+    def mut(s: state.RunState):
+        s.max_workers_override = n
+        s.events.append({
+            "ts": time.time(),
+            "kind": "scale",
+            "max_workers_override": n,
+        })
+    state.update_state(mut)
+    print(json.dumps({"max_workers_override": n}))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# cost
+# ----------------------------------------------------------------------
+
+def _parse_token_usage(log_path: Path) -> dict:
+    """Parse a stream-json worker log for the terminal result event's token usage."""
+    if not log_path.exists():
+        return {}
+    try:
+        with open(log_path, "rb") as _f:
+            _f.seek(0, 2)
+            _size = _f.tell()
+            _f.seek(max(0, _size - 8192))
+            tail = _f.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                evt = json.loads(line)
+                if evt.get("type") == "result":
+                    usage = evt.get("usage", {})
+                    return {
+                        "input_tokens": usage.get("input_tokens", 0),
+                        "output_tokens": usage.get("output_tokens", 0),
+                        "cache_read": usage.get("cache_read_input_tokens", 0),
+                        "cache_write": usage.get("cache_creation_input_tokens", 0),
+                    }
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {}
+
+
+def cmd_cost(_args) -> int:
+    """Cost summary — token counts from worker logs + Modal compute time."""
+    s = state.read_state()
+    cfg = load_config()
+
+    cloud_minutes = 0.0
+    worker_count = 0
+    total_input = 0
+    total_output = 0
+    total_cache_read = 0
+    total_cache_write = 0
+    local_model_workers = 0
+    local_model_input = 0
+    local_model_output = 0
+    per_task = []
+
+    for t in s.tasks.values():
+        if t.dispatched_at:
+            end = t.finished_at or time.time()
+            if t.target == "cloud":
+                cloud_minutes += (end - t.dispatched_at) / 60.0
+                worker_count += 1
+
+        log_path = Path(f".legion/local_logs/{t.id}.log")
+        usage = _parse_token_usage(log_path)
+        if usage:
+            in_tok = usage.get("input_tokens", 0)
+            out_tok = usage.get("output_tokens", 0)
+            # local-model workers run on-device — exclude them from API cost.
+            if t.target == "local-model":
+                local_model_workers += 1
+                local_model_input += in_tok
+                local_model_output += out_tok
+            else:
+                total_input += in_tok
+                total_output += out_tok
+                total_cache_read += usage.get("cache_read", 0)
+                total_cache_write += usage.get("cache_write", 0)
+            per_task.append({
+                "task_id": t.id,
+                "target": t.target,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cache_read_tokens": usage.get("cache_read", 0),
+            })
+
+    # Approximate cost for API mode (Sonnet 4.5 pricing as reference).
+    # Pro session mode is billed to your subscription, not per-token.
+    input_cost = round(total_input * 3.00 / 1_000_000, 4)
+    output_cost = round(total_output * 15.00 / 1_000_000, 4)
+    approx_api_cost = round(input_cost + output_cost, 4)
+
+    summary = {
+        "auth_mode": cfg.swarm.auth_mode,
+        "tokens": {
+            "total_input": total_input,
+            "total_output": total_output,
+            "total_cache_read": total_cache_read,
+            "total_cache_write": total_cache_write,
+        },
+        "approx_api_cost_usd": approx_api_cost,
+        "cloud_worker_minutes": round(cloud_minutes, 1),
+        "worker_count": worker_count,
+        "local_model": {
+            "workers": local_model_workers,
+            "input_tokens": local_model_input,
+            "output_tokens": local_model_output,
+            "note": "on-device (Qwen) — $0 API cost",
+        },
+        "per_task": per_task,
+        "note": (
+            "Token counts from local worker logs (cloud worker logs not yet parsed). "
+            "approx_api_cost_usd assumes Sonnet pricing and is informational only — "
+            "Pro session charges to your subscription, not per token."
+        ),
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# stop
+# ----------------------------------------------------------------------
+
+def cmd_stop(args) -> int:
+    mode = "force" if args.force else "graceful"
+    state.write_stop(mode)
+
+    if mode == "force":
+        # Kill all in-flight workers
+        s = state.read_state()
+        killed = []
+        for t in state.in_flight_tasks(s):
+            if dispatch.kill(t, force=True):
+                killed.append(t.id)
+
+        def mut(run: state.RunState):
+            for t in run.tasks.values():
+                if t.status == "in_flight":
+                    t.status = "failed"
+                    t.error = "force-stopped"
+                    t.finished_at = time.time()
+            run.events.append({"ts": time.time(), "kind": "stop", "mode": "force"})
+        state.update_state(mut)
+
+        print(json.dumps({"stopped": "force", "killed": killed}))
+    else:
+        print(json.dumps({"stopped": "graceful"}))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# cap (how many workers we're allowed to have in flight right now)
+# ----------------------------------------------------------------------
+
+def cmd_cap(_args) -> int:
+    s = state.read_state()
+    cfg = load_config()
+    cap = governor.current_max_workers(s, cfg)
+    in_flight = len(state.in_flight_tasks(s))
+    print(json.dumps({
+        "current_cap": cap,
+        "in_flight": in_flight,
+        "slots_available": max(0, cap - in_flight),
+        "throttle_active": governor.throttle_active(s),
+        "stop_requested": state.stop_requested(),
+    }))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# reconcile — merge shipped PRs in dep order, invoke mediator on conflict
+# ----------------------------------------------------------------------
+
+def cmd_reconcile(args) -> int:
+    """One reconciliation pass. Idempotent — safe to call on a tick."""
+    s = state.read_state()
+    cfg = load_config()
+
+    # Auto-heal stale state first: any "blocked" or "shipped but not merged"
+    # task whose PR is actually merged on GitHub gets cleaned up.
+    healed = reconciler.auto_heal(s)
+    if healed:
+        heal_ids = {h["task_id"] for h in healed}
+        def _heal_mut(run: state.RunState, ids=heal_ids):
+            now = time.time()
+            for tid in ids:
+                t = run.tasks[tid]
+                t.merge_blocker = None
+                t.error = None
+                if t.merged_at is None:
+                    t.merged_at = now
+                run.events.append({
+                    "ts": now, "kind": "auto_healed", "task_id": tid,
+                })
+        state.update_state(_heal_mut)
+        s = state.read_state()
+
+    ready = reconciler.ready_to_merge(s)
+    results = []
+    if healed:
+        results.append({"auto_healed": healed})
+
+    if not ready:
+        print(json.dumps({"action": "idle", "ready_count": 0, "auto_healed": healed}, indent=2))
+        return 0
+
+    for task in ready:
+        # 1. CI check
+        ci = reconciler.check_ci(task.pr_url)
+        if ci == "pending":
+            results.append({"task_id": task.id, "status": "ci_pending"})
+            continue
+        if ci == "fail":
+            # Re-dispatch: put the task back into pending with the CI failure
+            # attached to its spec, so the next worker has context on what broke.
+            if task.mediator_attempts < cfg.reconciler.mediator_max_retries:
+                # Use mediator_attempts as overall retry counter — reusing it
+                # avoids a new field; semantically it still caps "how many
+                # times we auto-retry this task"
+                failure_detail = reconciler.fetch_ci_failure(task.pr_url)
+                def _mut(run: state.RunState, tid=task.id, det=failure_detail):
+                    t = run.tasks[tid]
+                    t.status = "pending"
+                    t.mediator_attempts += 1
+                    # Append CI failure to the task spec so the next worker sees it
+                    t.spec = (
+                        t.spec
+                        + f"\n\n---\n## Previous attempt's CI failure (retry #{t.mediator_attempts})\n\n"
+                        + det[:2000]
+                    )
+                    # A local-model attempt that couldn't pass CI re-dispatches to
+                    # the real model instead of churning the 4B on it again.
+                    if cfg.local_model.redispatch_to_real_model and t.target == "local-model":
+                        t.force_real_model = True
+                    # Reset worker metadata so spawn treats it as fresh
+                    t.worker_id = None
+                    t.branch = None
+                    t.pr_url = None
+                    t.dispatched_at = None
+                    t.finished_at = None
+                    t.error = None
+                    run.events.append({
+                        "ts": time.time(), "kind": "ci_redispatch",
+                        "task_id": tid, "attempt": t.mediator_attempts,
+                    })
+                state.update_state(_mut)
+                # Clear any stale blocker file so the next worker starts clean
+                blocker_path = Path(f".legion/blockers/{task.id}.md")
+                if blocker_path.exists():
+                    blocker_path.unlink()
+                results.append({
+                    "task_id": task.id, "status": "ci_failed_redispatched",
+                    "retry_number": task.mediator_attempts + 1,
+                })
+            else:
+                def _mut(run: state.RunState, tid=task.id):
+                    run.tasks[tid].merge_blocker = "ci_failed"
+                    run.events.append({
+                        "ts": time.time(), "kind": "merge_blocked",
+                        "task_id": tid, "reason": "ci_failed",
+                    })
+                state.update_state(_mut)
+                results.append({"task_id": task.id, "status": "ci_failed_max_retries"})
+            continue
+
+        # 1b. Pre-merge review gate (Phase 5b)
+        if cfg.review.enabled and task.review_verdict != "clean" and task.review_verdict != "warnings":
+            rv = reviewer.review_pr(task, cfg.review)
+            verdict = rv.get("verdict", "error")
+
+            if verdict == "error":
+                # Reviewer errored (timeout, parse failure, CLI flake) — skip this
+                # task this tick. Reconciler retries on the next pass rather than
+                # silently merging unreviewed code.
+                results.append({
+                    "task_id": task.id,
+                    "status": "review_errored",
+                    "detail": rv.get("error", ""),
+                    "log": rv.get("log", ""),
+                })
+                continue
+
+            elif verdict == "critical":
+                # Block merge + potentially re-dispatch
+                issues = rv.get("issues", [])
+                summary = rv.get("summary", "")
+                if task.review_attempts < cfg.review.max_review_redispatches:
+                    # Re-dispatch with review feedback
+                    feedback = reviewer.format_issues_for_spec(issues, summary)
+                    def _redispatch(run: state.RunState, tid=task.id, fb=feedback,
+                                    iss=issues, summ=summary):
+                        t = run.tasks[tid]
+                        t.status = "pending"
+                        t.review_attempts += 1
+                        t.review_verdict = None       # clear for re-review next time
+                        t.review_issues = iss
+                        t.review_summary = summ
+                        t.spec = t.spec + fb
+                        # A local-model attempt the reviewer rejected re-dispatches
+                        # to the real model rather than retrying the 4B.
+                        if cfg.local_model.redispatch_to_real_model and t.target == "local-model":
+                            t.force_real_model = True
+                        t.worker_id = None
+                        t.branch = None
+                        t.pr_url = None
+                        t.dispatched_at = None
+                        t.finished_at = None
+                        t.error = None
+                        run.events.append({
+                            "ts": time.time(), "kind": "review_redispatch",
+                            "task_id": tid, "attempt": t.review_attempts,
+                            "issue_count": len(iss),
+                        })
+                    state.update_state(_redispatch)
+                    # Also post a comment on the old PR explaining
+                    if task.pr_url:
+                        reviewer.post_pr_comment(
+                            task.pr_url,
+                            reviewer.format_issues_for_pr_comment(issues) +
+                            "\n\n_Re-dispatching with this feedback as a new worker attempt._"
+                        )
+                    results.append({
+                        "task_id": task.id, "status": "review_critical_redispatched",
+                        "attempt": task.review_attempts + 1,
+                        "issue_count": len(issues),
+                    })
+                    continue
+                else:
+                    def _block(run: state.RunState, tid=task.id, iss=issues, summ=summary):
+                        t = run.tasks[tid]
+                        t.merge_blocker = "review_failed"
+                        t.review_verdict = "critical"
+                        t.review_issues = iss
+                        t.review_summary = summ
+                        run.events.append({
+                            "ts": time.time(), "kind": "merge_blocked",
+                            "task_id": tid, "reason": "review_failed",
+                        })
+                    state.update_state(_block)
+                    if task.pr_url:
+                        reviewer.post_pr_comment(
+                            task.pr_url,
+                            reviewer.format_issues_for_pr_comment(issues) +
+                            f"\n\n_Max review re-dispatches ({cfg.review.max_review_redispatches}) "
+                            f"exhausted — needs human resolution._"
+                        )
+                    results.append({
+                        "task_id": task.id, "status": "review_critical_maxed",
+                        "issue_count": len(issues),
+                    })
+                    continue
+
+            elif verdict == "warnings":
+                # Merge proceeds, comment the warnings on the PR
+                issues = rv.get("issues", [])
+                summary = rv.get("summary", "")
+                def _note(run: state.RunState, tid=task.id, iss=issues, summ=summary):
+                    t = run.tasks[tid]
+                    t.review_verdict = "warnings"
+                    t.review_issues = iss
+                    t.review_summary = summ
+                state.update_state(_note)
+                if issues and task.pr_url:
+                    reviewer.post_pr_comment(
+                        task.pr_url,
+                        reviewer.format_issues_for_pr_comment(issues),
+                    )
+                # Fall through to merge
+
+            else:  # clean
+                def _ok(run: state.RunState, tid=task.id):
+                    run.tasks[tid].review_verdict = "clean"
+                state.update_state(_ok)
+                # Fall through to merge
+
+        # 2. Attempt merge
+        mr = reconciler.merge_pr(task, use_admin_merge=cfg.reconciler.use_admin_merge)
+        if mr["status"] == "merged":
+            def _mut(run: state.RunState, tid=task.id):
+                run.tasks[tid].merged_at = time.time()
+                run.events.append({
+                    "ts": time.time(), "kind": "merged", "task_id": tid,
+                })
+            state.update_state(_mut)
+            results.append({"task_id": task.id, "status": "merged"})
+            continue
+
+        if mr["status"] == "needs_human":
+            # Branch-protected main or similar BLOCKED state. Mediator
+            # can't help (there's no conflict to resolve) — stop here and
+            # let a human approve/unblock the PR.
+            def _mut(
+                run: state.RunState,
+                tid=task.id,
+                err=mr.get("error", ""),
+                merge_state=mr.get("merge_state", ""),
+            ):
+                run.tasks[tid].merge_blocker = "needs_human"
+                run.tasks[tid].error = (err or "")[:500]
+                run.events.append({
+                    "ts": time.time(), "kind": "merge_blocked",
+                    "task_id": tid, "reason": "branch_protection",
+                    "merge_state": merge_state,
+                })
+            state.update_state(_mut)
+
+            if task.pr_url:
+                reviewer.post_pr_comment(
+                    task.pr_url,
+                    (
+                        "### Legion merge blocked — needs human review\n\n"
+                        "This PR is ready to merge but the base branch is "
+                        "protected.\n\n"
+                        "**Likely causes:**\n"
+                        "- Required approvals from CODEOWNERS not satisfied\n"
+                        "- Required status check hasn't passed\n"
+                        "- Branch protection requires admin override\n\n"
+                        f"GitHub mergeStateStatus: `{mr.get('merge_state', 'UNKNOWN')}`\n\n"
+                        f"gh error: `{(mr.get('error') or '').strip()[:300]}`\n\n"
+                        "**To enable legion auto-merge on protected branches:**\n"
+                        "1. Set `use_admin_merge = true` in `legion.toml` `[reconciler]`\n"
+                        "2. Ensure your GitHub token has admin rights on this repo\n"
+                        "   (`./setup` will re-push it if you re-auth with admin scope)\n\n"
+                        "_Or: approve + merge this PR manually, then run "
+                        "`legion run --resume` to drain the remaining queue._"
+                    ),
+                )
+            results.append({
+                "task_id": task.id,
+                "status": "needs_human",
+                "merge_state": mr.get("merge_state"),
+            })
+            continue
+
+        if mr["status"] == "conflict":
+            # 3. Mediate
+            if task.mediator_attempts >= cfg.reconciler.mediator_max_retries:
+                def _mut(run: state.RunState, tid=task.id):
+                    run.tasks[tid].merge_blocker = "mediator_maxed"
+                state.update_state(_mut)
+                results.append({"task_id": task.id, "status": "mediator_maxed"})
+                continue
+
+            med = mediator.run_mediator(task, s.base_branch)
+
+            def _mut(run: state.RunState, tid=task.id):
+                run.tasks[tid].mediator_attempts += 1
+                run.events.append({
+                    "ts": time.time(), "kind": "mediator_run",
+                    "task_id": tid, "result": med.get("status"),
+                })
+            state.update_state(_mut)
+
+            if med["status"] in ("resolved", "no_conflict"):
+                # Let GitHub recompute mergeability after the force-push.
+                # Without this, mergeable is UNKNOWN and retry immediately
+                # fails with "not mergeable".
+                reconciler.wait_for_mergeable(task.pr_url, timeout_s=45)
+                # Retry merge
+                mr2 = reconciler.merge_pr(task, use_admin_merge=cfg.reconciler.use_admin_merge)
+                if mr2["status"] == "merged":
+                    def _mut(run: state.RunState, tid=task.id):
+                        run.tasks[tid].merged_at = time.time()
+                        run.events.append({
+                            "ts": time.time(), "kind": "merged",
+                            "task_id": tid, "via": "mediator",
+                        })
+                    state.update_state(_mut)
+                    results.append({"task_id": task.id, "status": "mediated_and_merged"})
+                else:
+                    results.append({
+                        "task_id": task.id,
+                        "status": "mediation_ok_merge_failed",
+                        "merge_detail": mr2,
+                    })
+            else:
+                results.append({
+                    "task_id": task.id,
+                    "status": "mediation_failed",
+                    "detail": med,
+                })
+            continue
+
+        # 4. Other merge failure — not sticky. Next reconcile tick will retry,
+        # which runs the _pr_is_merged upfront check to auto-heal if the PR
+        # actually merged on GitHub's side.
+        def _mut(run: state.RunState, tid=task.id, err=mr.get("error", "")):
+            run.tasks[tid].error = err[:500]
+        state.update_state(_mut)
+        results.append({
+            "task_id": task.id,
+            "status": mr["status"],
+            "will_retry": True,
+            "error": mr.get("error", "")[:200],
+        })
+
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# mediate <task-id> — manually invoke the mediator
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# review <task-id> — manually invoke the reviewer
+# ----------------------------------------------------------------------
+
+def cmd_review(args) -> int:
+    s = state.read_state()
+    cfg = load_config()
+    task = s.tasks.get(args.task_id)
+    if not task:
+        print(f"error: no task {args.task_id}", file=sys.stderr)
+        return 1
+    if not task.pr_url:
+        print(f"error: task {task.id} has no PR to review", file=sys.stderr)
+        return 1
+    rv = reviewer.review_pr(task, cfg.review)
+    print(json.dumps(rv, indent=2))
+    return 0 if rv.get("verdict") in ("clean", "warnings") else 2
+
+
+def cmd_mediate(args) -> int:
+    s = state.read_state()
+    task = s.tasks.get(args.task_id)
+    if not task:
+        print(f"error: no task {args.task_id}", file=sys.stderr)
+        return 1
+    if not task.branch or not task.pr_url:
+        print(f"error: task {task.id} has no branch/PR to mediate", file=sys.stderr)
+        return 1
+    result = mediator.run_mediator(task, s.base_branch)
+    def _mut(run: state.RunState, tid=task.id):
+        run.tasks[tid].mediator_attempts += 1
+        run.events.append({
+            "ts": time.time(), "kind": "mediator_run",
+            "task_id": tid, "manual": True,
+            "result": result.get("status"),
+        })
+    state.update_state(_mut)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") in ("resolved", "no_conflict") else 2
+
+
+# ----------------------------------------------------------------------
+# critique / refine — decomposition subgraph (Phase 5a)
+# ----------------------------------------------------------------------
+
+def cmd_critique(args) -> int:
+    """Run deterministic + LLM critique on a tasks.json without modifying it."""
+    tasks_path = Path(args.tasks)
+    if not tasks_path.exists():
+        print(f"error: {tasks_path} not found", file=sys.stderr)
+        return 1
+    tasks = json.loads(tasks_path.read_text())
+    goal = args.goal or "(not provided)"
+    result = critic.critique_and_refine(tasks, goal)
+    print(json.dumps(result.to_dict(), indent=2))
+    return 0
+
+
+def cmd_decompose_refine(args) -> int:
+    """Iterate critic + refiner up to --iterations times. Overwrites the tasks file."""
+    tasks_path = Path(args.tasks)
+    if not tasks_path.exists():
+        print(f"error: {tasks_path} not found", file=sys.stderr)
+        return 1
+    tasks = json.loads(tasks_path.read_text())
+    goal = args.goal or "(not provided)"
+
+    if args.dry_run:
+        result = critic.iterate_until_stable(tasks, goal, max_iterations=args.iterations)
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0
+
+    result = critic.iterate_until_stable(tasks, goal, max_iterations=args.iterations)
+    if result.refined_tasks:
+        # Backup the original
+        backup = tasks_path.with_suffix(".json.pre-refine")
+        backup.write_text(tasks_path.read_text())
+        tasks_path.write_text(json.dumps(result.refined_tasks, indent=2))
+        print(json.dumps({
+            "status": "refined",
+            "iterations": result.iterations,
+            "remaining_flag_count": len(result.flags),
+            "summary": result.llm_summary,
+            "backup": str(backup),
+        }, indent=2))
+    else:
+        print(json.dumps({
+            "status": "stable" if not result.flags else "no_refinement",
+            "iterations": result.iterations,
+            "flag_count": len(result.flags),
+            "summary": result.llm_summary,
+        }, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# decompose — generate tasks.json from a plain-English goal
+# ----------------------------------------------------------------------
+
+def cmd_decompose(args) -> int:
+    """Generate tasks.json from a plain-English goal using Claude."""
+    from shutil import which
+    import textwrap
+
+    goal = args.goal
+    if not goal:
+        print("error: provide a goal, e.g.: legion decompose \"Add JWT auth\"", file=sys.stderr)
+        return 1
+
+    if not which("claude"):
+        print("error: `claude` CLI not found on PATH", file=sys.stderr)
+        return 1
+
+    prompt = textwrap.dedent(f"""
+        You are a software project decomposer. Decompose the following goal into a
+        parallelizable task DAG for a fleet of Claude Code workers.
+
+        Goal: {goal}
+
+        Output ONLY a valid JSON array (no markdown, no explanation) with this schema:
+        [
+          {{
+            "id": "T-001",
+            "title": "short imperative title",
+            "spec": "2-4 sentences: what to implement, which files to touch, acceptance criteria",
+            "deps": [],
+            "estimated_minutes": 10,
+            "files_touched": ["path/to/expected/file.py"]
+          }}
+        ]
+
+        Rules:
+        - Each task must be completable by one Claude worker in one PR
+        - deps lists task IDs that must merge before this task starts
+        - Keep tasks focused: 1-3 files per task is ideal
+        - estimated_minutes: 5 for tiny, 10 for small, 20 for medium, 30 for large
+        - Output raw JSON only — no ```json fences, no prose
+    """).strip()
+
+    print(f"Decomposing: {goal!r} ...", flush=True)
+
+    result = subprocess.run(
+        ["claude", "-p", prompt, "--output-format", "text"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"error: claude exited {result.returncode}: {result.stderr[:200]}", file=sys.stderr)
+        return 1
+
+    raw = result.stdout.strip()
+    # Strip accidental markdown fences
+    if raw.startswith("```"):
+        raw = "\n".join(raw.splitlines()[1:])
+    if raw.endswith("```"):
+        raw = raw[: raw.rfind("```")]
+    raw = raw.strip()
+
+    try:
+        tasks = json.loads(raw)
+        if not isinstance(tasks, list):
+            raise ValueError("expected a JSON array")
+    except Exception as e:
+        print(f"error: could not parse Claude output as JSON: {e}", file=sys.stderr)
+        print("Raw output:", file=sys.stderr)
+        print(raw[:500], file=sys.stderr)
+        return 1
+
+    Path(".legion").mkdir(exist_ok=True)
+    out_path = Path(".legion/tasks.json")
+    out_path.write_text(json.dumps(tasks, indent=2))
+    # Save goal so the brain can group retros across re-runs of the same goal.
+    Path(".legion/goal.txt").write_text(goal)
+
+    print(f"\nDecomposed into {len(tasks)} task(s) → {out_path}\n")
+    for t in tasks:
+        deps = f" (after {', '.join(t.get('deps', []))})" if t.get("deps") else ""
+        print(f"  {t['id']}  {t['title']}{deps}")
+        print(f"       {t.get('estimated_minutes', '?')}min  •  {t.get('spec', '')[:80]}…")
+    print()
+    print(f"Next: legion init {out_path}  →  legion run")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# run — autonomous dispatch + reconcile loop
+# ----------------------------------------------------------------------
+
+def render_run_summary(s: "state.RunState", say, *, use_rich: bool = False) -> int:
+    """Print the final summary for a legion run and return an exit code.
+
+    Every task is tallied into exactly one terminal category so the grand
+    total matches len(s.tasks). Non-zero exit code is returned if any task
+    ended in a worker/runtime failure, was blocked from merging, or was
+    cancelled.
+
+    Parameters
+    ----------
+    s: state.RunState
+        The final run state to summarize.
+    say: Callable[[str], None]
+        Output sink (e.g. cmd_run's _say that respects --quiet).
+    use_rich: bool
+        When True and Rich is importable, render a Panel instead of plain text.
+    """
+    tasks = list(s.tasks.values())
+
+    merged = [t for t in tasks if t.status == "shipped" and t.merged_at is not None]
+    # "shipped" but not merged and not otherwise blocked — these are PRs
+    # still awaiting merge (e.g. run exited before reconciler landed them).
+    shipped_open = [
+        t for t in tasks
+        if t.status == "shipped" and t.merged_at is None and not t.merge_blocker
+    ]
+    blocked = [t for t in tasks if t.merge_blocker is not None]
+    failed = [
+        t for t in tasks
+        if t.status in ("failed", "claude_failed") and not t.merge_blocker
+    ]
+    no_changes = [t for t in tasks if t.status == "no_changes"]
+    cancelled = [t for t in tasks if t.status == "cancelled"]
+
+    # Anything not in a terminal state above (pending / ready / in_flight)
+    # — should be zero on a clean exit, but surface it if non-zero.
+    terminal_ids = {
+        t.id for t in (*merged, *shipped_open, *blocked, *failed, *no_changes, *cancelled)
+    }
+    other = [t for t in tasks if t.id not in terminal_ids]
+
+    # Non-zero exit when any task ended in a non-success terminal state
+    # that indicates human attention is needed.
+    exit_code = 2 if (failed or blocked or cancelled) else 0
+
+    # ---- Rich Panel output ----
+    if use_rich:
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.text import Text
+
+            needs_human = [t for t in blocked if t.merge_blocker == "needs_human"]
+            other_blocked = [t for t in blocked if t.merge_blocker != "needs_human"]
+
+            # Header counts line
+            counts = Text()
+            counts.append(f"  \u2705  {len(merged)} merged", style="bold green")
+            if needs_human or other_blocked:
+                counts.append(f"    \u26a0 {len(blocked)} needs review", style="bold yellow")
+            if failed:
+                counts.append(f"    \u2717 {len(failed)} failed", style="bold red")
+            if shipped_open:
+                counts.append(f"    \u2713 {len(shipped_open)} shipped (open PR)", style="green")
+            if no_changes:
+                counts.append(f"    \u2014 {len(no_changes)} no changes", style="dim")
+            if cancelled:
+                counts.append(f"    \u29d7 {len(cancelled)} cancelled", style="dim")
+
+            body = Text()
+            body.append_text(counts)
+            body.append("\n")
+
+            if merged:
+                body.append("\n  Merged:\n", style="bold")
+                for t in merged:
+                    body.append(f"    \u2713 {t.id}", style="green")
+                    if t.pr_url:
+                        body.append(f"  {t.pr_url}", style="dim")
+                    body.append("\n")
+
+            if shipped_open:
+                body.append("\n  Shipped (PR open):\n", style="bold")
+                for t in shipped_open:
+                    body.append(f"    \u2713 {t.id}", style="green")
+                    if t.pr_url:
+                        body.append(f"  {t.pr_url}", style="dim")
+                    body.append("\n")
+
+            if needs_human:
+                body.append("\n  Action required:\n", style="bold yellow")
+                for t in needs_human:
+                    body.append(f"    \u26a0 {t.id}", style="yellow")
+                    if t.pr_url:
+                        body.append(f"  {t.pr_url}", style="dim")
+                    body.append("\n")
+                body.append(
+                    "      Run `legion run --resume` after approving PR\n",
+                    style="dim",
+                )
+
+            if other_blocked:
+                body.append("\n  Blocked:\n", style="bold yellow")
+                for t in other_blocked:
+                    reason = t.merge_blocker or "blocked"
+                    body.append(f"    \u26a0 {t.id}  {reason[:80]}\n", style="yellow")
+
+            if failed:
+                body.append("\n  Failed:\n", style="bold red")
+                for t in failed:
+                    reason = t.error or t.status or "unknown"
+                    body.append(f"    \u2717 {t.id}  {reason[:80]}\n", style="red")
+
+            if cancelled:
+                body.append("\n  Cancelled:\n", style="bold")
+                for t in cancelled:
+                    body.append(f"    \u29d7 {t.id}\n", style="dim")
+
+            if other:
+                body.append(f"\n  Other (non-terminal): {len(other)}\n", style="dim")
+
+            border_style = "red" if failed else ("yellow" if blocked else "green")
+            panel = Panel(
+                body,
+                title="[bold]LEGION RUN COMPLETE[/bold]",
+                border_style=border_style,
+                padding=(0, 1),
+            )
+            console = Console()
+            console.print()
+            console.print(panel)
+            return exit_code
+        except ImportError:
+            pass  # fall through to plain text
+
+    # ---- Plain text output ----
+    total = (
+        len(merged) + len(shipped_open) + len(blocked)
+        + len(failed) + len(no_changes) + len(cancelled) + len(other)
+    )
+    say("")
+    say("LEGION RUN COMPLETE")
+    say(f"  Merged:     {len(merged)}")
+    say(f"  Shipped:    {len(shipped_open)} (PR open, not yet merged)")
+    say(f"  Blocked:    {len(blocked)}")
+    say(f"  Failed:     {len(failed)}")
+    say(f"  No changes: {len(no_changes)}")
+    say(f"  Cancelled:  {len(cancelled)}")
+    if other:
+        say(f"  Other:      {len(other)} (non-terminal)")
+    say(f"  Total:      {total}")
+
+    for t in merged:
+        if t.pr_url:
+            say(f"    \u2713 {t.id}: {t.pr_url}")
+    for t in blocked:
+        if t.merge_blocker == "needs_human":
+            say(f"  \u26a0 {t.id}: needs_human \u2014 approve and merge manually:")
+            if t.pr_url:
+                say(f"      {t.pr_url}")
+        else:
+            reason = t.merge_blocker or "blocked"
+            say(f"    \u26a0 {t.id}: {reason[:120]}")
+    for t in failed:
+        reason = t.error or t.status or "unknown"
+        say(f"    \u2717 {t.id}: {reason[:120]}")
+    for t in cancelled:
+        say(f"    \u29d7 {t.id}: cancelled")
+
+    if any(t.merge_blocker == "needs_human" for t in blocked):
+        nh_count = sum(1 for t in blocked if t.merge_blocker == "needs_human")
+        say("")
+        say(f"  Action required: {nh_count} PR(s) need manual approval before legion can continue.")
+        say("  Run `legion run --resume` after merging to drain any remaining queue.")
+
+    return exit_code
+
+
+def cmd_run(args) -> int:
+    """Autonomous loop: dispatch ready tasks, poll in-flight, reconcile shipped.
+
+    Exits when:
+      - No in-flight + no ready + no shipped-but-unmerged tasks remain, OR
+      - `.legion/STOP` is written (by /legion-stop or Ctrl-C handler).
+
+    Resilient to individual spawn/poll/reconcile failures — logs the error
+    and continues the next tick.
+    """
+    import signal
+    tick_s = max(1, args.tick_seconds)
+    quiet = args.quiet
+    max_ticks = args.max_ticks or 0  # 0 = unbounded
+
+    # Load goal text for brain retro grouping (written by `legion decompose`).
+    _goal_path = Path(".legion/goal.txt")
+    _goal = _goal_path.read_text().strip() if _goal_path.exists() else ""
+
+    # Must run from inside the target git repo — workers use git worktrees from CWD.
+    _git_ok = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True,
+    )
+    if _git_ok.returncode != 0 or _git_ok.stdout.strip() != "true":
+        print(
+            "error: `legion run` must be executed from inside your target git repository.\n"
+            "  cd into the repo you want to swarm against, then re-run `legion run`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # ---- Rich availability check (lazy import, never breaks non-Rich envs) ----
+    try:
+        from rich.live import Live
+        from rich.table import Table
+        from rich.text import Text
+        from rich.console import Console
+        _RICH = True
+    except ImportError:
+        _RICH = False
+
+    use_rich = _RICH and sys.stdout.isatty() and not quiet
+
+    def _say(msg: str):
+        if not quiet:
+            print(msg, flush=True)
+
+    # When using Rich Live, narrated events must go through the console so
+    # they interleave correctly with the live display.
+    _rich_console: "Console | None" = None
+    def _narrate(msg: str):
+        """Print a narrated event line (scrolls above the live table)."""
+        if quiet:
+            return
+        if use_rich and _rich_console is not None:
+            _rich_console.print(msg)
+        else:
+            print(msg, flush=True)
+
+    # ---- Helper: format elapsed time as M:SS ----
+    def _fmt_elapsed(dispatched_at) -> str:
+        if dispatched_at is None:
+            return "—"
+        secs = int(time.time() - dispatched_at)
+        return f"{secs // 60}:{secs % 60:02d}"
+
+    # ---- Helper: status icon + text for a task ----
+    def _status_cell(task) -> "Text":
+        if not use_rich:
+            return task.status  # plain string for non-Rich path
+        from rich.text import Text  # already imported above, but safe to re-import
+        st = task.status
+        mb = task.merge_blocker
+        if task.merged_at is not None:
+            return Text("\u2705 merged", style="bold green")
+        if mb in ("needs_human", "ci_failed"):
+            return Text("\u26a0 blocked", style="bold yellow")
+        if mb:
+            return Text("\u26a0 blocked", style="bold yellow")
+        if st == "in_flight":
+            return Text("\u27f3 working", style="bold cyan")
+        if st == "shipped":
+            return Text("\u2713 shipped", style="green")
+        if st in ("failed", "claude_failed"):
+            return Text("\u2717 failed", style="bold red")
+        if st == "no_changes":
+            return Text("\u2014 no changes", style="dim")
+        if st == "cancelled":
+            return Text("\u29d7 cancelled", style="dim")
+        # pending / waiting
+        return Text("\u00b7 waiting", style="dim")
+
+    # ---- Helper: build the Rich Live table from current state ----
+    def _build_table(s) -> "Table":
+        from rich.table import Table
+        from rich.text import Text
+
+        # Determine whether any in-flight local worker has a meaningful action
+        in_flight_tasks = [t for t in s.tasks.values() if t.status == "in_flight"]
+        actions = {t.id: dispatch.get_worker_last_action(t) for t in in_flight_tasks}
+        show_progress = any(actions.values())
+
+        tbl = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+        tbl.add_column("Task", style="bold", min_width=7)
+        tbl.add_column("Title", min_width=30, max_width=42)
+        tbl.add_column("Status", min_width=12)
+        if show_progress:
+            tbl.add_column("Progress", min_width=24, max_width=46)
+        tbl.add_column("Target", min_width=6)
+        tbl.add_column("Elapsed", min_width=6)
+
+        for task in s.tasks.values():
+            title = task.title
+            if len(title) > 40:
+                title = title[:39] + "\u2026"
+
+            target_str = task.target or "\u2014"
+            elapsed_str = _fmt_elapsed(task.dispatched_at) if task.status == "in_flight" else "\u2014"
+
+            if show_progress:
+                action = actions.get(task.id, "")
+                progress_cell = Text(action, style="dim") if action else Text("\u2014", style="dim")
+                tbl.add_row(
+                    task.id,
+                    title,
+                    _status_cell(task),
+                    progress_cell,
+                    target_str,
+                    elapsed_str,
+                )
+            else:
+                tbl.add_row(
+                    task.id,
+                    title,
+                    _status_cell(task),
+                    target_str,
+                    elapsed_str,
+                )
+
+        # Footer: counts + repo name
+        inf_count = sum(1 for t in s.tasks.values() if t.status == "in_flight")
+        shipped_count = sum(1 for t in s.tasks.values() if t.status == "shipped")
+        merged_count = sum(1 for t in s.tasks.values() if t.merged_at is not None)
+
+        repo_name = s.repo_url or ""
+        repo_name = repo_name.removeprefix("https://github.com/").removesuffix(".git")
+
+        footer = Text(
+            f" {inf_count} workers active  \u2022  {shipped_count} shipped"
+            f"  \u2022  {merged_count} merged  \u2022  {repo_name}",
+            style="dim",
+        )
+
+        from rich.console import Group
+        return Group(tbl, footer)
+
+    # Handle Ctrl-C by writing STOP and letting the loop drain naturally.
+    _original_handler = signal.getsignal(signal.SIGINT)
+    def _on_sigint(_signum, _frame):
+        _narrate("\n[run] SIGINT \u2014 writing STOP; in-flight workers will finish")
+        state.write_stop("graceful")
+        signal.signal(signal.SIGINT, _original_handler)
+    signal.signal(signal.SIGINT, _on_sigint)
+
+    # ---- Track previous task statuses to detect transitions ----
+    _prev_statuses: dict[str, str] = {}
+    _prev_merged: set[str] = set()
+
+    tick = 0
+    last_status: str = ""  # used only in non-Rich path
+
+    def _run_loop_body(live=None):
+        """Core tick logic. live is a Rich Live instance or None."""
+        nonlocal tick, last_status, _prev_statuses, _prev_merged, _rich_console
+
+        while True:
+            tick += 1
+            if max_ticks and tick > max_ticks:
+                _narrate(f"[run] hit max_ticks={max_ticks}, exiting")
+                break
+
+            stop_mode = state.stop_requested()
+
+            try:
+                s = state.read_state()
+            except Exception as e:
+                print(f"[run] read_state failed: {e}", file=sys.stderr)
+                return 1
+
+            cfg = load_config()
+            in_flight = state.in_flight_tasks(s)
+            ready = state.ready_tasks(s)
+            unmerged_shipped = [
+                t for t in s.tasks.values()
+                if t.status == "shipped" and t.merged_at is None and t.merge_blocker is None
+            ]
+
+            # ---- Exit condition ----
+            if not in_flight and not ready and not unmerged_shipped:
+                _narrate(f"[run] done at tick {tick}")
+                break
+
+            if stop_mode == "graceful" and not in_flight and not unmerged_shipped:
+                _narrate(f"[run] graceful stop reached (no in-flight)")
+                break
+
+            if stop_mode == "force":
+                _narrate(f"[run] force stop \u2014 exiting immediately")
+                break
+
+            # ---- Reap stale workers ----
+            stale_ids = governor.stale_in_flight(s, cfg)
+            for stale_id in stale_ids:
+                stale_task = s.tasks[stale_id]
+                _narrate(f"[run] reaping stale worker {stale_id} (in-flight > {cfg.budget.worker_timeout_minutes}m)")
+                try:
+                    dispatch.kill(stale_task, force=True)
+                except Exception as e:
+                    _narrate(f"[run]   kill failed: {e}")
+                def _stale_mut(run: state.RunState, tid=stale_id):
+                    t = run.tasks[tid]
+                    t.status = "failed"
+                    t.finished_at = time.time()
+                    t.error = f"timed out after {cfg.budget.worker_timeout_minutes} minutes"
+                    run.events.append({
+                        "ts": time.time(), "kind": "stale_reaped", "task_id": tid,
+                    })
+                state.update_state(_stale_mut)
+
+            # ---- Poll in-flight ----
+            if in_flight:
+                try:
+                    _silent_poll(s)
+                except Exception as e:
+                    print(f"[run] poll error: {e}", file=sys.stderr)
+
+            # ---- Reconcile shipped ----
+            if unmerged_shipped:
+                try:
+                    _silent_reconcile()
+                except Exception as e:
+                    print(f"[run] reconcile error: {e}", file=sys.stderr)
+
+            # ---- Spawn up to cap ----
+            if not stop_mode:
+                s = state.read_state()
+                cap = governor.current_max_workers(s, cfg)
+                slots = max(0, cap - len(state.in_flight_tasks(s)))
+                ready = state.ready_tasks(s)
+                for task in ready[:slots]:
+                    try:
+                        meta = dispatch.spawn(
+                            task,
+                            target=routing.route(task, cfg.dispatch, governor.throttle_active(s)).target,
+                            repo_url=s.repo_url,
+                            base_branch=s.base_branch,
+                            branch_prefix=cfg.reconciler.branch_prefix,
+                            auth_mode=cfg.swarm.auth_mode,
+                        )
+                    except Exception as e:
+                        print(f"[run] spawn {task.id} crashed: {e}", file=sys.stderr)
+                        continue
+
+                    if not meta.get("worker_id"):
+                        _narrate(f"[run] spawn {task.id} failed: {meta.get('spawn_error', 'unknown')[:120]}")
+                        continue
+
+                    target_label = meta.get("target") or "?"
+
+                    def _mut(run: state.RunState, tid=task.id, m=meta):
+                        t = run.tasks[tid]
+                        t.status = "in_flight"
+                        t.target = m.get("target") or t.target
+                        t.worker_id = m["worker_id"]
+                        t.branch = m.get("branch")
+                        t.dispatched_at = m.get("dispatched_at", time.time())
+                        run.events.append({
+                            "ts": time.time(), "kind": "spawn",
+                            "task_id": tid, "target": t.target,
+                        })
+                    state.update_state(_mut)
+
+                    # Narrated spawn event
+                    title_short = task.title[:60] if task.title else ""
+                    _narrate(f"\u26a1 {task.id}  {title_short}  \u2192  {target_label}")
+
+            # ---- Overflow: spawn EXTRA workers on the on-device model ----
+            # When session/cloud capacity is saturated and ready tasks remain,
+            # absorb the overflow locally instead of idling. This is the whole
+            # point: don't "tap out" on the Pro-session rate limit \u2014 the Mac
+            # keeps adding workers backed by a local model. Gated on the router
+            # being reachable; if it's down we fall back to today's behavior
+            # (ready tasks just wait).
+            if not stop_mode and cfg.local_model.enabled:
+                s = state.read_state()
+                lm_slots = governor.local_model_slots(s, cfg)
+                remaining = [
+                    t for t in state.ready_tasks(s)
+                    if not getattr(t, "force_real_model", False)
+                ]
+                if remaining and lm_slots > 0 and governor.local_model_available(cfg):
+                    if cfg.local_model.offload == "simple":
+                        pool = [t for t in remaining if routing.is_simple(t, cfg.dispatch)]
+                    else:
+                        pool = remaining
+                    for task in pool[:lm_slots]:
+                        model = _select_local_model(task, cfg.local_model)
+                        try:
+                            meta = dispatch.spawn(
+                                task,
+                                target="local-model",
+                                repo_url=s.repo_url,
+                                base_branch=s.base_branch,
+                                branch_prefix=cfg.reconciler.branch_prefix,
+                                auth_mode=cfg.swarm.auth_mode,
+                                model=model,
+                                base_url=cfg.local_model.base_url,
+                            )
+                        except Exception as e:
+                            print(f"[run] local-model spawn {task.id} crashed: {e}", file=sys.stderr)
+                            continue
+
+                        if not meta.get("worker_id"):
+                            _narrate(f"[run] local-model spawn {task.id} failed: {meta.get('spawn_error', 'unknown')[:120]}")
+                            continue
+
+                        def _lm_mut(run: state.RunState, tid=task.id, m=meta):
+                            t = run.tasks[tid]
+                            t.status = "in_flight"
+                            t.target = m.get("target") or "local-model"
+                            t.worker_id = m["worker_id"]
+                            t.branch = m.get("branch")
+                            t.dispatched_at = m.get("dispatched_at", time.time())
+                            run.events.append({
+                                "ts": time.time(), "kind": "spawn",
+                                "task_id": tid, "target": t.target, "model": m.get("model"),
+                            })
+                        state.update_state(_lm_mut)
+                        _narrate(
+                            f"\u26a1 {task.id}  {(task.title or '')[:55]}  \u2192  local-model ({model})"
+                        )
+
+            # ---- Detect state transitions and narrate them ----
+            s2 = state.read_state()
+            for task in s2.tasks.values():
+                prev_st = _prev_statuses.get(task.id)
+                cur_st = task.status
+
+                # Task just became shipped (worker opened a PR)
+                if prev_st == "in_flight" and cur_st == "shipped" and task.id not in _prev_merged:
+                    pr_info = task.pr_url or "(no PR URL)"
+                    _narrate(f"\u2713 {task.id}  PR opened: {pr_info}")
+
+                # Task just merged
+                if task.merged_at is not None and task.id not in _prev_merged:
+                    _prev_merged.add(task.id)
+                    _narrate(f"\u2705 {task.id}  merged")
+
+                # Task needs human (merge blocker just set)
+                if task.merge_blocker == "needs_human" and prev_st and prev_st != cur_st:
+                    pr_info = task.pr_url or ""
+                    _narrate(f"\u26a0 {task.id}  needs_human \u2014 approve: {pr_info}")
+
+                # CI re-dispatch (task went from in_flight/shipped back to pending with mediator_attempts > 0)
+                if (
+                    prev_st in ("in_flight", "shipped")
+                    and cur_st == "pending"
+                    and task.mediator_attempts > 0
+                ):
+                    retry_num = task.mediator_attempts
+                    _narrate(f"\u21a9 {task.id}  CI failed \u2014 re-dispatching (retry {retry_num}/2)")
+
+                _prev_statuses[task.id] = cur_st
+
+            # Flush brain retros for newly terminal tasks (no-op if brain unavailable)
+            _flush_brain_retros(s2, _goal)
+
+            # ---- Update live table or emit plain status line ----
+            if use_rich and live is not None:
+                live.update(_build_table(s2))
+            else:
+                # Plain text fallback
+                shipped = sum(1 for t in s2.tasks.values() if t.status == "shipped")
+                merged = sum(1 for t in s2.tasks.values() if t.merged_at is not None)
+                inf = len(state.in_flight_tasks(s2))
+                rdy = len(state.ready_tasks(s2))
+                touched = [t for t in s2.tasks.values() if t.status != "pending"]
+                suffix_parts = [f"{t.id}:{t.status}" for t in touched]
+                suffix_raw = " ".join(suffix_parts)
+                if suffix_raw:
+                    suffix_candidate = f"  [{suffix_raw}]"
+                    if len(suffix_candidate) > 80:
+                        suffix_candidate = suffix_candidate[:79] + "\u2026"
+                    suffix = suffix_candidate
+                else:
+                    suffix = ""
+                status_line = f"[tick {tick}] in_flight={inf} ready={rdy} shipped={shipped} merged={merged}{suffix}"
+                if status_line != last_status:
+                    _say(status_line)
+                    last_status = status_line
+
+            time.sleep(tick_s)
+
+        return None  # sentinel: normal exit
+
+    # ---- Run with or without Rich Live ----
+    if use_rich:
+        from rich.console import Console
+        console = Console()
+        _rich_console = console
+
+        # Prime prev_statuses before entering Live so first tick doesn't
+        # generate spurious narration for already-existing state.
+        try:
+            _s0 = state.read_state()
+            for t in _s0.tasks.values():
+                _prev_statuses[t.id] = t.status
+            _prev_merged = {t.id for t in _s0.tasks.values() if t.merged_at is not None}
+        except Exception:
+            pass
+
+        try:
+            _s_init = state.read_state()
+        except Exception:
+            _s_init = None
+
+        with Live(
+            _build_table(_s_init) if _s_init else "",
+            console=console,
+            refresh_per_second=2,
+            transient=False,
+        ) as live:
+            _run_loop_body(live=live)
+    else:
+        # Non-TTY or non-Rich path: prime prev_statuses
+        try:
+            _s0 = state.read_state()
+            for t in _s0.tasks.values():
+                _prev_statuses[t.id] = t.status
+            _prev_merged = {t.id for t in _s0.tasks.values() if t.merged_at is not None}
+        except Exception:
+            pass
+        _run_loop_body(live=None)
+
+    # Final summary
+    s = state.read_state()
+    exit_code = render_run_summary(s, _say, use_rich=use_rich and not quiet)
+
+    # Clear stop marker on clean exit
+    state.clear_stop()
+    return exit_code
+
+
+def _silent_poll(_s):
+    """Internal: run poll logic without printing JSON (loop manages its own output)."""
+    # Re-use cmd_poll's logic but suppress stdout
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_poll(argparse.Namespace())
+
+
+def _silent_reconcile():
+    """Internal: run reconcile logic without printing JSON."""
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_reconcile(argparse.Namespace())
+
+
+# ----------------------------------------------------------------------
+# cleanup (idempotent reset)
+# ----------------------------------------------------------------------
+
+def cmd_cleanup(args) -> int:
+    """Remove worktrees, delete legion/* branches, and (optionally) .legion/.
+
+    Safe to run any time. Does NOT touch shipped PRs or the base branch.
+    """
+    removed_worktrees = []
+    deleted_branches = []
+
+    # 1. Find legion worktrees and remove them
+    wt_list = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    for block in wt_list.stdout.split("\n\n"):
+        for line in block.splitlines():
+            if line.startswith("worktree ") and "/.legion/worktrees/" in line:
+                path = line.split(" ", 1)[1]
+                r = subprocess.run(
+                    ["git", "worktree", "remove", "--force", path],
+                    capture_output=True, text=True,
+                )
+                if r.returncode == 0:
+                    removed_worktrees.append(path)
+    subprocess.run(["git", "worktree", "prune"], check=False, capture_output=True)
+
+    # 2. Find and delete any legion/* branches
+    branches = subprocess.run(
+        ["git", "branch", "--list", "legion/*"],
+        capture_output=True, text=True,
+    )
+    for line in branches.stdout.splitlines():
+        b = line.strip().lstrip("* ").strip()
+        if not b:
+            continue
+        r = subprocess.run(
+            ["git", "branch", "-D", b],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            deleted_branches.append(b)
+
+    # 3. Optionally wipe .legion/
+    wiped_legion_dir = False
+    if args.all:
+        import shutil
+        legion_dir = Path(".legion")
+        if legion_dir.exists():
+            shutil.rmtree(legion_dir)
+            wiped_legion_dir = True
+
+    print(json.dumps({
+        "removed_worktrees": removed_worktrees,
+        "deleted_branches": deleted_branches,
+        "wiped_legion_dir": wiped_legion_dir,
+    }, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# doctor — pre-flight health check
+# ----------------------------------------------------------------------
+
+def cmd_doctor(_args) -> int:
+    """Run a pre-flight health check and report pass/fail for each dependency."""
+    passed = 0
+    failed = 0
+    warned = 0
+
+    def ok(label: str, detail: str = ""):
+        nonlocal passed
+        passed += 1
+        detail_str = f"  {detail}" if detail else ""
+        print(f"  [ok]   {label:<20}{detail_str}")
+
+    def fail(label: str, detail: str = ""):
+        nonlocal failed
+        failed += 1
+        detail_str = f"  {detail}" if detail else ""
+        print(f"  [FAIL] {label:<20}{detail_str}")
+
+    def warn(label: str, detail: str = ""):
+        nonlocal warned
+        warned += 1
+        detail_str = f"  {detail}" if detail else ""
+        print(f"  [warn] {label:<20}{detail_str}")
+
+    print("legion doctor — pre-flight check")
+
+    # 1. Claude Code CLI
+    try:
+        r = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            version = r.stdout.strip() or r.stderr.strip()
+            ok("Claude Code CLI", version.splitlines()[0] if version else "ok")
+        else:
+            fail("Claude Code CLI", "non-zero exit — is `claude` on PATH?")
+    except FileNotFoundError:
+        fail("Claude Code CLI", "not found on PATH")
+    except Exception as e:
+        fail("Claude Code CLI", str(e))
+
+    # 2. GitHub CLI auth
+    try:
+        r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=10)
+        output = r.stdout + r.stderr
+        if r.returncode == 0:
+            user = None
+            for line in output.splitlines():
+                if "Logged in to" in line or "account " in line or "as " in line.lower():
+                    # Try to extract username — gh outputs "Logged in to github.com account USERNAME"
+                    parts = line.strip().split()
+                    if "account" in parts:
+                        idx = parts.index("account")
+                        if idx + 1 < len(parts):
+                            user = parts[idx + 1]
+                            break
+            detail = f"authenticated as {user}" if user else "authenticated"
+            ok("GitHub CLI", detail)
+        else:
+            fail("GitHub CLI", "not authenticated — run `gh auth login`")
+    except FileNotFoundError:
+        fail("GitHub CLI", "not found — install from https://cli.github.com")
+    except Exception as e:
+        fail("GitHub CLI", str(e))
+
+    # 3. Modal CLI — find binary
+    modal_bin = shutil.which("modal")
+    if not modal_bin:
+        for candidate in [
+            Path.home() / "tinker-env" / "bin" / "modal",
+            Path.home() / ".local" / "bin" / "modal",
+        ]:
+            if candidate.exists():
+                modal_bin = str(candidate)
+                break
+
+    if not modal_bin:
+        fail("Modal CLI", "not found on PATH or in ~/tinker-env/bin, ~/.local/bin — run `pip install modal`")
+    else:
+        try:
+            r = subprocess.run([modal_bin, "profile", "current"], capture_output=True, text=True, timeout=10)
+            output = (r.stdout + r.stderr).strip()
+            if r.returncode == 0:
+                profile = output.splitlines()[0] if output else "ok"
+                ok("Modal CLI", f"profile: {profile}")
+            else:
+                # Fallback: try `modal token list` or just check version
+                r2 = subprocess.run([modal_bin, "--version"], capture_output=True, text=True, timeout=10)
+                if r2.returncode == 0:
+                    fail("Modal CLI", f"found but not authenticated — run `modal token new`")
+                else:
+                    fail("Modal CLI", "found but unexpected error")
+        except Exception as e:
+            fail("Modal CLI", str(e))
+
+    # 4 & 5. Modal secrets
+    modal_secret_output = None
+    if modal_bin:
+        try:
+            r = subprocess.run([modal_bin, "secret", "list"], capture_output=True, text=True, timeout=15)
+            modal_secret_output = r.stdout + r.stderr
+        except Exception:
+            modal_secret_output = None
+
+    for secret_name, hint in [
+        ("claude-pro-session", "run `./setup` to push secrets"),
+        ("legion-github", "run `./setup` to push secrets"),
+    ]:
+        label = f"Modal secret"
+        display = f"{label} {secret_name}"
+        if modal_secret_output is None:
+            warn(display, "could not check (Modal CLI unavailable)")
+        elif secret_name in modal_secret_output:
+            ok(display)
+        else:
+            fail(display, f"not found — {hint}")
+
+    # 6. legion.toml
+    if Path("legion.toml").exists():
+        ok("legion.toml", "found in CWD")
+    else:
+        warn("legion.toml", "not found in CWD — copy from config/legion.toml.example")
+
+    # 7. Target repo
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip() == "true":
+            ok("target repo", "CWD is inside a git repo")
+        else:
+            warn("target repo", "CWD does not appear to be inside a git repo")
+    except Exception:
+        warn("target repo", "CWD does not appear to be inside a git repo")
+
+    # 8. Session token expiry
+    import os as _os
+    creds_raw = ""
+    if sys.platform == "darwin":
+        _ks = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", "Claude Code-credentials",
+             "-a", _os.getenv("USER", ""), "-w"],
+            capture_output=True, text=True,
+        )
+        if _ks.returncode == 0:
+            creds_raw = _ks.stdout.strip()
+    if not creds_raw:
+        _creds_file = Path.home() / ".claude" / ".credentials.json"
+        if _creds_file.exists():
+            try:
+                creds_raw = _creds_file.read_text()
+            except Exception:
+                pass
+    if creds_raw:
+        try:
+            _creds = json.loads(creds_raw)
+            _exp = _creds.get("claudeAiOauth", {}).get("expiresAt")
+            if _exp:
+                _exp_ts = int(_exp) / 1000.0
+                _remaining = _exp_ts - time.time()
+                if _remaining < 0:
+                    fail("session token", "EXPIRED — re-run ./setup to refresh")
+                elif _remaining < 3600:
+                    warn("session token", f"expires in {int(_remaining / 60)}m — re-run ./setup soon")
+                else:
+                    ok("session token", f"valid for ~{int(_remaining / 3600)}h {int((_remaining % 3600) / 60)}m")
+            else:
+                warn("session token", "no expiresAt in credentials — cannot verify freshness")
+        except Exception as _e:
+            warn("session token", f"could not parse credentials: {_e}")
+    else:
+        warn("session token", "no local credentials found — run ./setup if using session auth")
+
+    # Pre-commit hooks detection
+    _hook_paths = [
+        Path(".pre-commit-config.yaml"), Path(".pre-commit-config.yml"),
+        Path(".husky"), Path("lefthook.yml"), Path("lefthook.yaml"),
+        Path(".lefthook.yml"), Path(".lefthook.yaml"),
+    ]
+    _found_hooks = [str(p) for p in _hook_paths if p.exists()]
+    if not _found_hooks:
+        _pkg = Path("package.json")
+        if _pkg.exists():
+            try:
+                _pkg_data = json.loads(_pkg.read_text())
+                _all_deps = {**_pkg_data.get("dependencies", {}), **_pkg_data.get("devDependencies", {})}
+                if "husky" in _all_deps:
+                    _found_hooks = ["package.json (husky)"]
+            except Exception:
+                pass
+    if _found_hooks:
+        warn(
+            "pre-commit hooks",
+            f"detected ({', '.join(_found_hooks)}) — workers may fail on git commit. "
+            "Set SKIP=all or configure bypass in your repo before running legion.",
+        )
+
+    # .mcp.json in target repo
+    if Path(".mcp.json").exists():
+        warn(
+            ".mcp.json",
+            "found in repo — cloud workers may emit MCP init warnings inside Modal. "
+            "Usually non-blocking, but verify your first cloud run.",
+        )
+
+    # Summary
+    total = passed + failed
+    print()
+    parts = [f"{passed} checks passed", f"{failed} failed", f"{warned} warnings"]
+    print(f"  {', '.join(parts)}")
+    if warned:
+        print("  Run `legion doctor` from inside your target repo for full validation.")
+
+    return 0 if failed == 0 else 1
+
+
+# ----------------------------------------------------------------------
+# Entry
+# ----------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="legion")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_init = sub.add_parser("init")
+    p_init.add_argument("tasks", help="Path to tasks.json")
+    p_init.add_argument("--repo-url", default=None)
+    p_init.add_argument("--base-branch", default=None)
+    p_init.set_defaults(func=cmd_init)
+
+    p_ready = sub.add_parser("ready")
+    p_ready.set_defaults(func=cmd_ready)
+
+    p_route = sub.add_parser("route")
+    p_route.add_argument("task_id")
+    p_route.set_defaults(func=cmd_route)
+
+    p_spawn = sub.add_parser("spawn")
+    p_spawn.add_argument("task_id")
+    p_spawn.add_argument("--target", choices=["local", "cloud"], default=None)
+    p_spawn.set_defaults(func=cmd_spawn)
+
+    p_poll = sub.add_parser("poll")
+    p_poll.set_defaults(func=cmd_poll)
+
+    p_status = sub.add_parser("status")
+    p_status.set_defaults(func=cmd_status)
+
+    p_scale = sub.add_parser("scale")
+    p_scale.add_argument("n", help="Integer, or 'auto' to clear override")
+    p_scale.set_defaults(func=cmd_scale)
+
+    p_run = sub.add_parser("run", help="Autonomous dispatch + reconcile loop")
+    p_run.add_argument("--tick-seconds", type=int, default=8,
+                       help="Seconds between ticks (default 8)")
+    p_run.add_argument("--max-ticks", type=int, default=0,
+                       help="Max ticks before exit (default 0 = unlimited)")
+    p_run.add_argument("--quiet", action="store_true")
+    p_run.set_defaults(func=cmd_run)
+
+    p_crit = sub.add_parser("critique",
+                            help="Run deterministic+LLM critique on a tasks.json (no changes)")
+    p_crit.add_argument("tasks", help="Path to tasks.json")
+    p_crit.add_argument("--goal", default=None)
+    p_crit.set_defaults(func=cmd_critique)
+
+    p_ref = sub.add_parser("decompose-refine",
+                           help="Iterate critique + refine up to --iterations times; overwrites the file")
+    p_ref.add_argument("tasks", help="Path to tasks.json")
+    p_ref.add_argument("--goal", default=None)
+    p_ref.add_argument("--iterations", type=int, default=3)
+    p_ref.add_argument("--dry-run", action="store_true",
+                       help="Don't overwrite; just print the result")
+    p_ref.set_defaults(func=cmd_decompose_refine)
+
+    p_cost = sub.add_parser("cost")
+    p_cost.set_defaults(func=cmd_cost)
+
+    p_stop = sub.add_parser("stop")
+    p_stop.add_argument("--force", action="store_true")
+    p_stop.add_argument("--graceful", action="store_true")
+    p_stop.set_defaults(func=cmd_stop)
+
+    p_cap = sub.add_parser("cap")
+    p_cap.set_defaults(func=cmd_cap)
+
+    p_clean = sub.add_parser("cleanup", help="Remove legion worktrees + branches")
+    p_clean.add_argument("--all", action="store_true",
+                         help="Also rm -rf .legion/ (wipes run state)")
+    p_clean.set_defaults(func=cmd_cleanup)
+
+    p_rec = sub.add_parser("reconcile", help="Run one reconciliation pass (merge ready PRs, mediate conflicts)")
+    p_rec.set_defaults(func=cmd_reconcile)
+
+    p_med = sub.add_parser("mediate", help="Manually invoke the mediator on a task")
+    p_med.add_argument("task_id")
+    p_med.set_defaults(func=cmd_mediate)
+
+    p_rev = sub.add_parser("review", help="Manually invoke the reviewer on a task")
+    p_rev.add_argument("task_id")
+    p_rev.set_defaults(func=cmd_review)
+
+    p_doctor = sub.add_parser("doctor", help="Pre-flight health check for legion dependencies")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_decompose = sub.add_parser("decompose", help="Decompose a plain-English goal into tasks.json using Claude")
+    p_decompose.add_argument("goal", help="The coding goal to decompose")
+    p_decompose.set_defaults(func=cmd_decompose)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

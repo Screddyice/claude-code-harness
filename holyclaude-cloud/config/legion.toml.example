@@ -1,0 +1,124 @@
+# holyclaude-cloud — legion configuration
+# Copy to ./legion.toml at the root of the repo you want to swarm against.
+
+[swarm]
+# Hard cap on concurrent session/cloud workers (those that hit the Anthropic
+# API). Raised from the original 5 -> 10. On session auth the Pro rate limit
+# still bites above ~5 -- but the governor halves this on a real 429, and the
+# [local_model] overflow below adds MORE workers on top (on-device Qwen, which
+# doesn't touch the Anthropic limit). For sustained high cloud parallelism use
+# auth_mode = "api" and push this to 20+.
+max_workers = 10
+
+# Start with 1 worker on first run, observe throttle behavior, then ramp up.
+# Set false to commit to max_workers immediately.
+ramp_first_run = true
+
+# Pause between decomposition and dispatch so the human can review the task graph.
+# Set false for full-autonomous yolo mode.
+human_checkpoint_after_decompose = true
+
+# Auth mode for workers (not for the orchestrator Claude session):
+#   "session" — Pro session token. Free but shared rate limits kick in at
+#               ~3-5 concurrent workers.
+#   "api"     — ANTHROPIC_API_KEY. No throttle, but you pay per token.
+# Requires the setup script to have pushed the anthropic-api-key Modal
+# secret (it does this automatically if $ANTHROPIC_API_KEY is set locally).
+auth_mode = "session"
+
+[budget]
+# Hard ceiling for $/hour of Modal spend. 0 means no $ cap (Pro session is free).
+# Set this if you ever flip workers to API auth — runaway autoloops have killed wallets.
+max_dollars_per_hour = 0
+
+# Kill any individual worker that runs longer than this. Tasks needing more
+# should be split.
+worker_timeout_minutes = 30
+
+[reconciler]
+# Max retries for the mediator agent to resolve a merge conflict before
+# escalating to the human.
+mediator_max_retries = 2
+
+# Set true if you own the repo and want to bypass branch protection for autonomous merges.
+# Requires admin rights on the repo. Equivalent to `gh pr merge --admin`.
+# use_admin_merge = false
+
+# github_repo is auto-detected from `git remote get-url origin` — no need to set this.
+# Override only if your remote URL doesn't point to the right repo.
+# github_repo = "owner/repo"
+
+# Branch prefix for legion-spawned branches.
+branch_prefix = "legion/"
+
+[review]
+# Run an independent reviewer on each shipped PR before merging.
+# - "critical" verdict blocks merge and re-dispatches the task
+#   (up to max_review_redispatches, with feedback appended to the spec)
+# - "warnings" verdict merges but posts issues as a PR comment
+# - "clean" verdict merges silently
+enabled = true
+
+# Categories the reviewer checks for
+categories = ["security", "task_adherence", "silent_failures", "type_design", "dead_code"]
+
+# Max re-dispatches on critical verdict before giving up and blocking
+# the merge for human review
+max_review_redispatches = 2
+
+# Where to run reviewer workers:
+#   "local" (default) — fast, free with Pro session, uses whatever Claude
+#                       Code is installed locally
+#   "cloud"           — runs in Modal container, slower, uses same auth as
+#                       regular cloud workers
+#   "auto"            — same router heuristics as regular workers
+target = "local"
+
+[dispatch]
+# Heuristics router uses for local-vs-cloud routing. The router is an Opus call
+# that takes these as priors. Tweak to bias.
+
+# Tasks under this many files go local by default.
+local_file_threshold = 5
+
+# Tasks over this many estimated minutes go cloud by default.
+cloud_minutes_threshold = 5
+
+# Always-cloud task types (regex on task title).
+always_cloud_patterns = [
+    "(?i)scrape",
+    "(?i)browser test",
+    "(?i)long-running",
+    "(?i)benchmark"
+]
+
+[local_model]
+# Overflow workers backed by an ON-DEVICE model (e.g. Qwen via a local
+# OpenAI/Anthropic-compatible router). When the session/cloud fleet is
+# saturated and ready tasks remain, legion spawns these EXTRA workers instead
+# of idling on the Pro-session rate limit — the local machine keeps adding
+# workers. Best for SMALL focused tasks; the real-model reviewer remains the
+# quality backstop and failed local-model PRs re-dispatch to the real model.
+enabled = true
+
+# Extra workers ON TOP of the session/cloud cap (swarm.max_workers). They run
+# on-device so they don't share the Anthropic rate limit. Keep low — local
+# workers typically share one inference server (effectively serialized).
+max_workers = 2
+
+# Router endpoint; model names route to local inference, others pass through.
+base_url = "http://localhost:8083"
+
+# Default on-device model. Pick one small/fast enough to run the full harness.
+default_model = "qwen3.5:4b-64k"
+
+# Optional code-heavy model. "" = always use default_model.
+coder_model = ""
+
+# "simple" = only small/trivial overflow tasks go local (recommended);
+# "any" = grab whatever's next in the ready queue.
+offload = "simple"
+
+# A local-model attempt that fails CI/review re-dispatches to the real model
+# instead of retrying the local model on something it already couldn't land.
+redispatch_to_real_model = true
