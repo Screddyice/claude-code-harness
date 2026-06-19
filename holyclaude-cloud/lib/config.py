@@ -12,7 +12,11 @@ CONFIG_PATH = Path("legion.toml")
 
 @dataclass
 class SwarmConfig:
-    max_workers: int = 5
+    # Hard cap on concurrent session/cloud workers (the ones that hit the
+    # Anthropic API). Raised from the original 5 → 10; the governor still
+    # halves this on a real 429, and local-model overflow workers (Qwen via
+    # the backdoor router) run ON TOP of this cap without touching it.
+    max_workers: int = 10
     ramp_first_run: bool = True
     human_checkpoint_after_decompose: bool = True
     # "session" (default, Pro rate-limits apply) or "api" (Anthropic API key,

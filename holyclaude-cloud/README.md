@@ -195,7 +195,7 @@ All settings live in `legion.toml` at the repo root (gitignored by default):
 
 ```toml
 [swarm]
-max_workers = 5                          # hard cap on concurrent workers
+max_workers = 10                         # hard cap on concurrent session/cloud workers
 ramp_first_run = true                    # start at 1, +1 per ship
 human_checkpoint_after_decompose = true  # pause before dispatch
 auth_mode = "session"                    # "session" | "api"
@@ -211,6 +211,14 @@ branch_prefix = "legion/"
 [budget]
 max_dollars_per_hour = 0                 # API-mode cost cap (0 = unlimited)
 worker_timeout_minutes = 30              # stale-worker reaping
+
+[local_model]                            # ADD-ON: extra on-device (Qwen) workers
+enabled = true                           # spawn beyond max_workers when saturated
+max_workers = 2                          # extra local workers ON TOP of the cap
+base_url = "http://localhost:8083"       # backdoor router (qwen* -> local Ollama)
+default_model = "qwen3.5:4b-64k"
+offload = "simple"                       # only small/trivial overflow goes local
+redispatch_to_real_model = true          # failed local PR retries on the real model
 ```
 
 Full reference in [config/legion.toml.example](config/legion.toml.example).
@@ -219,13 +227,32 @@ Full reference in [config/legion.toml.example](config/legion.toml.example).
 
 Workers default to `auth_mode = "session"` — one Claude Pro session token shared across N parallel workers. This rate-limits above ~3–5 concurrent workers. The governor detects 429s and dynamically halves the cap for 10 minutes.
 
-For serious workloads, flip to `auth_mode = "api"` in `legion.toml` and re-run setup with `ANTHROPIC_API_KEY` exported. No rate limits, but you pay per token.
+For serious workloads, flip to `auth_mode = "api"` in `legion.toml` and re-run setup with `ANTHROPIC_API_KEY` exported. No rate limits, but you pay per token — push `max_workers` to 20+ here.
+
+## Local-model overflow (add-on)
+
+When the session/cloud fleet is saturated (`max_workers` reached, or the governor has halved the cap during a throttle window) and ready tasks are still waiting, legion can spawn **extra workers on-device** instead of letting those tasks idle. These overflow workers run a local model — Qwen through the [backdoor](https://github.com/ajsai47/backdoor) router on `:8083` — so they **don't consume the Anthropic rate limit**. It's purely additive: cloud capacity is unchanged, you just get *more* total agents.
+
+```
+fill session/cloud slots up to max_workers   → spawn(local | cloud)   [Anthropic]
+ready tasks still waiting + :8083 reachable   → spawn EXTRA workers     [on-device Qwen]
+                                                 (--model qwen3.5:4b-64k, ANTHROPIC_BASE_URL=:8083)
+```
+
+Configured under `[local_model]` (see above). Notes:
+
+- **`max_workers`** here is extra workers *on top of* `[swarm] max_workers` — not a slice of it.
+- **`offload = "simple"`** (default) sends only small/trivial tasks local; a small local model churns on big multi-file work. The real-model reviewer still gates every PR, and a local PR that fails CI/review **re-dispatches to the real model** (`redispatch_to_real_model`).
+- **Fail-safe:** if the router on `base_url` isn't reachable, legion behaves exactly as before — the tasks just wait. Nothing about cloud dispatch changes.
+- On-device workers are **free** and excluded from `legion cost`'s API total.
+
+During a throttle window this composes nicely: the governor backs the *cloud* path off the rate limit while the local Qwen workers keep the queue moving — so throughput stays up without making the throttle worse.
 
 **ToS note:** Running multiple headless Claudes on one Pro session at scale is grey-area commercial use. Personal projects only.
 
 ## What's not yet supported
 
-What IS supported: parallel cloud workers, dependency-ordered merges, adversarial review with re-dispatch, CI-aware retry (validated end-to-end), merge conflict mediation, cost cap enforcement, brain/learning loop (retros written and injected across runs), and end-to-end runs on repos without branch protection or pre-commit hooks.
+What IS supported: parallel cloud workers, local-model overflow workers (extra on-device Qwen agents via the backdoor router, additive on top of the cloud cap), dependency-ordered merges, adversarial review with re-dispatch, CI-aware retry (validated end-to-end), merge conflict mediation, cost cap enforcement, brain/learning loop (retros written and injected across runs), and end-to-end runs on repos without branch protection or pre-commit hooks.
 
 What isn't supported yet:
 

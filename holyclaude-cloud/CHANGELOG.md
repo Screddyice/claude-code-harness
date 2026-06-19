@@ -2,6 +2,21 @@
 
 All notable changes to holyclaude-cloud.
 
+## [v0.5.0] — 2026-06-19
+
+### Local-model overflow workers (add-on) + higher cloud cap
+
+Cloud capacity is **increased, not reduced** — and a local-model add-on stacks on top of it.
+
+- **`[swarm] max_workers` raised 5 → 10.** Higher ceiling for concurrent session/cloud workers. The governor's throttle-halving and `ramp_first_run` are unchanged; on `auth_mode = "api"` you can push to 20+.
+- **New `local-model` worker class (`[local_model]`).** When the session/cloud fleet is saturated (cap reached, or halved during a throttle window) and ready tasks remain, legion spawns **EXTRA** workers on-device — Qwen via the [backdoor](https://github.com/ajsai47/backdoor) router on `:8083` — instead of idling. These run *on top of* `max_workers` and don't consume the Anthropic rate limit. Purely additive; cloud dispatch is untouched.
+  - Reuses the local subprocess machinery; differs only by `--model <qwen>` + `ANTHROPIC_BASE_URL` (`lib/dispatch.py`).
+  - `governor.local_model_slots` / `local_model_available`: overflow capacity beyond the cap + best-effort `:8083` preflight that **fails safe** to prior behavior when the router is down.
+  - `offload = "simple"` (default) sends only small/trivial overflow tasks local; `routing.is_simple`.
+  - A local-model PR that fails CI or the reviewer's critical gate **re-dispatches to the real model** (`force_real_model`), never churns the local model.
+  - On-device workers excluded from `legion cost`'s API total; labeled in `legion status`.
+- 21 new tests (`tests/test_local_model.py`); full suite green.
+
 ## [v0.4.0] — 2026-04-24
 
 ### Phase 5c — Brain/learning loop

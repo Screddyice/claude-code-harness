@@ -25,7 +25,7 @@ If no number was given, STOP and use AskUserQuestion: "How many workers? (1-10)"
 
 The override persists for the rest of the run. It ignores the ramp but still yields to the throttle observer (if 429s are active, the effective cap is still halved).
 
-To clear the override and return to ramp/throttle-only logic: `legion scale <config_max_workers>` (default 5). There isn't a "reset to auto" yet — Phase 4 polish.
+To clear the override and return to ramp/throttle-only logic: `legion scale <config_max_workers>` (default 10), or `legion scale auto`. Note `scale` adjusts the session/cloud cap only — local-model overflow workers are governed separately by `[local_model] max_workers` and are unaffected.
 
 ---
 

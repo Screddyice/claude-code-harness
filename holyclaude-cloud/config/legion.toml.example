@@ -2,9 +2,13 @@
 # Copy to ./legion.toml at the root of the repo you want to swarm against.
 
 [swarm]
-# Hard cap on concurrent cloud workers. Pro session shared across N workers
-# will throttle hard above ~5. Stay conservative.
-max_workers = 5
+# Hard cap on concurrent session/cloud workers (those that hit the Anthropic
+# API). Raised from the original 5 -> 10. On session auth the Pro rate limit
+# still bites above ~5 -- but the governor halves this on a real 429, and the
+# [local_model] overflow below adds MORE workers on top (on-device Qwen, which
+# doesn't touch the Anthropic limit). For sustained high cloud parallelism use
+# auth_mode = "api" and push this to 20+.
+max_workers = 10
 
 # Start with 1 worker on first run, observe throttle behavior, then ramp up.
 # Set false to commit to max_workers immediately.
