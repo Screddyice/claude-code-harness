@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# holyclaude-cloud setup
+#
+# Verifies HolyClaude install + Modal CLI auth, pushes secrets,
+# builds the meta-on-meta image. Idempotent — safe to re-run.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+# Track what was configured vs skipped for the final summary.
+_summary_configured=()
+_summary_skipped=()
+
+# ---------------------------------------------------------------------
+# 0. Python version check
+# ---------------------------------------------------------------------
+_py=$(command -v python3.11 2>/dev/null || command -v python3 2>/dev/null || true)
+if [[ -z "$_py" ]]; then
+    echo "setup: Python 3.11+ is required but no python3 was found in PATH." >&2
+    echo "  Install: brew install python@3.11" >&2
+    exit 1
+fi
+_pyver=$("$_py" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+_pymaj="${_pyver%%.*}"
+_pymin="${_pyver#*.}"
+if [[ "$_pymaj" -lt 3 ]] || [[ "$_pymaj" -eq 3 && "$_pymin" -lt 11 ]]; then
+    echo "setup: Python 3.11+ required; found $_pyver (via $_py)." >&2
+    echo "  Install: brew install python@3.11   then re-run: python3.11 -m pip install -e ." >&2
+    exit 1
+fi
+if [[ "$_pymaj" -eq 3 && "$_pymin" -ge 14 ]]; then
+    echo "setup: WARNING — Python $_pyver detected. Python 3.14 has a known broken" >&2
+    echo "  expat binding on macOS (Symbol not found: _XML_SetAllocTrackerActivationThreshold)." >&2
+    echo "  Use Python 3.11–3.13: brew install python@3.11 && python3.11 -m pip install -e ." >&2
+    exit 1
+fi
+echo "setup: Python $_pyver OK (via $_py)"
+
+# ---------------------------------------------------------------------
+# 1. Locate Modal CLI
+# ---------------------------------------------------------------------
+MODAL_BIN_CANDIDATES=(
+    "$(command -v modal 2>/dev/null || true)"
+    "$HOME/tinker-env/bin/modal"
+    "/Users/ajsai47/tinker-env/bin/modal"
+)
+MODAL_BIN=""
+for cand in "${MODAL_BIN_CANDIDATES[@]}"; do
+    if [[ -n "$cand" && -x "$cand" ]]; then
+        MODAL_BIN="$cand"
+        break
+    fi
+done
+
+if [[ -z "$MODAL_BIN" ]]; then
+    echo "setup: modal CLI not found. Install: pip install modal" >&2
+    exit 1
+fi
+echo "setup: modal CLI -> $MODAL_BIN"
+
+# ---------------------------------------------------------------------
+# 2. Verify modal auth
+# ---------------------------------------------------------------------
+if ! "$MODAL_BIN" token current >/dev/null 2>&1 \
+   && ! "$MODAL_BIN" profile current >/dev/null 2>&1; then
+    echo "setup: modal not authenticated." >&2
+    echo "  Run: $MODAL_BIN token new" >&2
+    echo "  This opens a browser — log in and your token is saved automatically." >&2
+    exit 1
+fi
+echo "setup: modal auth OK"
+
+# ---------------------------------------------------------------------
+# 3. Verify HolyClaude is installed (peer dep)
+# ---------------------------------------------------------------------
+if [[ -d "$HOME/holyclaude" ]] || [[ -L "$HOME/.claude/plugins/holyclaude" ]] || [[ -d "$HOME/.claude/plugins/holyclaude" ]]; then
+    echo "setup: HolyClaude detected"
+else
+    echo "setup: WARNING — HolyClaude not found locally."
+    echo "  Install: git clone https://github.com/ajsai47/holyclaude.git ~/holyclaude && ~/holyclaude/setup"
+    echo "  (Cloud workers don't need it locally — they get HolyClaude from the image clone."
+    echo "   But your local orchestrator does.)"
+fi
+
+# ---------------------------------------------------------------------
+# Helper: write a secret via temp file so values never appear on CLI args.
+# Usage: _push_secret <secret-name> <KEY> <value>
+# ---------------------------------------------------------------------
+_push_secret_kv() {
+    local secret_name="$1"
+    local key="$2"
+    local value="$3"
+    local _tmpf
+    _tmpf="$(mktemp)"
+    chmod 600 "$_tmpf"
+    printf '%s=%s\n' "$key" "$value" > "$_tmpf"
+    "$MODAL_BIN" secret create "$secret_name" --from-dotenv "$_tmpf" --force
+    rm -f "$_tmpf"
+}
+
+# ---------------------------------------------------------------------
+# 4. Push Claude Pro session secret
+# ---------------------------------------------------------------------
+secret_exists() {
+    "$MODAL_BIN" secret list 2>/dev/null | awk '{print $2}' | grep -Fxq "$1"
+}
+
+CREDS_JSON=""
+CREDS_SOURCE=""
+if [[ "$(uname)" == "Darwin" ]]; then
+    # Claude Code 2.1.x+ stores session creds in macOS Keychain.
+    # Service: "Claude Code-credentials", account: macOS username.
+    CREDS_JSON="$(security find-generic-password -s 'Claude Code-credentials' -a "$(whoami)" -w 2>/dev/null || true)"
+    [[ -n "$CREDS_JSON" ]] && CREDS_SOURCE="macOS Keychain"
+fi
+if [[ -z "$CREDS_JSON" && -f "$HOME/.claude/.credentials.json" ]]; then
+    # Legacy file-based creds (pre-migration Claude Code).
+    CREDS_JSON="$(cat "$HOME/.claude/.credentials.json")"
+    CREDS_SOURCE="$HOME/.claude/.credentials.json"
+fi
+if [[ -z "$CREDS_JSON" ]]; then
+    echo "setup: could not locate Claude Pro session credentials." >&2
+    if [[ "$(uname)" == "Darwin" ]]; then
+        echo "  Checked:" >&2
+        echo "    - macOS Keychain entry 'Claude Code-credentials' (account $(whoami)): not found" >&2
+        echo "    - Legacy file $HOME/.claude/.credentials.json: not found" >&2
+        echo "  Fix: run 'claude' interactively, log in to your Pro account, then re-run setup." >&2
+    else
+        echo "  Checked: $HOME/.claude/.credentials.json — not found." >&2
+        echo "  Fix: run 'claude' interactively, log in, then re-run setup." >&2
+    fi
+    echo "  Alternative: switch legion.toml [swarm] auth_mode = \"api\" and export ANTHROPIC_API_KEY." >&2
+    exit 1
+fi
+if ! python3 -c "
+import json,sys
+d = json.loads(sys.stdin.read())
+assert 'claudeAiOauth' in d and 'accessToken' in d['claudeAiOauth']
+" <<< "$CREDS_JSON" >/dev/null 2>&1; then
+    echo "setup: credentials payload from $CREDS_SOURCE is missing claudeAiOauth.accessToken." >&2
+    echo "  The stored blob may be corrupt or from an incompatible Claude Code version." >&2
+    echo "  Try: log out + log back in to Claude Code, then re-run setup." >&2
+    exit 1
+fi
+echo "setup: found Claude Pro session creds in $CREDS_SOURCE"
+
+echo "setup: pushing claude-pro-session secret"
+"$MODAL_BIN" secret delete claude-pro-session --yes >/dev/null 2>&1 || true
+_push_secret_kv claude-pro-session CLAUDE_CREDENTIALS_JSON "$CREDS_JSON"
+_summary_configured+=("claude-pro-session  (Claude Pro session credentials)")
+
+# ---------------------------------------------------------------------
+# 5. Push GitHub token secret
+# ---------------------------------------------------------------------
+GH_TOKEN=""
+if command -v gh >/dev/null 2>&1; then
+    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+fi
+if [[ -z "$GH_TOKEN" && -n "${GITHUB_TOKEN:-}" ]]; then
+    GH_TOKEN="$GITHUB_TOKEN"
+fi
+
+if [[ -z "$GH_TOKEN" ]]; then
+    echo "setup: ERROR — no GitHub token found." >&2
+    echo "  Workers need a GitHub token to push branches and open PRs." >&2
+    echo "  Fix (pick one):" >&2
+    echo "    gh auth login" >&2
+    echo "    export GITHUB_TOKEN=ghp_..." >&2
+    echo "  Then re-run setup." >&2
+    exit 1
+fi
+
+echo "setup: pushing legion-github secret"
+"$MODAL_BIN" secret delete legion-github --yes >/dev/null 2>&1 || true
+_push_secret_kv legion-github GITHUB_TOKEN "$GH_TOKEN"
+_summary_configured+=("legion-github       (GitHub token for branch push / PR)")
+
+# ---------------------------------------------------------------------
+# 5b. Push Anthropic API key secret (for auth_mode="api" escape hatch)
+# ---------------------------------------------------------------------
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "setup: pushing anthropic-api-key secret (real key — escape hatch enabled)"
+    "$MODAL_BIN" secret delete anthropic-api-key --yes >/dev/null 2>&1 || true
+    _push_secret_kv anthropic-api-key ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
+    _summary_configured+=("anthropic-api-key   (real key; auth_mode=api enabled)")
+else
+    # Still push a placeholder — Modal attaches secrets at decorator time,
+    # not at runtime, so the worker function body won't load at all if this
+    # secret doesn't exist. The worker validates the key value before using
+    # it, so a placeholder is safely ignored when auth_mode=session.
+    if ! "$MODAL_BIN" secret list 2>/dev/null | awk '{print $2}' | grep -Fxq "anthropic-api-key"; then
+        echo "setup: no ANTHROPIC_API_KEY in env — pushing placeholder anthropic-api-key"
+        echo "  (decorator needs the secret to exist; auth_mode=session ignores the value)"
+        _push_secret_kv anthropic-api-key ANTHROPIC_API_KEY \
+            "placeholder-run-setup-with-ANTHROPIC_API_KEY-set-to-enable-api-mode"
+        _summary_skipped+=("anthropic-api-key   (placeholder pushed; set ANTHROPIC_API_KEY to enable api mode)")
+    else
+        echo "setup: anthropic-api-key secret already exists — not touching it"
+        _summary_skipped+=("anthropic-api-key   (already exists; not changed)")
+    fi
+fi
+
+# ---------------------------------------------------------------------
+# 6. Drop legion.toml if missing in cwd at install time
+# ---------------------------------------------------------------------
+if [[ ! -f "./legion.toml" && ! -f "$PWD/legion.toml" ]]; then
+    cp "$REPO_ROOT/config/legion.toml.example" "$REPO_ROOT/legion.toml"
+    echo "setup: dropped default legion.toml at $REPO_ROOT/legion.toml"
+    echo "  Copy this to any repo you want to swarm against."
+fi
+
+# ---------------------------------------------------------------------
+# 7. Final summary
+# ---------------------------------------------------------------------
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  setup complete"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [[ ${#_summary_configured[@]} -gt 0 ]]; then
+    echo ""
+    echo "  Configured:"
+    for item in "${_summary_configured[@]}"; do
+        echo "    [ok] $item"
+    done
+fi
+if [[ ${#_summary_skipped[@]} -gt 0 ]]; then
+    echo ""
+    echo "  Skipped / unchanged:"
+    for item in "${_summary_skipped[@]}"; do
+        echo "    [-]  $item"
+    done
+fi
+echo ""
+echo "Next steps:"
+echo "  1. cd into the repo you want to swarm against."
+echo "  2. Copy legion.toml from $REPO_ROOT/legion.toml (or write your own)."
+echo "  3. In Claude Code: /legion-start \"<your goal>\""
+echo ""
+echo "First /legion-start will build the Modal image (~10-15 min). Subsequent runs reuse the cache."
