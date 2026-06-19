@@ -1,28 +1,15 @@
-# Local marketplace stub
+# Local Codex Marketplace Stub
 
-This directory is a placeholder showing the structure of a local plugin marketplace
-that Claude Code can load via `extraKnownMarketplaces` in `~/.claude/settings.json`.
+This directory shows the structure for a local Codex plugin marketplace.
 
-To use:
+Register it with:
 
-1. Copy this directory somewhere persistent on your machine (e.g.
-   `~/projects/local-marketplaces/my-local/`).
-2. Add an entry to your `~/.claude/settings.json`:
+```bash
+codex plugin marketplace add /absolute/path/to/marketplace/example-local
+```
 
-   ```json
-   "extraKnownMarketplaces": {
-     "my-local": {
-       "source": {
-         "source": "directory",
-         "path": "/Users/you/projects/local-marketplaces/my-local"
-       },
-       "autoUpdate": true
-     }
-   }
-   ```
+Codex marketplaces use `.agents/plugins/marketplace.json`. Each plugin entry points to
+a plugin directory containing `.codex-plugin/plugin.json`.
 
-3. Drop your own plugin directories under `plugins/` and reference them in
-   `marketplace.json`.
-
-Use a local marketplace when you want to install in-house plugins on your own machine
-without publishing them to a public registry.
+Use a local marketplace when you want in-house plugins available on your own machine
+without publishing them publicly.
