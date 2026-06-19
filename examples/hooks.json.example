@@ -1,0 +1,13 @@
+{
+  "SessionStart": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/absolute/path/to/codex-harness/scripts/init-codex-harness.sh",
+          "timeout": 30
+        }
+      ]
+    }
+  ]
+}
