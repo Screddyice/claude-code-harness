@@ -109,6 +109,12 @@ Explanation of what changed and why.
 Allowed types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `ci`, `perf`,
 `style`, `build`.
 
+Every committed work branch gets one PR. Push and open a draft PR immediately after
+the first commit instead of waiting for the feature to be complete, then push later
+checkpoint commits to the same PR. Before ending a session or switching branches,
+verify that every branch with keepable commits has an open or merged PR. Do not
+self-merge unless the repository explicitly delegates that authority.
+
 ## PR And Tracker Linking
 
 If work corresponds to a tracker issue, include exactly one line in the PR body:

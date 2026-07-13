@@ -1,13 +1,27 @@
 {
-  "SessionStart": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "/absolute/path/to/codex-harness/scripts/init-codex-harness.sh",
-          "timeout": 30
-        }
-      ]
-    }
-  ]
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/codex-harness/scripts/init-codex-harness.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/codex-harness/scripts/codex-local-diff-review.sh",
+            "timeout": 600,
+            "statusMessage": "Local model reviewing the current diff"
+          }
+        ]
+      }
+    ]
+  }
 }

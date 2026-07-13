@@ -5,6 +5,12 @@
 
 preferred_auth_method = "chatgpt"
 
+# During a staged Claude-to-Codex migration, load CLAUDE.md only when a directory
+# does not yet have AGENTS.md. The larger budget prevents a workspace guide from
+# consuming the default 32 KiB before nested repo instructions are appended.
+project_doc_fallback_filenames = ["CLAUDE.md"]
+project_doc_max_bytes = 131072
+
 # Trust only the workspace roots where you intentionally run Codex.
 [projects."/Users/you/projects"]
 trust_level = "trusted"

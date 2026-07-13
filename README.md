@@ -8,8 +8,9 @@ sanitized `AGENTS.md` templates, a conservative `~/.codex/config.toml` example,
 per-repo `.codex-harness/` scaffolding, and a local Codex plugin marketplace stub.
 
 The repo was adapted from a Claude Code harness. The Claude-specific surfaces
-(`~/.claude/settings.json`, SessionStart hooks, status lines, and `CLAUDE.md`) are
-intentionally replaced with Codex-native concepts.
+(`~/.claude/settings.json`, hooks, status lines, and `CLAUDE.md`) are mapped to
+Codex-native concepts. A staged migration can keep `CLAUDE.md` as a configured
+fallback until each repo has an adapted `AGENTS.md`.
 
 ## What's Inside
 
@@ -22,6 +23,8 @@ codex-harness/
 │   └── hooks.json.example            # optional Codex hook wiring
 ├── scripts/
 │   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
+│   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
+│   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
     └── example-local/                # Codex local plugin marketplace example
@@ -48,7 +51,7 @@ while sharing one Codex setup.
 |------------------------|-------------------------------|
 | `CLAUDE.md` | `AGENTS.md` |
 | `~/.claude/settings.json` | `~/.codex/config.toml` plus CLI commands |
-| SessionStart hook | Optional Codex `hooks.json`, explicit `scripts/init-codex-harness.sh`, or your own shell wrapper |
+| SessionStart hook | Codex `SessionStart` hook in `hooks.json`, explicit initializer, or a shell wrapper |
 | Claude status line | No direct Codex equivalent; use `scripts/codex-workspace-summary.sh` |
 | Claude plugin marketplace | `.agents/plugins/marketplace.json` and `codex plugin marketplace add` |
 | Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
@@ -76,7 +79,30 @@ cp examples/hooks.json.example ~/.codex/hooks.json
 
 # 6. Add a local Codex plugin marketplace, if you use in-house plugins
 codex plugin marketplace add "$(pwd)/marketplace/example-local"
+
+# 7. Audit the whole workspace; this command is read-only.
+scripts/audit-codex-migration.sh ~/projects
 ```
+
+## Continuous PR Tracking
+
+Do not wait for a complete feature before creating its review surface. After the first
+commit on a work branch, run:
+
+```bash
+scripts/track-branch-pr.sh /path/to/repo
+```
+
+The command refuses `main` and `master`, verifies GitHub CLI authentication, pushes the
+current branch, and opens a draft PR when none exists. On later commits it pushes the
+same branch and reports the existing PR. A closed or merged PR causes a failure so one
+branch cannot silently accumulate a second review history. Set `PR_TRACK_BASE` or
+`PR_TRACK_REMOTE` only when a repository does not use its detected defaults.
+
+The workspace and project `AGENTS.md` templates make this first-commit draft-PR flow the
+default agent policy. PR creation is intentionally explicit rather than a hidden Git
+hook: commits stay usable offline, while every agent session is still required to run
+the tracker before switching branches or handing off work. The script never merges.
 
 ## Per-Repo Harness
 
@@ -100,9 +126,28 @@ project-level starter.
 
 ## Optional Hooks
 
-Codex has a hook feature in current CLI builds, but hook behavior and payload details
-can vary by version. This harness includes `examples/hooks.json.example` for users who
-want auto-init behavior similar to the old Claude SessionStart hook.
+Codex supports lifecycle hooks including `SessionStart`, `Stop`, tool hooks, and
+compaction hooks. This harness includes `examples/hooks.json.example` for users who
+want auto-init behavior similar to the old Claude SessionStart hook. Codex requires
+non-managed hooks to be reviewed and trusted; inspect them with `/hooks` after install.
+The example also wires `codex-local-diff-review.sh`, which adapts the existing read-only
+Ollama reviewer to Codex's `continue` / `stopReason` / `systemMessage` Stop-hook schema.
+
+## Migration Audit
+
+`scripts/audit-codex-migration.sh` checks the workspace without changing it. It reports:
+
+- `CLAUDE.md` files without a sibling `AGENTS.md`.
+- `AGENTS.md` files larger than Codex's default 32 KiB instruction budget.
+- `.claude-harness/` directories without `.codex-harness/` siblings.
+- Missing `CLAUDE.md` fallback or an undersized instruction budget in Codex config.
+
+The fallback is transitional. Codex prefers `AGENTS.md` when both files exist, so repos
+can be adapted one at a time without losing local instructions in the meantime.
+Legacy-only instruction and harness paths are informational when the fallback is active;
+pass `--strict` as the second argument to make them fail the audit. Third-party, vendored,
+and embedded skill trees are excluded by default because their instruction files are owned
+upstream and should not be rewritten by a workspace migration.
 
 Use the explicit initializer when you want predictable behavior:
 

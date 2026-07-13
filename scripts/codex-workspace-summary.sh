@@ -21,10 +21,15 @@ else
 fi
 
 if [ -f "$workspace/AGENTS.md" ]; then
-  echo "Workspace instructions: $workspace/AGENTS.md"
+  bytes="$(wc -c < "$workspace/AGENTS.md" | tr -d ' ')"
+  echo "Workspace instructions: $workspace/AGENTS.md ($bytes bytes)"
 else
   echo "Workspace instructions: missing $workspace/AGENTS.md"
 fi
+
+legacy_only="$(find "$workspace" -maxdepth 4 -type f -name CLAUDE.md \
+  ! -exec sh -c 'test -f "$(dirname "$1")/AGENTS.md"' _ {} \; 2>/dev/null | wc -l | tr -d ' ')"
+echo "Legacy-only instruction files: $legacy_only"
 
 if [ -d "$workspace/.codex-harness" ]; then
   echo "Harness: $workspace/.codex-harness"
