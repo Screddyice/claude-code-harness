@@ -27,6 +27,8 @@ Primary stack:
 - Prefer existing patterns over new abstractions.
 - Do not commit secrets, generated auth caches, or local logs.
 - Do not run production mutations without explicit confirmation.
+- Open a draft PR immediately after the first commit on a work branch, push later
+  checkpoints to it, and never leave keepable branch commits without a PR.
 
 ## Architecture
 

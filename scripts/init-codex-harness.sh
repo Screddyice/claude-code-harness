@@ -49,6 +49,8 @@ write_if_missing() {
 write_if_missing "$harness/config.json" '{
   "version": 1,
   "agent": "codex",
+  "instructionFile": "AGENTS.md",
+  "legacyInstructionFallback": "CLAUDE.md",
   "purpose": "Per-repo scaffolding for Codex context, lightweight memory, and planning artifacts",
   "createdBy": "init-codex-harness.sh"
 }'
@@ -101,6 +103,8 @@ Document the project purpose, owner, stack, and safety constraints here.
 - Prefer existing project patterns.
 - Do not commit secrets, generated auth caches, or local logs.
 - Ask before mutating production systems or external accounts.
+- Open a draft PR immediately after the first commit on a work branch, push later
+  checkpoints to it, and never leave keepable branch commits without a PR.
 AGENTS
 fi
 
