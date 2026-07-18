@@ -11,6 +11,7 @@ Run before handoff:
 bash -n scripts/*.sh
 scripts/test-codex-local-diff-review.sh
 scripts/test-track-branch-pr.sh
+scripts/test-install-llmjury-orchestration.sh
 scripts/audit-codex-migration.sh /path/to/workspace
 git diff --check
 ```

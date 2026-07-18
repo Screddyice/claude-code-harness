@@ -24,6 +24,7 @@ codex-harness/
 ├── scripts/
 │   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
 │   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
+│   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
@@ -80,9 +81,44 @@ cp examples/hooks.json.example ~/.codex/hooks.json
 # 6. Add a local Codex plugin marketplace, if you use in-house plugins
 codex plugin marketplace add "$(pwd)/marketplace/example-local"
 
-# 7. Audit the whole workspace; this command is read-only.
+# 7. Optional: install bidirectional Claude/Codex orchestration (requires LLM-Jury)
+scripts/install-llmjury-orchestration.sh
+
+# 8. Audit the whole workspace; this command is read-only.
 scripts/audit-codex-migration.sh ~/projects
 ```
+
+## Optional LLM-Jury Orchestration
+
+When `llmjury` is installed, the harness can make Claude Code and Codex cooperate from
+either starting point:
+
+```text
+Claude session → Claude plans → Codex executes ─┐
+                                                ├→ verify → finish
+Codex session  → Claude plans ← Codex requests ─┘    │
+                         ↑                           │ new evidence
+                         └──── dynamic replan ───────┘
+
+Testable Python unit → local Ollama council → independent verifier → integrate
+```
+
+Run the idempotent installer:
+
+```bash
+scripts/install-llmjury-orchestration.sh
+```
+
+It calls `llmjury install-claude` and `llmjury install-codex`, then verifies both
+skill files. On non-trivial work, the Codex skill requests a read-only structured
+Claude plan before execution and asks Claude to replan when tests or repository
+evidence invalidate the plan. The Claude skill delegates bounded implementation to a
+workspace-confined Codex agent. Local models remain limited to code units with a real
+oracle; the verifier, not a vote, determines whether their output can be integrated.
+
+This integration is optional: the harness works without LLM-Jury. Restart both Claude
+Code and Codex after first installation so their skill catalogs refresh. Use `--force`
+only to replace locally modified installed copies.
 
 ## Continuous PR Tracking
 

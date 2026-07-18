@@ -43,6 +43,15 @@ else
   echo "Marketplace: none at $workspace/.agents/plugins/marketplace.json"
 fi
 
+claude_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+codex_root="${CODEX_HOME:-$HOME/.codex}"
+if [ -f "$claude_root/skills/llm-jury-delegate/SKILL.md" ] \
+  && [ -f "$codex_root/skills/llm-jury-orchestrate/SKILL.md" ]; then
+  echo "LLM-Jury orchestration: ready (Claude <-> Codex)"
+else
+  echo "LLM-Jury orchestration: not installed (optional)"
+fi
+
 if command -v codex >/dev/null 2>&1; then
   echo
   codex mcp list 2>/dev/null || true
