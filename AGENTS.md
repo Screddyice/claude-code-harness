@@ -8,8 +8,9 @@ of company names, credentials, hostnames, account IDs, and private project ident
 Run before handoff:
 
 ```bash
-bash -n scripts/*.sh
+find scripts -name '*.sh' -print0 | xargs -0 bash -n
 scripts/test-codex-local-diff-review.sh
+scripts/test-shared-hooks.sh
 scripts/test-track-branch-pr.sh
 scripts/test-install-llmjury-orchestration.sh
 scripts/audit-codex-migration.sh /path/to/workspace
