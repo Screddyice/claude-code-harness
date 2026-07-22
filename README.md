@@ -25,6 +25,7 @@ codex-harness/
 │   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
 │   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
 │   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
+│   ├── hooks/                           # shared hook logic and runtime adapters
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
@@ -166,8 +167,23 @@ Codex supports lifecycle hooks including `SessionStart`, `Stop`, tool hooks, and
 compaction hooks. This harness includes `examples/hooks.json.example` for users who
 want auto-init behavior similar to the old Claude SessionStart hook. Codex requires
 non-managed hooks to be reviewed and trusted; inspect them with `/hooks` after install.
-The example also wires `codex-local-diff-review.sh`, which adapts the existing read-only
-Ollama reviewer to Codex's `continue` / `stopReason` / `systemMessage` Stop-hook schema.
+
+The `scripts/hooks/` directory is the canonical runtime for hooks shared by Claude Code
+and Codex. Point each tool's config at this directory instead of keeping executable
+copies under `~/.claude` and `~/.codex`. Both tools run the same automatic PR tracker
+and local diff reviewer. Thin Stop-hook adapters preserve each tool's JSON contract:
+
+| Behavior | Claude Code command | Codex command |
+|----------|---------------------|---------------|
+| Push branches and open draft PRs | `scripts/hooks/auto-pr-push.sh` | `scripts/hooks/auto-pr-push.sh` |
+| Enforce one PR per work branch | `scripts/hooks/enforce-pr-claude.sh` | `scripts/hooks/enforce-pr-codex.sh` |
+| Review the current diff with Ollama | `scripts/hooks/local-diff-review.sh` | `scripts/hooks/local-diff-review-codex.sh` |
+
+The shared PR hook writes its log to `~/.cache/claude-code-harness/auto-pr-push.log`.
+Set `HARNESS_PR_OWNERS` to a space-separated allowlist in both tool configs; an empty
+allowlist disables automatic pushes.
+The old top-level `scripts/codex-local-diff-review.sh` remains as a compatibility entry
+point. Run `scripts/test-shared-hooks.sh` after changing shared logic or an adapter.
 
 ## Migration Audit
 
