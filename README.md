@@ -196,6 +196,32 @@ allowlist disables automatic pushes.
 The old top-level `scripts/codex-local-diff-review.sh` remains as a compatibility entry
 point. Run `scripts/test-shared-hooks.sh` after changing shared logic or an adapter.
 
+### Local diff reviewer GPU cost
+
+The reviewer runs on `Stop`, so it fires once per turn. It used to default to
+`gemma3:12b` with no rate limit, which meant a 13 GB load onto the GPU dozens of
+times in a working session. Two defaults changed on 2026-07-31:
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `LOCAL_REVIEW_MODEL` | `qwen3.5:4b-64k` | ~3 GB instead of ~13 GB, and loads fast enough to stay resident between turns |
+| `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
+| `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
+
+The cooldown collapses a burst of rapid turns into one review over the
+accumulated diff. It is keyed per repository and checked *before* the diff-hash
+marker is written, so a skipped turn does not mark that diff as already
+reviewed; an unchanged diff is still reviewed once the cooldown expires. A
+missing or corrupt stamp reads as "never reviewed" and lets the review proceed,
+so the reviewer cannot be wedged shut by a bad cache file.
+
+Findings still arrive mid-session. The Claude Code hook sets `asyncRewake`, so
+the review runs in the background and wakes the session when it flags
+something; moving the reviewer to `SessionEnd` would leave no session to wake.
+
+Run `scripts/test-local-diff-review-cooldown.sh` after changing the cooldown or
+cache-key logic.
+
 ## Migration Audit
 
 `scripts/audit-codex-migration.sh` checks the workspace without changing it. It reports:
