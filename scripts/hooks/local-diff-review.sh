@@ -6,10 +6,16 @@
 set -u
 
 [ "${LOCAL_REVIEW:-1}" = "1" ] || exit 0
-model="${LOCAL_REVIEW_MODEL:-gemma3:12b}"
+# Small model by default (2026-07-31). gemma3:12b meant a 13 GB load onto the
+# GPU on every Stop with a changed diff; qwen3.5:4b-64k is ~3 GB and loads fast
+# enough to stay resident between turns. Set LOCAL_REVIEW_MODEL to override.
+model="${LOCAL_REVIEW_MODEL:-qwen3.5:4b-64k}"
 ollama="${LOCAL_REVIEW_OLLAMA_URL:-http://127.0.0.1:11434}"
 max_diff_bytes="${LOCAL_REVIEW_MAX_DIFF_BYTES:-60000}"
 cache_dir="${LOCAL_REVIEW_CACHE_DIR:-$HOME/.cache/local-diff-review}"
+# Minimum gap between reviews of the same repo. Collapses a burst of rapid turns
+# into one review over the accumulated diff instead of one per turn.
+cooldown="${LOCAL_REVIEW_COOLDOWN_SECONDS:-1200}"
 
 top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 origin="$(git -C "$top" remote get-url origin 2>/dev/null || true)"
@@ -34,8 +40,19 @@ mkdir -p "$cache_dir"
 repo_key="$(printf %s "$top" | shasum -a 256 | cut -c1-16)"
 diff_hash="$(printf %s "$diff" | shasum -a 256 | cut -c1-16)"
 marker="$cache_dir/$repo_key"
+stamp="$cache_dir/$repo_key.last"
 [ "$(cat "$marker" 2>/dev/null)" = "$diff_hash" ] && exit 0
+
+# Cooldown. Checked BEFORE the diff-hash marker is stamped: stamping on a skip
+# would mark this diff "already reviewed", so an unchanged diff would never get
+# reviewed once the cooldown expired.
+now="$(date +%s)"
+last="$(cat "$stamp" 2>/dev/null || true)"
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+[ "$(( now - last ))" -lt "$cooldown" ] && exit 0
+
 printf %s "$diff_hash" > "$marker"
+printf %s "$now" > "$stamp"
 
 curl -sf -m 5 "$ollama/api/tags" >/dev/null 2>&1 || exit 0
 
