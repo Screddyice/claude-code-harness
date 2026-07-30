@@ -178,6 +178,17 @@ and local diff reviewer. Thin Stop-hook adapters preserve each tool's JSON contr
 | Push branches and open draft PRs | `scripts/hooks/auto-pr-push.sh` | `scripts/hooks/auto-pr-push.sh` |
 | Enforce one PR per work branch | `scripts/hooks/enforce-pr-claude.sh` | `scripts/hooks/enforce-pr-codex.sh` |
 | Review the current diff with Ollama | `scripts/hooks/local-diff-review.sh` | `scripts/hooks/local-diff-review-codex.sh` |
+| Distil session left-off into HyperSwarm | (wired directly in `~/.claude/settings.json`) | `scripts/hooks/codex-hyperswarm-leftoff.sh` |
+
+`codex-hyperswarm-leftoff.sh` runs on Codex `SessionEnd` and gives Codex parity
+with Claude Code's HyperSwarm feed: it hands the ending session's id to
+`hyperswarm capture --runtime claude_mem_session` (significance-gated, with the
+left-off fallback) and pushes the store to the canonical host, so remote
+Hermes/Telegram agents can see where Codex coding left off. A detached worker
+waits for claude-mem's async session summary before capturing, and two guards
+stop recursion: the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
+own `codex exec` child, plus a skip for sessions whose prompt is the gate
+preamble. Logs to `/tmp/hs-codex-push.log`.
 
 The shared PR hook writes its log to `~/.cache/claude-code-harness/auto-pr-push.log`.
 Set `HARNESS_PR_OWNERS` to a space-separated allowlist in both tool configs; an empty
