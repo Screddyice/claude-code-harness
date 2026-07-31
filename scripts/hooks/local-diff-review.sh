@@ -62,6 +62,47 @@ last="$(cat "$stamp" 2>/dev/null || true)"
 case "$last" in ''|*[!0-9]*) last=0 ;; esac
 [ "$(( now - last ))" -lt "$cooldown" ] && exit 0
 
+# Free-memory gate. This hook loads a multi-GB model straight through Ollama's
+# HTTP API, so llm-jury's RAM preflight never sees this path and cannot protect
+# it. Without a check of its own the reviewer will happily ask for ~7.5 GB on a
+# host that has 2 GB left.
+#
+# That is not a theoretical risk here. On 2026-07-31 this machine panicked four
+# times, and never as a clean OOM: the VM compressor reached 100% of its SEGMENT
+# limit while compressed pages sat at 38% of theirs, which wedges every thread
+# that touches memory and starves watchdogd past its 90-second deadline.
+#
+# Checked BEFORE the marker is stamped, for the same reason the cooldown is: a
+# skip must not record this diff as reviewed, or it would never be looked at
+# again once memory freed up.
+free_mb_now() {
+  # Kept a function rather than inlined: a `case` inside $(...) inside a
+  # ${VAR:-default} expansion parses as the end of the substitution.
+  case "$(uname -s)" in
+    Darwin)
+      # free + inactive + purgeable: macOS keeps very little memory outright
+      # free, so counting only "Pages free" under-reports badly.
+      vm_stat 2>/dev/null | awk '
+        /page size of/ { for (i = 1; i <= NF; i++) if ($i == "of") ps = $(i + 1) }
+        /^Pages (free|inactive|purgeable)/ { gsub(/\./, "", $NF); p += $NF }
+        END { if (ps > 0 && p > 0) printf "%d", p * ps / 1048576 }' ;;
+    Linux)
+      awk '/^MemAvailable:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null ;;
+  esac
+}
+
+min_free_mb="${LOCAL_REVIEW_MIN_FREE_MB:-9000}"
+if [ "$min_free_mb" -gt 0 ] 2>/dev/null; then
+  free_mb="${LOCAL_REVIEW_FREE_MB_OVERRIDE:-}"
+  [ -n "$free_mb" ] || free_mb="$(free_mb_now)"
+  case "$free_mb" in
+    # Unreadable: skip the gate rather than block. This exists to stop a
+    # known-bad load, not to become a new way for the hook to fail.
+    ''|*[!0-9]*) : ;;
+    *) [ "$free_mb" -lt "$min_free_mb" ] && exit 0 ;;
+  esac
+fi
+
 printf %s "$diff_hash" > "$marker"
 printf %s "$now" > "$stamp"
 

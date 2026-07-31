@@ -237,7 +237,29 @@ times in a working session. Two defaults changed on 2026-07-31:
 | `LOCAL_REVIEW_MODEL` | `qwen3.5:4b` | Small model instead of `gemma3:12b`'s ~13 GB |
 | `LOCAL_REVIEW_KEEP_ALIVE` | `30s` | Unload after the review instead of holding GB between turns |
 | `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
+| `LOCAL_REVIEW_MIN_FREE_MB` | `9000` | Skip the review when less free RAM than the model needs |
 | `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
+
+#### Why the reviewer needs a memory check of its own
+
+The reviewer loads its model straight through Ollama's HTTP API. That path never touches
+llm-jury, so **llm-jury's RAM preflight cannot protect it** — the two guards are on
+different code paths, and the reviewer had none. It would ask for ~7.5 GB on a host with
+2 GB left.
+
+`LOCAL_REVIEW_MIN_FREE_MB` closes that. Free memory is measured as free + inactive +
+purgeable on macOS (which keeps very little memory outright free, so counting only "Pages
+free" under-reports badly) and `MemAvailable` on Linux. The check runs *before* the
+diff-hash marker is stamped, for the same reason the cooldown does: a skip must not record
+the diff as reviewed, or it would never be looked at again once memory freed up. When free
+memory is unreadable the gate is skipped rather than enforced — it exists to stop a
+known-bad load, not to become a new way for the hook to fail.
+
+This closed a real gap. On 2026-07-31 this host panicked four times, and never as a clean
+OOM: the VM compressor reached **100% of its segment limit while compressed pages sat at
+38% of theirs**, which wedges every thread that touches memory and starves `watchdogd`
+past its 90-second deadline. Anything able to claim multiple GB without looking at what is
+free contributes to that, and an unguarded reviewer firing on every turn qualifies.
 
 #### Measure resident size, not weights
 
@@ -273,7 +295,7 @@ Findings still arrive mid-session. The Claude Code hook sets `asyncRewake`, so
 the review runs in the background and wakes the session when it flags
 something; moving the reviewer to `SessionEnd` would leave no session to wake.
 
-Run `scripts/test-local-diff-review-cooldown.sh` after changing the cooldown or
+Run `scripts/test-local-diff-review-cooldown.sh` and `scripts/test-local-diff-review-memory.sh` after changing the cooldown, the memory gate, or
 cache-key logic.
 
 ## Migration Audit
