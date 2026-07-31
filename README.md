@@ -204,9 +204,33 @@ times in a working session. Two defaults changed on 2026-07-31:
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `LOCAL_REVIEW_MODEL` | `qwen3.5:4b-64k` | ~3 GB instead of ~13 GB, and loads fast enough to stay resident between turns |
+| `LOCAL_REVIEW_MODEL` | `qwen3.5:4b` | Small model instead of `gemma3:12b`'s ~13 GB |
+| `LOCAL_REVIEW_KEEP_ALIVE` | `30s` | Unload after the review instead of holding GB between turns |
 | `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
 | `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
+
+#### Measure resident size, not weights
+
+This table originally claimed the small model cost "~3 GB, and loads fast enough to stay
+resident between turns". Both halves of that were wrong, and expensively so.
+
+~3 GB is the model's **weights**. Ollama sizes the KV cache as `num_ctx ×
+OLLAMA_NUM_PARALLEL`, and the reviewer asks for `num_ctx 24576`, so at 4 parallel slots
+the tag measured **7.5 GB resident** with `ollama ps`. Keeping that resident between
+turns then denied the memory to everything else on the same Ollama server. Alongside an
+llm-jury council it over-committed a 36 GB Mac and panicked it twice on 2026-07-31
+(`watchdog timeout: no checkins from watchdogd`) — wired GPU allocations cannot be paged
+out, so the host starves its kernel watchdog rather than raising a catchable OOM.
+
+Two corrections followed. `keep_alive` is now short by default: with a 20 minute
+cooldown the next review is far away, so lingering trades a few seconds of reload for
+several GB held hostage. And the default tag dropped the `-64k` suffix — same model ID,
+but the plain tag cannot silently fall back to a 64k context if `num_ctx` is ever
+dropped from the request.
+
+When changing the model or context here, measure with `ollama ps` rather than reading
+`ollama list`; the first reports resident size, the second reports bytes on disk, and on
+a memory-constrained host the gap between them is the whole problem.
 
 The cooldown collapses a burst of rapid turns into one review over the
 accumulated diff. It is keyed per repository and checked *before* the diff-hash
