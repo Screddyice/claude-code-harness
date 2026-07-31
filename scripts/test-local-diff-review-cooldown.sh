@@ -87,8 +87,22 @@ echo $(( $(date +%s) - 100 )) > "$stamp"
 [ -f "$marker" ] || { echo "FAIL LOCAL_REVIEW_COOLDOWN_SECONDS override ignored" >&2; exit 1; }
 
 # ── default model is the small one (the GPU-cost decision, 2026-07-31) ───────
-grep -q 'LOCAL_REVIEW_MODEL:-qwen3.5:4b-64k' "$hook" || {
-  echo "FAIL default review model is not qwen3.5:4b-64k" >&2
+# Plain tag, not -64k: same model ID, but the -64k default context made this
+# 3.4 GB model 7.5 GB resident, and it was held between turns. With an explicit
+# num_ctx in the request the suffix bought nothing and cost memory the council
+# needed. Asserting the plain tag keeps the suffix from creeping back.
+grep -q 'LOCAL_REVIEW_MODEL:-qwen3.5:4b}' "$hook" || {
+  echo "FAIL default review model is not qwen3.5:4b" >&2
+  exit 1
+}
+
+# ── the model is released after the review, not held between turns ──────────
+grep -q 'LOCAL_REVIEW_KEEP_ALIVE:-30s' "$hook" || {
+  echo "FAIL default keep_alive is not 30s" >&2
+  exit 1
+}
+grep -q '"keep_alive"' "$hook" || {
+  echo "FAIL keep_alive is not sent in the request payload" >&2
   exit 1
 }
 

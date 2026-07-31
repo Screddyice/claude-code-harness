@@ -42,6 +42,40 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
   trap 'rmdir "$lockdir" 2>/dev/null' EXIT
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+  # Guards against re-proposing work that has already landed.
+  #
+  # The PR check below asks for `--state open`. After a SQUASH merge the PR for
+  # this branch is MERGED rather than open, so that count comes back 0 and the
+  # hook opens a second PR for work already on the base -- while the push above
+  # re-creates the remote branch the merge just deleted. Squash-merged commits
+  # are not ancestors of the base, so HOOK_AHEAD stays > 0 and cannot catch it
+  # either. Observed live on 2026-07-31: Screddyice/llm-jury#18 appeared ten
+  # seconds after #17 squash-merged, with an empty diff against main.
+  head_oid="$(git rev-parse HEAD 2>/dev/null || true)"
+
+  # (a) Local and free: the base already contains this exact tree. Only fires
+  #     once the local base ref has caught up, so it is the cheap case, not the
+  #     load-bearing one.
+  if [ -n "${HOOK_BASE:-}" ] && git diff --quiet "$HOOK_BASE" HEAD 2>/dev/null; then
+    printf '%s [skip] %s@%s adds nothing over %s (already landed)\n' \
+      "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$HOOK_BASE" >>"$log" 2>&1
+    exit 0
+  fi
+
+  # (b) This exact commit was already merged. Load-bearing for the race above,
+  #     where the local base ref is still pre-merge so (a) cannot see it yet.
+  #     Keyed on the merged head SHA, so a branch reused for NEW commits has a
+  #     different HEAD and correctly proceeds to a fresh PR.
+  if [ -n "$head_oid" ]; then
+    merged_oid="$(gh pr list --head "$HOOK_BRANCH" --state merged \
+      --json headRefOid --jq '.[0].headRefOid // empty' 2>>"$log")"
+    if [ -n "${merged_oid:-}" ] && [ "$merged_oid" = "$head_oid" ]; then
+      printf '%s [skip] %s@%s already merged as %s\n' \
+        "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$(printf '%.12s' "$merged_oid")" >>"$log" 2>&1
+      exit 0
+    fi
+  fi
+
   if [ "${AUTO_PR_PUSH_DRYRUN:-0}" = "1" ]; then
     printf '%s [DRYRUN] %s@%s (owner=%s, ahead=%s) -> would push + ensure draft PR\n' \
       "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$owner" "$HOOK_AHEAD" >>"$log" 2>&1
