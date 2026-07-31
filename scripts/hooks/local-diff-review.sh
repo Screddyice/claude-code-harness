@@ -6,16 +6,27 @@
 set -u
 
 [ "${LOCAL_REVIEW:-1}" = "1" ] || exit 0
-# Small model by default (2026-07-31). gemma3:12b meant a 13 GB load onto the
-# GPU on every Stop with a changed diff; qwen3.5:4b-64k is ~3 GB and loads fast
-# enough to stay resident between turns. Set LOCAL_REVIEW_MODEL to override.
-model="${LOCAL_REVIEW_MODEL:-qwen3.5:4b-64k}"
+# Small model by default (2026-07-31). gemma3:12b meant a 13 GB load onto the GPU
+# on every Stop with a changed diff.
+#
+# The "~3 GB" this comment used to claim for qwen3.5:4b was the weights only, and
+# that was wrong in the expensive direction: Ollama sizes KV as num_ctx x
+# OLLAMA_NUM_PARALLEL, so at 24576 ctx the tag measured 7.5 GB resident with
+# `ollama ps`. Combined with a council on the same server that over-committed a
+# 36 GB host and panicked it twice. Use the plain tag rather than -64k (same model
+# ID, and num_ctx below is explicit anyway) so a dropped num_ctx cannot silently
+# fall back to a 64k default. Set LOCAL_REVIEW_MODEL to override.
+model="${LOCAL_REVIEW_MODEL:-qwen3.5:4b}"
 ollama="${LOCAL_REVIEW_OLLAMA_URL:-http://127.0.0.1:11434}"
 max_diff_bytes="${LOCAL_REVIEW_MAX_DIFF_BYTES:-60000}"
 cache_dir="${LOCAL_REVIEW_CACHE_DIR:-$HOME/.cache/local-diff-review}"
 # Minimum gap between reviews of the same repo. Collapses a burst of rapid turns
 # into one review over the accumulated diff instead of one per turn.
 cooldown="${LOCAL_REVIEW_COOLDOWN_SECONDS:-1200}"
+# How long Ollama keeps the model resident after a review. Deliberately short: with
+# a 20 minute cooldown the next review is far away, so lingering only holds GB that
+# a council or another session needs. Trades a few seconds of reload for ~6 GB back.
+keep_alive="${LOCAL_REVIEW_KEEP_ALIVE:-30s}"
 
 top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 origin="$(git -C "$top" remote get-url origin 2>/dev/null || true)"
@@ -56,7 +67,7 @@ printf %s "$now" > "$stamp"
 
 curl -sf -m 5 "$ollama/api/tags" >/dev/null 2>&1 || exit 0
 
-review="$(DIFF="$diff" MODEL="$model" OLLAMA="$ollama" python3 - <<'PY' 2>/dev/null
+review="$(DIFF="$diff" MODEL="$model" OLLAMA="$ollama" KEEP_ALIVE="$keep_alive" python3 - <<'PY' 2>/dev/null
 import json
 import os
 import urllib.request
@@ -76,6 +87,9 @@ payload = {
         {"role": "user", "content": os.environ["DIFF"]},
     ],
     "stream": False,
+    # Unload promptly. The cooldown means the next review is ~20 min out, so
+    # staying resident only denies the GPU to whatever else needs it.
+    "keep_alive": os.environ.get("KEEP_ALIVE", "30s"),
     "options": {"num_ctx": 24576, "num_predict": 600},
 }
 request = urllib.request.Request(
