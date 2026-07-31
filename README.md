@@ -193,6 +193,36 @@ preamble. Logs to `/tmp/hs-codex-push.log`.
 The shared PR hook writes its log to `~/.cache/claude-code-harness/auto-pr-push.log`.
 Set `HARNESS_PR_OWNERS` to a space-separated allowlist in both tool configs; an empty
 allowlist disables automatic pushes.
+
+#### Duplicate-PR guard after a squash merge
+
+The hook decided whether a branch still needed a PR by asking `gh pr list --state open`.
+After a **squash** merge the branch's PR is `MERGED`, not open, so that count came back 0
+and the hook opened a *second* PR for work already sitting on the base — while its push
+re-created the remote branch the merge had just deleted. The "commits ahead of base"
+precondition cannot catch this either: a squash merge rewrites the commits, so the
+branch's own commits are never ancestors of the base and the branch looks permanently
+ahead.
+
+Seen live on 2026-07-31: `Screddyice/llm-jury#18` was opened ten seconds after `#17`
+squash-merged, carrying the same three commits and an empty diff against `main`. Left
+alone this recurs on every squash merge where the session has not yet switched branches.
+
+Two guards now run before the push:
+
+| Guard | Cost | Catches |
+|---|---|---|
+| base already contains this tree (`git diff --quiet <base> HEAD`) | local, free | the branch adds nothing, once the local base ref has caught up |
+| this exact commit is already merged (`gh pr list --state merged` head SHA) | one API call | the race above, where the local base ref is still pre-merge |
+
+The second is the load-bearing one, and it is keyed on the **merged head SHA** rather
+than the branch name, so reusing a branch for new commits after its PR merged still
+opens a fresh PR. This brings the automatic hook in line with `track-branch-pr.sh`,
+which already refused to add a second review history to a closed or merged PR.
+
+Because Claude Code, Codex, and Grok all run this same script — Codex via
+`~/.codex/hooks.json`, Grok via `[compat.claude] hooks = true` — the guard applies to
+all three. Run `scripts/test-auto-pr-push-merged-guard.sh` after changing it.
 The old top-level `scripts/codex-local-diff-review.sh` remains as a compatibility entry
 point. Run `scripts/test-shared-hooks.sh` after changing shared logic or an adapter.
 
