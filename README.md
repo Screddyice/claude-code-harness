@@ -242,9 +242,10 @@ Grok Build TUI (`~/.grok`) gets a **native** harness slice, not Claude-compat im
 
 | Channel | How it reaches Grok | Notes |
 |---------|---------------------|-------|
-| claude-mem write path | `~/.grok/hooks/claude-mem.json` → `scripts/claude-mem-hook.sh` | Platform source `grok`; Stop converts Grok `chat_history.jsonl` to Claude JSONL before summarize |
+| claude-mem write path | `~/.grok/hooks/claude-mem.json` → `scripts/claude-mem-hook.sh` | Platform source `grok`; **SessionEnd** summarizes (not every Stop); converts Grok `chat_history.jsonl` → Claude JSONL |
+| claude-mem compressor | Host proxy `:11435` (`claude-mem-host-proxy.py`) | Grok sessions use **Grok CLI** for mem, not Ollama. Codex/Claude sessions use their CLIs. Local Ollama only for local/qwen. See `~/.claude-mem/HOST-LLM-ROUTING.md` |
 | claude-mem read path | `~/.grok/rules/claude-mem-context.md` (SessionStart inject) + MCP `mcp-search` | Skills via `~/.grok/skills-claude-mem` symlink |
-| HyperSwarm left-off | `~/.grok/hooks/hyperswarm.json` → `hyperswarm-leftoff.sh` | Same distiller path as Codex |
+| HyperSwarm left-off | `~/.grok/hooks/hyperswarm.json` → `hyperswarm-leftoff.sh` | Same distiller path as Codex; waits for claude-mem summary |
 | PR tracking | `~/.grok/hooks/pr-tracking.json` → shared `auto-pr-push.sh` + `enforce-pr-grok.sh` | Owned-org allowlist only |
 | Local Ollama diff review | **not wired** | Resident ~7.5 GB + council load kernel-panicked the Mac twice on 2026-07-31 |
 | `[compat.claude] hooks/mcps` | **must stay false** | True double-fires Claude's chain into Grok; was a root cause of the panics |
@@ -284,7 +285,9 @@ sqlite3 ~/.claude-mem/claude-mem.db \
 ```
 
 A healthy setup shows `platform_source=grok` rows growing as you work, context in
-`~/.grok/rules/claude-mem-context.md`, and no Ollama model loaded solely for a Grok Stop.
+`~/.grok/rules/claude-mem-context.md`, host proxy `curl -s http://127.0.0.1:11435/health`
+reporting `proxy=host`, and **no** Ollama model loaded solely for Grok mem or a Grok Stop
+(`ollama ps` should stay empty unless you are in a local/qwen coding session or fusion).
 
 ### Local diff reviewer GPU cost
 

@@ -1,5 +1,5 @@
 {
-  "description": "claude-mem for Grok — shared memory with Claude Code / Codex",
+  "description": "claude-mem for Grok — shared memory with Claude Code / Codex (host LLM: Grok sessions compress via Grok CLI, not local Ollama)",
   "hooks": {
     "SessionStart": [
       {
@@ -38,21 +38,15 @@
         ]
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "\"$HOME/.grok/scripts/claude-mem-hook.sh\" summarize",
-            "timeout": 90,
+            "timeout": 180,
             "statusMessage": "Saving claude-mem summary"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
+          },
           {
             "type": "command",
             "command": "\"$HOME/.grok/scripts/claude-mem-hook.sh\" refresh-context",

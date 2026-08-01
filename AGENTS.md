@@ -45,3 +45,9 @@ Grok lives under `~/.grok` with its own hooks and scripts. Install with
 - Do not add `local-diff-review` to Grok Stop hooks.
 - claude-mem uses platform source `grok`; context injects via
   `~/.grok/rules/claude-mem-context.md` and MCP `mcp-search`.
+- **Mem compression is host-routed (2026-08-01):** Grok sessions compress with
+  Grok CLI, Codex with Codex CLI, Claude with Claude CLI (Codex fallback on
+  weekly limit). Local Ollama `qwen3.5:4b-mem` is only for local/qwen sessions.
+  Host proxy: `~/.local/bin/claude-mem-host-proxy.py` on `:11435`; settings use
+  model `claude-mem-auto`. See `~/.claude-mem/HOST-LLM-ROUTING.md`. A healthy
+  Grok session must not load Ollama solely for mem.
