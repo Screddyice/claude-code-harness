@@ -31,3 +31,31 @@ Claude surfaces; `--strict` treats every legacy-only path as a failure.
 - After the first commit on a work branch, run `scripts/track-branch-pr.sh` to push it
   and open a draft PR. Run it after later commits so review tracks ongoing progress.
 - Never leave a committed work branch without a PR, and never self-merge it.
+
+## Workspace root (Shawn Mac)
+
+On this machine the multi-org workspace is `~/projects` (not a single git repo). Harness
+hooks install into user config (`~/.claude`, `~/.codex`, `~/.grok`) so they apply to
+**any** cwd under `~/projects`, regardless of org folder. Workspace instructions live at
+`~/projects/AGENTS.md` and `~/projects/CLAUDE.md`; org identity is still git `origin`.
+Do not require re-installing the harness per org.
+
+## Grok (native, not compat import)
+
+Grok lives under `~/.grok` with its own hooks and scripts. Install with
+`scripts/install-grok-harness.sh`. Hard rules:
+
+- Keep `[compat.claude] hooks = false` and `mcps = false`. Enabling them imports Claude
+  Code's full hook chain (including the Ollama diff reviewer) into every Grok tool call
+  and has kernel-panicked this host.
+- Wire PR tracking and claude-mem through `examples/grok/*.json` + `scripts/grok/*`,
+  never by turning on Claude compat hooks.
+- Do not add `local-diff-review` to Grok Stop hooks.
+- claude-mem uses platform source `grok`; context injects via
+  `~/.grok/rules/claude-mem-context.md` and MCP `mcp-search`.
+- **Mem compression is host-routed (2026-08-01):** Grok sessions compress with
+  Grok CLI, Codex with Codex CLI, Claude with Claude CLI (Codex fallback on
+  weekly limit). Local Ollama `qwen3.5:4b-mem` is only for local/qwen sessions.
+  Host proxy: `~/.local/bin/claude-mem-host-proxy.py` on `:11435`; settings use
+  model `claude-mem-auto`. See `~/.claude-mem/HOST-LLM-ROUTING.md`. A healthy
+  Grok session must not load Ollama solely for mem.

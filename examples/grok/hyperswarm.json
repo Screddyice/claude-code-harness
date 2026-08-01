@@ -1,0 +1,18 @@
+{
+  "description": "HyperSwarm session distillation for Grok (shared claude-mem → Hostinger corpus)",
+  "hooks": {
+    "SessionEnd": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.grok/scripts/hyperswarm-leftoff.sh\"",
+            "timeout": 15,
+            "statusMessage": "Queueing HyperSwarm left-off distill"
+          }
+        ]
+      }
+    ]
+  }
+}
