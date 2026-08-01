@@ -1,0 +1,30 @@
+{
+  "description": "Every branch gets a PR — shared auto-pr-push + Grok Stop enforcer (no local-diff-review; that stays off on Grok)",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env HARNESS_PR_OWNERS='teamnebula-ai screddyice' \"$HOME/projects/Screddyice/claude-code-harness/scripts/hooks/auto-pr-push.sh\"",
+            "timeout": 15,
+            "statusMessage": "Auto-pushing branch + ensuring draft PR"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/projects/Screddyice/claude-code-harness/scripts/hooks/enforce-pr-grok.sh\"",
+            "timeout": 20,
+            "statusMessage": "Checking branch has a PR"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "description": "claude-mem for Grok — shared memory with Claude Code / Codex",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.grok/scripts/claude-mem-hook.sh\" start",
+            "timeout": 60,
+            "statusMessage": "Loading claude-mem"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.grok/scripts/claude-mem-hook.sh\" session-init",
+            "timeout": 60,
+            "statusMessage": "Recording prompt in claude-mem"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.grok/scripts/claude-mem-hook.sh\" observation",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.grok/scripts/claude-mem-hook.sh\" summarize",
+            "timeout": 90,
+            "statusMessage": "Saving claude-mem summary"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.grok/scripts/claude-mem-hook.sh\" refresh-context",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
