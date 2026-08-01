@@ -234,6 +234,14 @@ has panicked this host. Run `scripts/test-auto-pr-push-merged-guard.sh` after ch
 The old top-level `scripts/codex-local-diff-review.sh` remains as a compatibility entry
 point. Run `scripts/test-shared-hooks.sh` after changing shared logic or an adapter.
 
+## Workspace root (multi-org)
+
+When this harness is installed on a multi-org machine (e.g. Shawn's `~/projects`), hooks and
+skills are **user-global**. Opening Claude Code / Codex / Grok from the workspace root or
+from any org/repo under it uses the same harness. Workspace docs: `~/projects/CLAUDE.md`,
+`~/projects/AGENTS.md`. Org folders only add thin pointers; git `origin` selects company
+credentials.
+
 ## Grok harness support
 
 Grok Build TUI (`~/.grok`) gets a **native** harness slice, not Claude-compat import.

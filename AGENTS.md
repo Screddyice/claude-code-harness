@@ -32,6 +32,14 @@ Claude surfaces; `--strict` treats every legacy-only path as a failure.
   and open a draft PR. Run it after later commits so review tracks ongoing progress.
 - Never leave a committed work branch without a PR, and never self-merge it.
 
+## Workspace root (Shawn Mac)
+
+On this machine the multi-org workspace is `~/projects` (not a single git repo). Harness
+hooks install into user config (`~/.claude`, `~/.codex`, `~/.grok`) so they apply to
+**any** cwd under `~/projects`, regardless of org folder. Workspace instructions live at
+`~/projects/AGENTS.md` and `~/projects/CLAUDE.md`; org identity is still git `origin`.
+Do not require re-installing the harness per org.
+
 ## Grok (native, not compat import)
 
 Grok lives under `~/.grok` with its own hooks and scripts. Install with
