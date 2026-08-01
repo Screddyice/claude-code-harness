@@ -111,6 +111,14 @@ else
   warn "claude-mem worker not responding on :$PORT (first Grok SessionStart starts it)"
 fi
 
+# --- rules (workspace root + mem context) ---
+mkdir -p "$GROK_HOME/rules"
+# projects-workspace is maintained on the machine; keep a copy under examples if present
+if [[ -f "$REPO_ROOT/examples/grok/projects-workspace.md" ]]; then
+  install_file "$REPO_ROOT/examples/grok/projects-workspace.md" "$GROK_HOME/rules/projects-workspace.md"
+fi
+# claude-mem-context is written by the live worker; do not overwrite if present
+
 # --- what we deliberately do NOT install ---
 echo
 echo "Deliberately NOT installed on Grok:"

@@ -242,6 +242,12 @@ from any org/repo under it uses the same harness. Workspace docs: `~/projects/CL
 `~/projects/AGENTS.md`. Org folders only add thin pointers; git `origin` selects company
 credentials.
 
+| Harness | Workspace entry points |
+|---------|------------------------|
+| Claude Code | `~/projects/CLAUDE.md`, `~/projects/.claude/skills` → `~/.claude/skills` |
+| Codex | `~/.codex/AGENTS.md` + `~/projects/AGENTS.md`; skills under `~/.codex/skills` (agents skills linked); hooks in `~/.codex/hooks.json`; zsh `codex` loads `~/projects/.env` |
+| Grok | `~/.grok/rules/projects-workspace.md`; `[skills].paths` includes agents + claude skills; native hooks; `grok` wrapper loads `~/projects/.env` |
+
 ## Grok harness support
 
 Grok Build TUI (`~/.grok`) gets a **native** harness slice, not Claude-compat import.
