@@ -1,3 +1,5 @@
+> **claude-mem removed 2026-08-02.** Do not reinstall the thedotmack plugin, host proxy, mcp-search, or Grok mem hooks. Shared observation memory is gone from this harness.
+
 # Codex Harness
 
 This repository is the sanitized, reusable Codex harness template. Keep examples free
@@ -48,14 +50,10 @@ Grok lives under `~/.grok` with its own hooks and scripts. Install with
 - Keep `[compat.claude] hooks = false` and `mcps = false`. Enabling them imports Claude
   Code's full hook chain (including the Ollama diff reviewer) into every Grok tool call
   and has kernel-panicked this host.
-- Wire PR tracking and claude-mem through `examples/grok/*.json` + `scripts/grok/*`,
+- Wire PR tracking and  (claude-mem removed) /grok/*.json` + `scripts/grok/*`,
   never by turning on Claude compat hooks.
 - Do not add `local-diff-review` to Grok Stop hooks.
-- claude-mem uses platform source `grok`; context injects via
-  `~/.grok/rules/claude-mem-context.md` and MCP `mcp-search`.
 - **Mem compression is host-routed (2026-08-01):** Grok sessions compress with
   Grok CLI, Codex with Codex CLI, Claude with Claude CLI (Codex fallback on
   weekly limit). Local Ollama `qwen3.5:4b-mem` is only for local/qwen sessions.
-  Host proxy: `~/.local/bin/claude-mem-host-proxy.py` on `:11435`; settings use
-  model `claude-mem-auto`. See `~/.claude-mem/HOST-LLM-ROUTING.md`. A healthy
   Grok session must not load Ollama solely for mem.

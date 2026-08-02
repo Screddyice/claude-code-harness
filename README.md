@@ -1,3 +1,5 @@
+> **claude-mem removed 2026-08-02.** Do not reinstall the thedotmack plugin, host proxy, mcp-search, or Grok mem hooks. Shared observation memory is gone from this harness.
+
 # codex-harness
 
 A starter template for organizing a multi-company [OpenAI Codex CLI](https://github.com/openai/codex)
@@ -21,14 +23,11 @@ codex-harness/
 │   ├── AGENTS.md.project.example     # per-repo AGENTS.md starter
 │   ├── config.toml.example           # ~/.codex/config.toml starter
 │   ├── hooks.json.example            # optional Codex hook wiring
-│   └── grok/                         # Grok-native hooks (claude-mem, PR, HyperSwarm)
-├── scripts/
+│   └── grok/                         # Grok-native hooks ( (claude-mem removed) ├── scripts/
 │   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
 │   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
 │   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
-│   ├── install-grok-harness.sh       # install Grok + claude-mem native wiring
-│   ├── grok/                         # Grok bridge scripts (claude-mem, HyperSwarm)
-│   ├── hooks/                           # shared hook logic and runtime adapters
+│   ├── install-grok-harness.sh       # install Grok +  (claude-mem removed) │   ├── grok/                         # Grok bridge scripts ( (claude-mem removed) │   ├── hooks/                           # shared hook logic and runtime adapters
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
@@ -184,15 +183,13 @@ each tool's JSON contract:
 | Enforce one PR per work branch | `enforce-pr-claude.sh` | `enforce-pr-codex.sh` | `enforce-pr-grok.sh` |
 | Review the current diff with Ollama | `local-diff-review.sh` | `local-diff-review-codex.sh` | **off** (GPU panic risk) |
 | Distil session left-off into HyperSwarm | Claude settings | `codex-hyperswarm-leftoff.sh` | `scripts/grok/hyperswarm-leftoff.sh` |
-| Shared claude-mem observations | plugin hooks | Codex adapter | `scripts/grok/claude-mem-hook.sh` |
 
 `codex-hyperswarm-leftoff.sh` runs on Codex `SessionEnd` and gives Codex parity
 with Claude Code's HyperSwarm feed: it hands the ending session's id to
 `hyperswarm capture --runtime claude_mem_session` (significance-gated, with the
 left-off fallback) and pushes the store to the canonical host, so remote
 Hermes/Telegram agents can see where Codex coding left off. A detached worker
-waits for claude-mem's async session summary before capturing, and two guards
-stop recursion: the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
+waits for  (claude-mem removed) stop recursion: the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
 own `codex exec` child, plus a skip for sessions whose prompt is the gate
 preamble. Logs to `/tmp/hs-codex-push.log`.
 
@@ -256,10 +253,7 @@ Grok Build TUI (`~/.grok`) gets a **native** harness slice, not Claude-compat im
 
 | Channel | How it reaches Grok | Notes |
 |---------|---------------------|-------|
-| claude-mem write path | `~/.grok/hooks/claude-mem.json` → `scripts/claude-mem-hook.sh` | Platform source `grok`; **SessionEnd** summarizes (not every Stop); converts Grok `chat_history.jsonl` → Claude JSONL |
-| claude-mem compressor | Host proxy `:11435` (`claude-mem-host-proxy.py`) | Grok sessions use **Grok CLI** for mem, not Ollama. Codex/Claude sessions use their CLIs. Local Ollama only for local/qwen. See `~/.claude-mem/HOST-LLM-ROUTING.md` |
-| claude-mem read path | `~/.grok/rules/claude-mem-context.md` (SessionStart inject) + MCP `mcp-search` | Skills via `~/.grok/skills-claude-mem` symlink |
-| HyperSwarm left-off | `~/.grok/hooks/hyperswarm.json` → `hyperswarm-leftoff.sh` | Same distiller path as Codex; waits for claude-mem summary |
+| HyperSwarm left-off | `~/.grok/hooks/hyperswarm.json` → `hyperswarm-leftoff.sh` | Same distiller path as Codex; waits for  (claude-mem removed) |
 | PR tracking | `~/.grok/hooks/pr-tracking.json` → shared `auto-pr-push.sh` + `enforce-pr-grok.sh` | Owned-org allowlist only |
 | Local Ollama diff review | **not wired** | Resident ~7.5 GB + council load kernel-panicked the Mac twice on 2026-07-31 |
 | `[compat.claude] hooks/mcps` | **must stay false** | True double-fires Claude's chain into Grok; was a root cause of the panics |
@@ -276,30 +270,23 @@ scripts/install-grok-harness.sh --check   # status only
 #   skills = true
 #   rules = true
 #   agents = true
-#   mcps = false          # use native [mcp_servers.mcp-search] instead
 #   hooks = false         # use native ~/.grok/hooks/*.json instead
 #
 #   [skills]
-#   paths = ["~/.grok/skills-claude-mem"]
 #
 #   [plugins]
-#   disabled = ["claude-mem"]   # avoid double-loading the marketplace plugin
-#
-#   [mcp_servers.mcp-search]
+#   disabled = [" (claude-mem removed) #
 #   # use the node -e launcher from the live ~/.grok/config.toml (resolves
-#   # thedotmack/claude-mem worker across Claude/Codex cache layouts)
+#   # thedotmack/ (claude-mem removed) /Codex cache layouts)
 ```
 
 Restart Grok (new session) after install so hooks reload. Confirm with `/hooks` and:
 
 ```bash
-curl -s http://127.0.0.1:37701/api/health
-sqlite3 ~/.claude-mem/claude-mem.db \
   "SELECT platform_source, COUNT(*) FROM sdk_sessions GROUP BY 1;"
 ```
 
 A healthy setup shows `platform_source=grok` rows growing as you work, context in
-`~/.grok/rules/claude-mem-context.md`, host proxy `curl -s http://127.0.0.1:11435/health`
 reporting `proxy=host`, and **no** Ollama model loaded solely for Grok mem or a Grok Stop
 (`ollama ps` should stay empty unless you are in a local/qwen coding session or fusion).
 
