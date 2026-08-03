@@ -183,6 +183,7 @@ each tool's JSON contract:
 | Enforce one PR per work branch | `enforce-pr-claude.sh` | `enforce-pr-codex.sh` | `enforce-pr-grok.sh` |
 | Review the current diff with Ollama | `local-diff-review.sh` | `local-diff-review-codex.sh` | **off** (GPU panic risk) |
 | Distil session left-off into HyperSwarm | Claude settings | `codex-hyperswarm-leftoff.sh` | `scripts/grok/hyperswarm-leftoff.sh` |
+| Sample OAuth login expiry | `oauth-expiry-monitor.sh` | n/a | n/a |
 
 `codex-hyperswarm-leftoff.sh` runs on Codex `SessionEnd` and gives Codex parity
 with Claude Code's HyperSwarm feed: it hands the ending session's id to
@@ -196,6 +197,42 @@ preamble. Logs to `/tmp/hs-codex-push.log`.
 The shared PR hook writes its log to `~/.cache/claude-code-harness/auto-pr-push.log`.
 Set `HARNESS_PR_OWNERS` to a space-separated allowlist in both tool configs; an empty
 allowlist disables automatic pushes.
+
+#### Login-expiry monitor
+
+`oauth-expiry-monitor.sh` runs on Claude Code `SessionStart` (loud) and `SessionEnd`
+(`--quiet`). It stays silent while your login is healthy. Codex and Grok authenticate
+through their own CLIs, so this hook is Claude-only.
+
+It exists because Claude Code's banner is easy to misread. The banner reads one field,
+`refreshTokenExpiresAt` in the macOS keychain item `Claude Code-credentials`, and renders
+`Math.ceil(remaining / 86400000)`. Anything from one second to 24 hours prints as
+**"1 day"**. There is no "0 days" and no hours display. Only `/login` mints a new refresh
+token; the 8-hour access token rotating each session does not extend that window. So a
+refresh token parked near its expiry prints "Your login expires in 1 day" every day while
+auth keeps working, which reads as a stuck warning rather than a real deadline. Claude
+Code also computes the banner once per session at mount and memoizes it, so a session you
+left running for 15 hours still shows what was true at launch even after you re-auth.
+Restart the session to clear a stale banner.
+
+The hook appends one JSON sample per run to `~/.claude/oauth-expiry.log` and speaks up on
+two conditions:
+
+| Condition | What it means |
+|---|---|
+| Expiry moved **backwards** since the last sample | A stale credential blob overwrote a fresh one. This is what makes the warning recur. |
+| Refresh token inside the 3-day window | Run `/login` once, deliberately, instead of ignoring a daily banner. |
+
+`oauth-expiry-check.sh` prints the same numbers on demand, with `--log` to append a
+sample. Both read the keychain and never write it. Sampling is event-driven with no
+polling timer, per the workspace no-wake-to-check rule.
+
+Overrides: `LOG_PATH`, `NOTIFY_STAMP`, `MONITOR_NO_NOTIFY=1` to suppress the macOS
+notification (tests, headless and cron runs), and `OAUTH_MONITOR_TEST_JSON` to feed a
+synthetic credential instead of reading the keychain. Run
+`scripts/test-oauth-expiry-monitor.sh` after changing either script; it covers the healthy
+path, a forward roll, the regression and expiring alerts, `--quiet`, a malformed
+credential blob, and the shape of the emitted hook JSON.
 
 #### Duplicate-PR guard after a squash merge
 
