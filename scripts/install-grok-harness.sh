@@ -47,12 +47,12 @@ install_file() {
 echo "Grok harness install (repo=$REPO_ROOT, home=$GROK_HOME)"
 
 # --- scripts (no claude-mem) ---
-for name in load-projects-env.sh hyperswarm-leftoff.sh; do
+for name in load-projects-env.sh hyperswarm-leftoff.sh mem0-session-write.sh; do
   install_file "$REPO_ROOT/scripts/grok/$name" "$GROK_HOME/scripts/$name" 755
 done
 
 # --- hook JSON (no claude-mem) ---
-for name in hyperswarm.json load-projects-env.json pr-tracking.json; do
+for name in hyperswarm.json load-projects-env.json pr-tracking.json mem0-session.json; do
   install_file "$REPO_ROOT/examples/grok/$name" "$GROK_HOME/hooks/$name"
 done
 

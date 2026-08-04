@@ -236,6 +236,7 @@ each tool's JSON contract:
 | Review the current diff with Ollama | `local-diff-review.sh` | `local-diff-review-codex.sh` | **off** (GPU panic risk) |
 | Distil session left-off into HyperSwarm | Claude settings | `codex-hyperswarm-leftoff.sh` | `scripts/grok/hyperswarm-leftoff.sh` |
 | Sample OAuth login expiry | `oauth-expiry-monitor.sh` | n/a | n/a |
+| Write a session memory to Mem0 | plugin hooks | plugin hooks | `scripts/grok/mem0-session-write.sh` |
 
 `codex-hyperswarm-leftoff.sh` runs on Codex `SessionEnd` and gives Codex parity
 with Claude Code's HyperSwarm feed: it hands the ending session's id to
@@ -289,6 +290,37 @@ synthetic credential instead of reading the keychain. Run
 `scripts/test-oauth-expiry-monitor.sh` after changing either script; it covers the healthy
 path, a forward roll, the regression and expiring alerts, `--quiet`, a malformed
 credential blob, and the shape of the emitted hook JSON.
+
+#### Grok session memories
+
+Every other host contributes memories to Mem0: Claude Code and Codex run the
+mem0 plugin hooks, Hermes writes through its own provider. Grok reaches Mem0
+over **MCP only**, which is on-demand and read/write within a session, with no
+hook that records the session itself. Two consequences, both recorded as a known
+limitation in PR #18 and now closed:
+
+- Grok sessions were invisible to recall on every other host.
+- HyperSwarm's `mem0_session` distiller matches on `metadata.session_id`, so a
+  Grok session could never produce a corpus entry no matter what the leftoff
+  hook did.
+
+`scripts/grok/mem0-session-write.sh` runs on Grok `SessionEnd` and writes ONE
+memory tagged `metadata.session_id` and `source=grok`. It reads
+`~/.grok/sessions/<url-encoded cwd>/prompt_history.jsonl`, which holds what the
+user actually typed keyed by session id, plus that session's `summary.json` for
+Grok's own generated title. It deliberately does **not** parse
+`chat_history.jsonl`: its user turns are wrapped blocks (`<user_info>`,
+`<user_query>`) that need unwrapping, while `prompt_history` is already clean.
+
+The hook returns in ~0.2s and does the work in a detached worker, so session
+close is never delayed. It honours the same recursion markers as the other
+harness hooks (`CODEX_NO_INTERACTIVE`, plus its own `GROK_MEM0_NO_RECURSE`). It
+only ever **writes**, so it cannot consume the retrieval quota that
+`mem0-local` exists to protect: Mem0 Starter allows 50,000 adds/month against
+5,000 retrievals, and adds are not the binding constraint.
+
+Verified against a real 539-message session: 4 prompts extracted, 5 memories
+landed with `source=grok`.
 
 #### Duplicate-PR guard after a squash merge
 

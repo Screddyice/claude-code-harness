@@ -1,0 +1,18 @@
+{
+  "description": "Write one session memory to Mem0 Platform on Grok SessionEnd (Grok has no mem0 plugin hooks; MCP is read/write on demand only)",
+  "hooks": {
+    "SessionEnd": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.grok/scripts/mem0-session-write.sh\"",
+            "timeout": 15,
+            "statusMessage": "Recording session memory"
+          }
+        ]
+      }
+    ]
+  }
+}
