@@ -26,7 +26,11 @@ engine refuses), or a single small task.
    default (workers branch from HEAD).
 2. Write `tasks.json`: unique `id`, self-contained `task` brief (scope,
    acceptance, checks to run), optional advisory `files` scope hints (the
-   engine warns on overlap between tasks).
+   engine warns on overlap between tasks). State in each brief
+   "create/modify ONLY <files>; do not edit README or other files" —
+   parallel workers otherwise both touch shared docs and collide at fold
+   time. Ensure .gitignore covers build artifacts (worker checks generate
+   them; the engine commits everything untracked).
 3. Run with the terminal tool:
 
 ```bash

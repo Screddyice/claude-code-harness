@@ -27,7 +27,12 @@ delegate` or just doing it is cheaper).
    (workers branch from HEAD and never see uncommitted changes).
 2. Write `tasks.json` — each task: unique `id`, self-contained `task` brief
    (scope, acceptance, which checks to run), optional `files` (advisory scope
-   hint; the engine warns when two tasks overlap):
+   hint; the engine warns when two tasks overlap). In the brief, say
+   explicitly "create/modify ONLY <files>; do not edit README or other
+   files" — validation showed parallel workers otherwise both edit shared
+   docs and collide at fold time. Also make sure the repo's .gitignore covers
+   build artifacts (worker checks generate them; the engine commits
+   everything untracked):
 
 ```json
 {"tasks": [
