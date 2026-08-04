@@ -17,7 +17,7 @@ Canonical multi-org workspace is `/Users/screddy/projects`. Start Grok there or 
 1. **Org identity** = `git remote get-url origin` on the nearest `.git`, not the folder name.
 2. **Skills** = global. Config scans `~/.agents/skills`, `~/.claude/skills`, `~/.grok/skills*`. Compat Claude skills stay enabled; hooks/mcps stay **disabled**.
 3. **Harness hooks** are native only: `~/.grok/hooks/{hyperswarm,load-projects-env,pr-tracking}.json`. Never set `[compat.claude] hooks = true`.
-4. **claude-mem was removed 2026-08-02** — do not reinstall hooks, mcp-search, host proxy, or skills-claude-mem.
+4. **Memory = Mem0 Platform** (`[mcp_servers.mem0]`, `MEM0_API_KEY` in `~/projects/.env`). claude-mem is gone — do not reinstall it.
 5. **Credentials**: `~/projects/.env` (wrapper + load-projects-env hook). Never print secrets.
 6. **PR-per-branch** applies to owned orgs (`teamnebula-ai`, `Screddyice`) via `pr-tracking.json`.
 7. When you enter a specific repo, read its local AGENTS/CLAUDE before coding.
