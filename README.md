@@ -31,6 +31,8 @@ codex-harness/
 │   ├── install-grok-harness.sh       # install Grok native wiring
 │   ├── grok/                         # Grok bridge scripts (HyperSwarm)
 │   ├── hooks/                           # shared hook logic and runtime adapters
+│   ├── swarm/                        # cross-CLI parallel agent dispatch engine
+│   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
@@ -125,6 +127,53 @@ oracle; the verifier, not a vote, determines whether their output can be integra
 This integration is optional: the harness works without LLM-Jury. Restart both Claude
 Code and Codex after first installation so their skill catalogs refresh. Use `--force`
 only to replace locally modified installed copies.
+
+## Swarm — Cross-CLI Parallel Agent Dispatch
+
+`scripts/swarm/` fans independent, bounded task briefs out to headless worker
+agents on the OTHER subscription's CLI — `codex exec` workers from a Claude Code
+session, `claude -p` workers from a Codex session — so both accounts' cloud
+agents run at once. Each task gets an isolated git worktree on a scratch branch
+(`swarm/<run-id>/<task-id>`); workers EDIT ONLY, the engine runs every git
+command and creates one commit per task, and the orchestrating session reviews
+each diff and folds accepted branches back with `git merge --squash`.
+
+```text
+tasks.json ─► swarm run ─► worktree per task ─► codex/claude workers (≤4 total)
+                                │                        │ edits only
+                                └── engine commits ◄─────┘
+      review diffs ─► git merge --squash ─► swarm clean <run-id>
+```
+
+Install the `swarm` CLI shim plus the Claude and Codex skills:
+
+```bash
+scripts/swarm/install.sh
+```
+
+Contract highlights:
+
+- `swarm run --workspace . --tasks tasks.json [--via codex|claude] [--fallback]`
+  — exit 0 all tasks completed, 2 partial, 3 none. Partial is not an error.
+- A provider hitting its usage limit trips a per-provider circuit breaker
+  (message signatures plus a 2-consecutive-fast-failure backstop): its queued
+  tasks are skipped as `provider_limited`, never fatal to the run, and
+  `--fallback` re-routes them to the other provider in fresh worktrees.
+- Refuses dirty trees by default (workers branch from HEAD and cannot see
+  uncommitted work; `--allow-dirty` overrides), refuses rs21 repositories, and
+  one PID-locked run per repo at a time.
+- Concurrency: 3 workers per provider, 4 total by default (`--max-total`) —
+  bound the process SUM before raising it while local models are resident.
+- `swarm status <run-id>` reconciles the manifest against git reality;
+  `swarm clean <run-id>` refuses to delete unfolded or uncommitted worker
+  output unless `--force`.
+- Workers never commit, push, or open PRs; they run with scrubbed environments
+  (no inherited API keys) and prompts that forbid nested local-model runs and
+  subagents.
+
+Tests: `scripts/test-swarm.sh` (pytest, includes a stub-CLI end-to-end).
+Before first real use, run `scripts/swarm/smoke_live.sh` once — it verifies the
+real CLIs' headless flag behavior with one trivial task per provider.
 
 ## Continuous PR Tracking
 
