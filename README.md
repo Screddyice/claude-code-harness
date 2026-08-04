@@ -23,11 +23,14 @@ codex-harness/
 │   ├── AGENTS.md.project.example     # per-repo AGENTS.md starter
 │   ├── config.toml.example           # ~/.codex/config.toml starter
 │   ├── hooks.json.example            # optional Codex hook wiring
-│   └── grok/                         # Grok-native hooks ( (claude-mem removed) ├── scripts/
+│   └── grok/                         # Grok-native hooks (PR tracking, HyperSwarm)
+├── scripts/
 │   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
 │   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
 │   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
-│   ├── install-grok-harness.sh       # install Grok +  (claude-mem removed) │   ├── grok/                         # Grok bridge scripts ( (claude-mem removed) │   ├── hooks/                           # shared hook logic and runtime adapters
+│   ├── install-grok-harness.sh       # install Grok native wiring
+│   ├── grok/                         # Grok bridge scripts (HyperSwarm)
+│   ├── hooks/                           # shared hook logic and runtime adapters
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
@@ -189,8 +192,9 @@ each tool's JSON contract:
 with Claude Code's HyperSwarm feed: it hands the ending session's id to
 `hyperswarm capture --runtime claude_mem_session` (significance-gated, with the
 left-off fallback) and pushes the store to the canonical host, so remote
-Hermes/Telegram agents can see where Codex coding left off. A detached worker
-waits for  (claude-mem removed) stop recursion: the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
+Hermes/Telegram agents can see where Codex coding left off. The hook returns
+immediately and a detached worker sleeps 5s before capturing, so the transcript
+has settled. Two guards stop recursion: the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
 own `codex exec` child, plus a skip for sessions whose prompt is the gate
 preamble. Logs to `/tmp/hs-codex-push.log`.
 
@@ -290,7 +294,7 @@ Grok Build TUI (`~/.grok`) gets a **native** harness slice, not Claude-compat im
 
 | Channel | How it reaches Grok | Notes |
 |---------|---------------------|-------|
-| HyperSwarm left-off | `~/.grok/hooks/hyperswarm.json` → `hyperswarm-leftoff.sh` | Same distiller path as Codex; waits for  (claude-mem removed) |
+| HyperSwarm left-off | `~/.grok/hooks/hyperswarm.json` → `hyperswarm-leftoff.sh` | Same distiller path as Codex; detached worker sleeps 5s before capturing |
 | PR tracking | `~/.grok/hooks/pr-tracking.json` → shared `auto-pr-push.sh` + `enforce-pr-grok.sh` | Owned-org allowlist only |
 | Local Ollama diff review | **not wired** | Resident ~7.5 GB + council load kernel-panicked the Mac twice on 2026-07-31 |
 | `[compat.claude] hooks/mcps` | **must stay false** | True double-fires Claude's chain into Grok; was a root cause of the panics |
@@ -308,13 +312,6 @@ scripts/install-grok-harness.sh --check   # status only
 #   rules = true
 #   agents = true
 #   hooks = false         # use native ~/.grok/hooks/*.json instead
-#
-#   [skills]
-#
-#   [plugins]
-#   disabled = [" (claude-mem removed) #
-#   # use the node -e launcher from the live ~/.grok/config.toml (resolves
-#   # thedotmack/ (claude-mem removed) /Codex cache layouts)
 ```
 
 Restart Grok (new session) after install so hooks reload. Confirm with `/hooks` and:
