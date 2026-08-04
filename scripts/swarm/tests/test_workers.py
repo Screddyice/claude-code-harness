@@ -110,6 +110,7 @@ def test_claude_cmd_construction_and_env(tmp_path, monkeypatch):
     assert "--strict-mcp-config" in cmd
     assert cmd[cmd.index("--setting-sources") + 1] == "project"
     assert seen["kwargs"]["cwd"] == str(tmp_path)
+    assert seen["kwargs"]["stdin"] == subprocess.DEVNULL  # non-EOF stdin hangs codex
     assert "ANTHROPIC_API_KEY" not in seen["kwargs"]["env"]
     assert result.ok and result.handoff["status"] == "completed"
 

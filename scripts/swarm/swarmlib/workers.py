@@ -151,8 +151,13 @@ class CliWorker:
     def _run(self, cmd, cwd, env):
         start = time.monotonic()
         try:
+            # stdin MUST be an immediate EOF: codex exec with a readable
+            # non-TTY stdin blocks forever waiting to consume piped input
+            # before its first API call (caught live in E2E validation —
+            # 21 min asleep, zero sockets open).
             completed = self.runner(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 timeout=self.timeout, check=False, cwd=str(cwd), env=env,
             )
             return WorkerResult(completed.returncode, completed.stdout,
