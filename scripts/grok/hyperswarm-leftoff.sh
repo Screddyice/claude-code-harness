@@ -1,21 +1,36 @@
 #!/usr/bin/env bash
 #
-# Grok SessionEnd adapter for HyperSwarm (claude-mem-session distiller).
+# Grok SessionEnd adapter for HyperSwarm (mem0-session distiller).
 #
 # Same path Claude Code and Codex use:
-#   1. Wait (bounded) for claude-mem to land a session summary for THIS session
-#   2. Distil via `hyperswarm capture --runtime claude_mem_session` (significance-gated)
+#   1. Let Mem0 settle after session close
+#   2. Distil via `hyperswarm capture --runtime mem0_session` (significance-gated)
 #   3. Push Mac staging → Hostinger canonical store
 #
 # Grok hook payloads use camelCase (sessionId); capture expects session_id.
 # Detached worker so session close is never delayed. Always exits 0.
 #
+# Before 2026-08-02 this targeted --runtime claude_mem_session and gated on a
+# summary row in ~/.claude-mem/claude-mem.db. claude-mem was retired and that
+# database deleted, so the gate could never pass and Grok captured nothing.
+#
+# CAVEAT: Grok reaches Mem0 through MCP only, with no hook that writes a
+# session_summary on its own. Mem0SessionSource matches on
+# metadata.session_id, so this captures only when the Grok session actually
+# wrote session-tagged memories. Codex has the mem0 plugin hooks and does.
+#
 set -uo pipefail
 
 PY="$HOME/.hyperswarm/venv/bin/python"
-DB="$HOME/.claude-mem/claude-mem.db"
 LOG="${HS_GROK_LOG:-/tmp/hs-grok-push.log}"
-GATE_PREAMBLE='You are a significance gate'
+
+# Hook envs are thin; capture needs the Mem0 key.
+if [ -z "${MEM0_API_KEY:-}" ] && [ -f "$HOME/projects/.env" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . <(grep -E '^MEM0_API_KEY=' "$HOME/projects/.env" 2>/dev/null || true)
+  set +a
+fi
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>&1 || true; }
 
@@ -31,43 +46,20 @@ if [ "${1:-}" = "--worker" ]; then
     exit 0
   fi
 
-  # Wait for claude-mem async summary (~24 × 5s = 2 min).
-  ready=""
-  for _ in $(seq 1 24); do
-    ready="$(sqlite3 "file:$DB?mode=ro" "
-      SELECT sk.user_prompt IS NOT NULL
-      FROM sdk_sessions sk
-      JOIN session_summaries ss ON ss.memory_session_id = sk.memory_session_id
-      WHERE sk.content_session_id = '$(printf '%s' "$session_id" | sed "s/'/''/g")'
-      LIMIT 1;" 2>/dev/null || true)"
-    [ -n "$ready" ] && break
-    sleep 5
-  done
-  if [ -z "$ready" ]; then
-    log "no claude-mem summary for $session_id within 2m — skip capture, still push"
+  # Let Mem0 settle after session close before the distiller reads it.
+  sleep 5
+
+  cd "${work_cwd:-$HOME}" 2>/dev/null || cd "$HOME" || true
+
+  payload=$(printf '{"session_id":"%s","cwd":"%s","hook_event_name":"SessionEnd","runtime":"grok"}' \
+    "$(printf '%s' "$session_id" | sed 's/"/\\"/g')" \
+    "$(printf '%s' "${work_cwd:-}" | sed 's/"/\\"/g')")
+
+  if printf '%s' "$payload" | "$PY" -m hyperswarm.cli capture \
+        --runtime mem0_session --verbose >>"$LOG" 2>&1; then
+    log "capture: ok (entry written only if session qualified)"
   else
-    prompt_head="$(sqlite3 "file:$DB?mode=ro" "
-      SELECT substr(COALESCE(user_prompt,''),1,40) FROM sdk_sessions
-      WHERE content_session_id = '$(printf '%s' "$session_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
-    case "$prompt_head" in
-      "$GATE_PREAMBLE"*)
-        log "session $session_id is a significance-gate invocation — skipping"
-        exit 0
-        ;;
-    esac
-
-    cd "${work_cwd:-$HOME}" 2>/dev/null || cd "$HOME" || true
-
-    payload=$(printf '{"session_id":"%s","cwd":"%s","hook_event_name":"SessionEnd","runtime":"grok"}' \
-      "$(printf '%s' "$session_id" | sed 's/"/\\"/g')" \
-      "$(printf '%s' "${work_cwd:-}" | sed 's/"/\\"/g')")
-
-    if printf '%s' "$payload" | "$PY" -m hyperswarm.cli capture \
-          --runtime claude_mem_session --verbose >>"$LOG" 2>&1; then
-      log "capture: ok (entry written only if session qualified)"
-    else
-      log "capture: non-zero exit — continuing to push"
-    fi
+    log "capture: non-zero exit — continuing to push"
   fi
 
   if "$PY" -m hyperswarm.cli push --verbose >>"$LOG" 2>&1; then

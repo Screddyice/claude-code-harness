@@ -190,11 +190,14 @@ each tool's JSON contract:
 
 `codex-hyperswarm-leftoff.sh` runs on Codex `SessionEnd` and gives Codex parity
 with Claude Code's HyperSwarm feed: it hands the ending session's id to
-`hyperswarm capture --runtime claude_mem_session` (significance-gated, with the
+`hyperswarm capture --runtime mem0_session` (significance-gated, with the
 left-off fallback) and pushes the store to the canonical host, so remote
 Hermes/Telegram agents can see where Codex coding left off. The hook returns
-immediately and a detached worker sleeps 5s before capturing, so the transcript
-has settled. Two guards stop recursion: the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
+immediately and a detached worker sleeps 5s so Mem0 lands the session's
+memories before the distiller reads them. `Mem0SessionSource` matches on
+`metadata.session_id` and writes nothing when Mem0 holds no memories for the
+session, so no local gate decides whether capture is worth running. Recursion
+stops at the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
 own `codex exec` child, plus a skip for sessions whose prompt is the gate
 preamble. Logs to `/tmp/hs-codex-push.log`.
 
