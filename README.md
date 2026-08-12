@@ -221,6 +221,35 @@ Two implementation details are load-bearing, both learned by breaking them first
 
 Verify against a fork specifically; a non-fork repo passes either way and proves nothing.
 
+### A squash-merged branch is not a branch without a PR
+
+The enforcement asks GitHub for an **open** PR. After a squash merge there isn't one: the PR
+is `MERGED`, and the squash commit on the base is an ancestor of nothing on the branch, so
+`HOOK_AHEAD` stays above zero forever. A branch whose work shipped therefore looks identical
+to work that never had a PR, and the Stop hook blocks every stop with no action that can
+satisfy it — opening another PR does not help, and deleting the local branch is the only way
+out, which nothing tells you.
+
+`hook_load_pr_status` now falls through to `hook_branch_already_merged()` and reports
+`merged_pr`, which the enforcers treat as satisfied:
+
+```
+open PR found        -> has_pr
+merged PR, same head -> merged_pr     (satisfied — work already landed)
+neither              -> needs_pr      (blocks)
+```
+
+**The check is keyed on the branch's current head SHA**, matching `auto-pr-push.sh`, which
+had this guard first. That is what stops a branch coasting: reuse a merged branch for new
+commits and its head no longer matches the merged PR, so it correctly needs a PR again.
+Both directions are worth testing, because a fix that only satisfies the first one silently
+turns the rule off for reused branches.
+
+`merged_pr` is deliberately a separate status rather than reusing `has_pr` — "already
+landed" and "has an open review surface" are different facts, and anything that logs or
+reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
+only on exactly `needs_pr`.
+
 ## Per-Repo Harness
 
 `scripts/init-codex-harness.sh` creates an idempotent `.codex-harness/` directory in a

@@ -79,6 +79,31 @@ hook_load_branch_context() {
   return 0
 }
 
+# True when this branch's CURRENT head is exactly what a merged PR landed.
+#
+# A squash merge produces one commit on the base that is an ancestor of nothing
+# on the branch, so HOOK_AHEAD stays > 0 forever, while the PR is MERGED rather
+# than open and an --state open lookup returns nothing. The branch then looks
+# identical to work that never had a PR, and the Stop hook blocks every stop with
+# no action that can satisfy it — deleting the local branch is the only exit, and
+# nothing tells you that. Observed 2026-08-12 on Screddyice/jarvis after #18
+# squash-merged.
+#
+# Keyed on the head SHA, exactly as auto-pr-push.sh does for the same reason: a
+# branch REUSED for new commits has a different HEAD, so it correctly still
+# needs a PR rather than coasting on the old merge.
+hook_branch_already_merged() {
+  local head_oid merged_oid
+  head_oid="$(git rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$head_oid" ] || return 1
+
+  merged_oid="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
+    --head "$HOOK_BRANCH" --state merged \
+    --json headRefOid --jq '.[0].headRefOid // empty' 2>/dev/null)"
+
+  [ -n "$merged_oid" ] && [ "$merged_oid" = "$head_oid" ]
+}
+
 hook_load_pr_status() {
   HOOK_PR_STATUS=""
   HOOK_PR_COUNT="0"
@@ -94,6 +119,11 @@ hook_load_pr_status() {
     HOOK_PR_STATUS="gh_error"
   elif [ "${HOOK_PR_COUNT:-0}" -gt 0 ] 2>/dev/null; then
     HOOK_PR_STATUS="has_pr"
+  elif hook_branch_already_merged; then
+    # Distinct from has_pr on purpose. "Landed already" and "has a review surface
+    # open" are different facts, and a consumer that logs or reports should be
+    # able to tell them apart.
+    HOOK_PR_STATUS="merged_pr"
   else
     HOOK_PR_STATUS="needs_pr"
   fi
