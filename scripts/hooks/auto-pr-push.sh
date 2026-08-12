@@ -67,7 +67,8 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
   #     Keyed on the merged head SHA, so a branch reused for NEW commits has a
   #     different HEAD and correctly proceeds to a fresh PR.
   if [ -n "$head_oid" ]; then
-    merged_oid="$(gh pr list --head "$HOOK_BRANCH" --state merged \
+    merged_oid="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
+      --head "$HOOK_BRANCH" --state merged \
       --json headRefOid --jq '.[0].headRefOid // empty' 2>>"$log")"
     if [ -n "${merged_oid:-}" ] && [ "$merged_oid" = "$head_oid" ]; then
       printf '%s [skip] %s@%s already merged as %s\n' \
@@ -84,9 +85,11 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
 
   git push -u origin "HEAD:$HOOK_BRANCH" >>"$log" 2>&1
 
-  pr_count="$(gh pr list --head "$HOOK_BRANCH" --state open --json number --jq 'length' 2>>"$log")"
+  pr_count="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
+    --head "$HOOK_BRANCH" --state open --json number --jq 'length' 2>>"$log")"
   if [ "${pr_count:-0}" = "0" ]; then
-    if gh pr create --draft --fill --head "$HOOK_BRANCH" >>"$log" 2>&1; then
+    if gh pr create ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
+      --draft --fill --head "$HOOK_BRANCH" >>"$log" 2>&1; then
       printf '%s [ok] opened draft PR for %s@%s\n' "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" >>"$log" 2>&1
     else
       printf '%s [warn] push ok but could not open PR for %s@%s\n' \

@@ -195,6 +195,32 @@ default agent policy. PR creation is intentionally explicit rather than a hidden
 hook: commits stay usable offline, while every agent session is still required to run
 the tracker before switching branches or handing off work. The script never merges.
 
+### Every `gh` call is pinned to origin
+
+The hooks ask GitHub about the branch through `gh`, and every one of those calls passes
+`--repo` for the **origin** remote explicitly. Bare `gh` picks a remote by its own
+precedence and prefers `upstream` when one exists, so inside a fork it answers about the
+*parent* repository.
+
+That is not theoretical. On 2026-08-12 in `Screddyice/backdoor` (a fork of
+`ajsai47/backdoor`), an open PR on origin was reported as "no open pull request" and the
+Stop hook blocked every stop with no way to satisfy it — the PR existed the whole time,
+the hook was simply asking the wrong repo. The same resolution silently made
+`auto-pr-push.sh` unable to see merged PRs, defeating its duplicate-PR guard.
+
+Two implementation details are load-bearing, both learned by breaking them first:
+
+- The `--repo` flag is passed as an **array**, never as an unquoted
+  `${VAR:+--repo "$VAR"}`. That form relies on word-splitting an unquoted expansion,
+  which bash does and zsh does not, so under zsh it collapses into the single argument
+  `--repo owner/name` and `gh` rejects it with `unknown flag`.
+- The array is expanded as `${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"}`. macOS
+  ships bash 3.2, where an empty array expanded under `set -u` aborts with
+  `unbound variable` — and `auto-pr-push.sh` runs `set -uo pipefail`. A remote URL that
+  failed to parse would otherwise turn a cosmetic miss into a dead hook.
+
+Verify against a fork specifically; a non-fork repo passes either way and proves nothing.
+
 ## Per-Repo Harness
 
 `scripts/init-codex-harness.sh` creates an idempotent `.codex-harness/` directory in a

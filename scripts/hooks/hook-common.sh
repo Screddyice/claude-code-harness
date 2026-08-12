@@ -29,6 +29,33 @@ hook_load_branch_context() {
   HOOK_ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
   [ -n "$HOOK_ORIGIN_URL" ] || return 1
 
+  # owner/repo for ORIGIN specifically. Every gh call below must be pinned to
+  # this, because bare `gh` picks a remote by its own precedence and prefers
+  # `upstream` when one exists — so in a fork it answers about the PARENT repo.
+  # Observed 2026-08-12 in Screddyice/backdoor (a fork of ajsai47/backdoor):
+  # an open PR on origin was reported as "no open pull request", and the Stop
+  # hook blocked every single stop with no way to satisfy it. The PR existed
+  # the whole time; the hook was asking the wrong repository.
+  #
+  # Derived with awk rather than a non-greedy regex: BSD sed rejects `+?`.
+  # Handles both https://host/owner/repo(.git) and git@host:owner/repo(.git).
+  HOOK_REPO_SLUG="$(printf '%s' "$HOOK_ORIGIN_URL" \
+    | sed -e 's|\.git$||' -e 's|:|/|g' \
+    | awk -F/ 'NF>=2 {print $(NF-1)"/"$NF}')"
+
+  # Passed as an ARRAY, never as an unquoted ${VAR:+--repo "$VAR"}. That form
+  # depends on word-splitting an unquoted expansion, which bash does and zsh
+  # does not — so it silently becomes the single argument `--repo owner/name`
+  # and gh rejects it with "unknown flag". These files carry a bash shebang but
+  # are also sourced, and a helper that only works under one shell is a trap.
+  # Expanded at every call site as ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"},
+  # not the plain "${HOOK_GH_REPO_ARGS[@]}". /bin/bash on macOS is 3.2, where an
+  # EMPTY array expanded under `set -u` aborts with "unbound variable" — and
+  # auto-pr-push.sh runs `set -uo pipefail`. A slug that fails to parse would
+  # otherwise turn a cosmetic miss into a dead hook.
+  HOOK_GH_REPO_ARGS=()
+  [ -n "$HOOK_REPO_SLUG" ] && HOOK_GH_REPO_ARGS=(--repo "$HOOK_REPO_SLUG")
+
   HOOK_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   [ -n "$HOOK_TOP" ] || return 1
   HOOK_REPO_DIR="$(basename "$HOOK_TOP")"
@@ -61,7 +88,8 @@ hook_load_pr_status() {
     return 0
   fi
 
-  HOOK_PR_COUNT="$(gh pr list --head "$HOOK_BRANCH" --state open --json number --jq 'length' 2>/dev/null)"
+  HOOK_PR_COUNT="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
+    --head "$HOOK_BRANCH" --state open --json number --jq 'length' 2>/dev/null)"
   if [ $? -ne 0 ]; then
     HOOK_PR_STATUS="gh_error"
   elif [ "${HOOK_PR_COUNT:-0}" -gt 0 ] 2>/dev/null; then
