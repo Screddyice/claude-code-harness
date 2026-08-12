@@ -44,6 +44,9 @@ hook_load_pr_status
 
 case "$HOOK_PR_STATUS" in
   has_pr) exit 0 ;;
+  # Already landed via squash merge — nothing to open. See
+  # hook_branch_already_merged() for why an --state open lookup cannot see this.
+  merged_pr) exit 0 ;;
   gh_missing)
     message="PR-tracking rule: branch '$HOOK_BRANCH' has $HOOK_AHEAD commit(s) with no PR, and 'gh' is not installed, so Grok cannot verify or create one. Install gh or open the PR manually."
     printf '{"systemMessage":%s}\n' "$(hook_json_string "$message")"
