@@ -34,6 +34,7 @@ codex-harness/
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
+│   ├── gbrowse                       # headed-browser wrapper that survives a session
 │   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
 │   ├── dns-postflight.sh             # did the cutover land, and did mail survive
 │   └── codex-workspace-summary.sh    # quick local sanity summary
@@ -251,6 +252,46 @@ turns the rule off for reused branches.
 landed" and "has an open review surface" are different facts, and anything that logs or
 reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
 only on exactly `needs_pr`.
+
+## gbrowse — headed browser sessions that survive
+
+`browse handoff` opens a visible browser so a human can log in, solve a CAPTCHA, or
+clear an MFA prompt. In a Claude Code session it reliably destroys the thing it just
+created. Observed 2026-08-14 driving the GoDaddy and Squarespace panels: five daemon
+deaths, three logins, every one discarding the authenticated session.
+
+```bash
+gbrowse handoff [message]   # headed takeover that actually survives
+gbrowse doctor              # mode agreement, orphaned daemons, watchdog risk
+gbrowse <anything else>     # passed straight through to browse
+```
+
+**Cause.** `handoff` promotes a *running* daemon in place: `browser-manager.ts` swaps
+the Playwright context and sets `connectionMode = 'headed'` without restarting the
+process. The parent-process watchdog registered at boot (`server.ts:687-714`) is still
+live and still pointed at whatever shell started the daemon. Claude Code's Bash tool
+kills that shell after every tool call, so on the next 15s poll the watchdog sees a
+dead parent, sees headed mode, and shuts down. In headless mode it deliberately stays
+alive — promotion is what turns a tolerated condition into a fatal one.
+
+A second path shares the predicate: the SIGTERM handler at `server.ts:1369-1381` also
+quits when runtime mode is headed, gated by **neither** `BROWSE_PARENT_PID` nor
+`BROWSE_HEADED`. Exporting `BROWSE_PARENT_PID=0` therefore only silences the poller.
+
+**Fix.** `browse connect` already does the right thing: it force-kills any existing
+daemon and cold-restarts with the watchdog disabled and the process detached into its
+own group. So `gbrowse handoff` captures the current URL, routes through `connect`,
+and re-navigates. Cookies survive because the Chromium profile is persistent.
+
+`gbrowse doctor` reports the tell that makes this invisible: the state file's `mode` is
+written only at start, so after an in-place promotion disk says `launched` while the
+process is headed and dying on a timer. It also lists orphaned daemons, which `connect`
+cannot see because it only kills what the state file knows about.
+
+Verified: plain `browse handoff` daemon gone after 45s; via `gbrowse`, alive with
+consistent mode. Patching the gstack checkout directly is not durable, because
+`/gstack-upgrade` hard-resets the working tree to origin/main, so the wrapper lives
+here and the real fix is a separate PR upstream.
 
 ## DNS Cutover Guards
 
