@@ -34,6 +34,8 @@ codex-harness/
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
+│   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
+│   ├── dns-postflight.sh             # did the cutover land, and did mail survive
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
     └── example-local/                # Codex local plugin marketplace example
@@ -249,6 +251,49 @@ turns the rule off for reused branches.
 landed" and "has an open review surface" are different facts, and anything that logs or
 reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
 only on exactly `needs_pr`.
+
+## DNS Cutover Guards
+
+Moving a domain's DNS is not a website setting when that domain also carries email.
+`reddy2help.org` was moved from Squarespace to GoDaddy on 2026-08-14 and went fully
+offline, mail included, because nothing asked whether the delegation was signed.
+
+```bash
+scripts/dns-preflight.sh  <domain> <target-nameserver> [more...]
+scripts/dns-postflight.sh <domain> --expect-ip <ip> --dkim-fingerprint <sha256> \
+                                   --acme-host <ssh-alias> [--acme-service caddy]
+```
+
+**The rule both scripts enforce: build the destination zone first, switch last.** A
+zone at a new provider is inert until the nameservers point at it, so it can be built
+and verified at zero risk. Switching first is not a faster path to the same place.
+
+`dns-preflight.sh` is read-only and exits non-zero on a blocking finding. It catches
+the two failures that take a domain fully offline:
+
+- **DNSSEC.** If the registry publishes a DS record, a nameserver move to an unsigned
+  provider means the registrar disables signing immediately while the DS leaves the
+  registry on its own TTL. In that gap every validating resolver refuses the answer.
+  Measured: SERVFAIL on 1.1.1.1, 8.8.8.8 and 9.9.9.9 within a minute, for ~11 minutes.
+- **Mail records absent at the destination.** A new zone inherits nothing. The
+  destination is queried directly and diffed against the live zone. The DKIM key is
+  **fingerprinted**, not merely counted: a key over 255 characters is published split
+  across quoted strings, and rejoining it wrong yields a record that is present,
+  well-formed, and cryptographically junk. Mail keeps sending and silently fails
+  authentication.
+
+`dns-postflight.sh` catches the two that make a *correct* cutover still serve nothing:
+
+- **Staged propagation.** The NS change and the DS removal reach the registry
+  independently, so it polls four validating resolvers rather than one.
+- **A stuck ACME backoff.** An ACME client cannot observe that DNS changed. Caddy had
+  been failing since the VM was built and by cutover was on attempt 33 with a
+  **six-hour** retry, having fallen through to Let's Encrypt staging (browser-rejected).
+  DNS was right, mail was right, the site served nothing. `--acme-host` restarts the
+  service and the issuer is checked afterwards so a staging cert cannot pass.
+
+The `dns-cutover` skill wraps both with the procedure and the DNSSEC-restore ordering
+rule (**sign first, publish the DS second**).
 
 ## Per-Repo Harness
 
