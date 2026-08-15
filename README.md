@@ -221,6 +221,43 @@ Two implementation details are load-bearing, both learned by breaking them first
 
 Verify against a fork specifically; a non-fork repo passes either way and proves nothing.
 
+### A rejected push is a failure, not an `[ok]`
+
+`auto-pr-push.sh` used to run `git push` and discard its exit status, then report success from
+the branch it took afterwards. A rejected push produced exactly this in the log:
+
+```
+ ! [rejected]  HEAD -> feat/be-icp-scoring-rubric (non-fast-forward)
+error: failed to push some refs to …/nebos-v2.git
+[ok] pushed nebos-v2@feat/be-icp-scoring-rubric (PR already open)
+```
+
+Nothing reached GitHub, and the one place you would check to find that out said it had. The
+other branch was worse in a quieter way: it read `[warn] push ok but could not open PR`, which
+asserts the push succeeded in the middle of reporting a problem. Both were reachable with the
+push already rejected, so "the hook says it pushed" carried no information either way.
+
+The exit status is now checked. On failure the hook classifies the cause rather than printing
+`git push failed` and sending you into a 30,000-line log to work out which of several unrelated
+problems you have:
+
+| Cause | Reported as |
+|---|---|
+| Remote has commits this checkout lacks | `REJECTED (non-fast-forward) … nothing was uploaded` + the `git pull --rebase` to run |
+| No write access | `REJECTED — no write access to <slug>` |
+| No usable git credentials | `FAILED — git has no usable credentials` |
+| Offline / host unreachable | `FAILED — network unreachable` |
+| Server-side branch protection | `REJECTED by a server-side rule` |
+
+Failures also append one line each to **`~/.cache/claude-code-harness/auto-pr-push-failures.log`**.
+The main log interleaves raw `git` and `gh` output for every repo on the machine, so a failure
+in it is findable only if you already suspect one. The failures file answers "did anything not
+make it to GitHub?" with `cat`.
+
+Worth knowing about the non-fast-forward case specifically: the hook does not resolve it. A
+diverged branch needs a human to choose rebase, merge, or discard, and a hook that force-pushed
+on your behalf would be a much worse bug than the one it replaced.
+
 ### A squash-merged branch is not a branch without a PR
 
 The enforcement asks GitHub for an **open** PR. After a squash merge there isn't one: the PR

@@ -11,6 +11,11 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 log_dir="${HARNESS_HOOK_LOG_DIR:-$HOME/.cache/claude-code-harness}"
 log="$log_dir/auto-pr-push.log"
+# Failures only. The main log is append-only across every repo on the machine
+# and interleaves raw git/gh output; by 2026-08-14 it was 30k lines, which is
+# where a rejected push went unnoticed for a full day. One line per failure,
+# nothing else, so `cat` answers "did anything not make it to GitHub?".
+faillog="$log_dir/auto-pr-push-failures.log"
 allowed_owners="${HARNESS_PR_OWNERS:-}"
 [ -n "$allowed_owners" ] || exit 0
 
@@ -83,7 +88,47 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
     exit 0
   fi
 
-  git push -u origin "HEAD:$HOOK_BRANCH" >>"$log" 2>&1
+  # Check the push. This used to be a bare `git push …` whose exit status was
+  # discarded, after which the tail of this function reported `[ok] pushed`
+  # unconditionally. A rejected push therefore produced this, verbatim, in the
+  # log on 2026-08-14:
+  #
+  #   ! [rejected]  HEAD -> feat/be-icp-scoring-rubric (non-fast-forward)
+  #   error: failed to push some refs to …/nebos-v2.git
+  #   [ok] pushed nebos-v2@feat/be-icp-scoring-rubric (PR already open)
+  #
+  # Nothing reached GitHub and the log said it had. That is the worst shape a
+  # failure can take: the one place you would look to check reassures you.
+  push_output="$(git push -u origin "HEAD:$HOOK_BRANCH" 2>&1)"
+  push_rc=$?
+  printf '%s\n' "$push_output" >>"$log" 2>&1
+
+  if [ "$push_rc" -ne 0 ]; then
+    # Name the likely cause. "push failed" alone sends you to a 30,000-line log
+    # to find out which of several very different problems you have.
+    detail="git push exited $push_rc"
+    case "$push_output" in
+      *non-fast-forward*|*"tip of your current branch is behind"*)
+        detail="REJECTED (non-fast-forward) — origin/$HOOK_BRANCH has commits this checkout does not, so nothing was uploaded. Reconcile with 'git pull --rebase origin $HOOK_BRANCH' before trusting any PR on this branch" ;;
+      *"Permission denied"*|*"denied to"*|*403*)
+        detail="REJECTED — no write access to $HOOK_REPO_SLUG" ;;
+      *"could not read Username"*|*"Authentication failed"*|*"Invalid username or password"*)
+        detail="FAILED — git has no usable credentials for $HOOK_REPO_SLUG" ;;
+      *"Could not resolve host"*|*"unable to access"*|*"Connection refused"*)
+        detail="FAILED — network unreachable" ;;
+      *"protected branch"*|*"pre-receive hook declined"*)
+        detail="REJECTED by a server-side rule" ;;
+    esac
+
+    printf '%s [FAIL] %s@%s %s\n' \
+      "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$detail" >>"$log" 2>&1
+    # Also to a short, dedicated file. The main log interleaves raw git and gh
+    # output across every repo on the machine, so a failure in it is findable
+    # only if you already suspect one.
+    printf '%s %s@%s %s\n' \
+      "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$detail" >>"$faillog" 2>&1
+    exit 1
+  fi
 
   pr_count="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
     --head "$HOOK_BRANCH" --state open --json number --jq 'length' 2>>"$log")"
@@ -92,8 +137,12 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
       --draft --fill --head "$HOOK_BRANCH" >>"$log" 2>&1; then
       printf '%s [ok] opened draft PR for %s@%s\n' "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" >>"$log" 2>&1
     else
-      printf '%s [warn] push ok but could not open PR for %s@%s\n' \
+      # Reachable now only with a genuinely successful push, so this message can
+      # finally claim it. It could not before.
+      printf '%s [FAIL] %s@%s pushed, but gh pr create failed — branch is on GitHub with no PR\n' \
         "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" >>"$log" 2>&1
+      printf '%s %s@%s pushed, but gh pr create failed — branch is on GitHub with no PR\n' \
+        "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" >>"$faillog" 2>&1
     fi
   else
     printf '%s [ok] pushed %s@%s (PR already open)\n' "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" >>"$log" 2>&1
