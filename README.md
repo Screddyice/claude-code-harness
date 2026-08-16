@@ -34,6 +34,9 @@ codex-harness/
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
+│   ├── gbrowse                       # headed-browser wrapper that survives a session
+│   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
+│   ├── dns-postflight.sh             # did the cutover land, and did mail survive
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
     └── example-local/                # Codex local plugin marketplace example
@@ -286,6 +289,89 @@ turns the rule off for reused branches.
 landed" and "has an open review surface" are different facts, and anything that logs or
 reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
 only on exactly `needs_pr`.
+
+## gbrowse — headed browser sessions that survive
+
+`browse handoff` opens a visible browser so a human can log in, solve a CAPTCHA, or
+clear an MFA prompt. In a Claude Code session it reliably destroys the thing it just
+created. Observed 2026-08-14 driving the GoDaddy and Squarespace panels: five daemon
+deaths, three logins, every one discarding the authenticated session.
+
+```bash
+gbrowse handoff [message]   # headed takeover that actually survives
+gbrowse doctor              # mode agreement, orphaned daemons, watchdog risk
+gbrowse <anything else>     # passed straight through to browse
+```
+
+**Cause.** `handoff` promotes a *running* daemon in place: `browser-manager.ts` swaps
+the Playwright context and sets `connectionMode = 'headed'` without restarting the
+process. The parent-process watchdog registered at boot (`server.ts:687-714`) is still
+live and still pointed at whatever shell started the daemon. Claude Code's Bash tool
+kills that shell after every tool call, so on the next 15s poll the watchdog sees a
+dead parent, sees headed mode, and shuts down. In headless mode it deliberately stays
+alive — promotion is what turns a tolerated condition into a fatal one.
+
+A second path shares the predicate: the SIGTERM handler at `server.ts:1369-1381` also
+quits when runtime mode is headed, gated by **neither** `BROWSE_PARENT_PID` nor
+`BROWSE_HEADED`. Exporting `BROWSE_PARENT_PID=0` therefore only silences the poller.
+
+**Fix.** `browse connect` already does the right thing: it force-kills any existing
+daemon and cold-restarts with the watchdog disabled and the process detached into its
+own group. So `gbrowse handoff` captures the current URL, routes through `connect`,
+and re-navigates. Cookies survive because the Chromium profile is persistent.
+
+`gbrowse doctor` reports the tell that makes this invisible: the state file's `mode` is
+written only at start, so after an in-place promotion disk says `launched` while the
+process is headed and dying on a timer. It also lists orphaned daemons, which `connect`
+cannot see because it only kills what the state file knows about.
+
+Verified: plain `browse handoff` daemon gone after 45s; via `gbrowse`, alive with
+consistent mode. Patching the gstack checkout directly is not durable, because
+`/gstack-upgrade` hard-resets the working tree to origin/main, so the wrapper lives
+here and the real fix is a separate PR upstream.
+
+## DNS Cutover Guards
+
+Moving a domain's DNS is not a website setting when that domain also carries email.
+`reddy2help.org` was moved from Squarespace to GoDaddy on 2026-08-14 and went fully
+offline, mail included, because nothing asked whether the delegation was signed.
+
+```bash
+scripts/dns-preflight.sh  <domain> <target-nameserver> [more...]
+scripts/dns-postflight.sh <domain> --expect-ip <ip> --dkim-fingerprint <sha256> \
+                                   --acme-host <ssh-alias> [--acme-service caddy]
+```
+
+**The rule both scripts enforce: build the destination zone first, switch last.** A
+zone at a new provider is inert until the nameservers point at it, so it can be built
+and verified at zero risk. Switching first is not a faster path to the same place.
+
+`dns-preflight.sh` is read-only and exits non-zero on a blocking finding. It catches
+the two failures that take a domain fully offline:
+
+- **DNSSEC.** If the registry publishes a DS record, a nameserver move to an unsigned
+  provider means the registrar disables signing immediately while the DS leaves the
+  registry on its own TTL. In that gap every validating resolver refuses the answer.
+  Measured: SERVFAIL on 1.1.1.1, 8.8.8.8 and 9.9.9.9 within a minute, for ~11 minutes.
+- **Mail records absent at the destination.** A new zone inherits nothing. The
+  destination is queried directly and diffed against the live zone. The DKIM key is
+  **fingerprinted**, not merely counted: a key over 255 characters is published split
+  across quoted strings, and rejoining it wrong yields a record that is present,
+  well-formed, and cryptographically junk. Mail keeps sending and silently fails
+  authentication.
+
+`dns-postflight.sh` catches the two that make a *correct* cutover still serve nothing:
+
+- **Staged propagation.** The NS change and the DS removal reach the registry
+  independently, so it polls four validating resolvers rather than one.
+- **A stuck ACME backoff.** An ACME client cannot observe that DNS changed. Caddy had
+  been failing since the VM was built and by cutover was on attempt 33 with a
+  **six-hour** retry, having fallen through to Let's Encrypt staging (browser-rejected).
+  DNS was right, mail was right, the site served nothing. `--acme-host` restarts the
+  service and the issuer is checked afterwards so a staging cert cannot pass.
+
+The `dns-cutover` skill wraps both with the procedure and the DNSSEC-restore ordering
+rule (**sign first, publish the DS second**).
 
 ## Per-Repo Harness
 
