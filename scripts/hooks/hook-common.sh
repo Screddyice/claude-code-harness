@@ -6,16 +6,16 @@ hook_resolve_cwd() {
   local input="${1:-}"
   local cwd
 
-  # Accept Claude/Codex (cwd) and Grok (cwd / workspaceRoot) payloads.
+  # Accept Claude/Codex (cwd) payloads.
   cwd="$(printf '%s' "$input" | python3 -c 'import json, sys
 try:
     j = json.load(sys.stdin)
 except Exception:
     print("")
     raise SystemExit
-print(j.get("cwd") or j.get("workspaceRoot") or j.get("workspace_root") or "")' 2>/dev/null)"
+print(j.get("cwd") or "")' 2>/dev/null)"
   [ -z "$cwd" ] && cwd="${CODEX_PROJECT_DIR:-}"
-  [ -z "$cwd" ] && cwd="${GROK_WORKSPACE_ROOT:-${CLAUDE_PROJECT_DIR:-}}"
+  [ -z "$cwd" ] && cwd="${CLAUDE_PROJECT_DIR:-}"
   [ -n "$cwd" ] && cd "$cwd" 2>/dev/null || true
 }
 

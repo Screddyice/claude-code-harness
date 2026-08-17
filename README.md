@@ -22,14 +22,11 @@ codex-harness/
 │   ├── AGENTS.md.workspace.example   # ~/projects/AGENTS.md template
 │   ├── AGENTS.md.project.example     # per-repo AGENTS.md starter
 │   ├── config.toml.example           # ~/.codex/config.toml starter
-│   ├── hooks.json.example            # optional Codex hook wiring
-│   └── grok/                         # Grok-native hooks (PR tracking, HyperSwarm)
+│   └── hooks.json.example            # optional Codex hook wiring
 ├── scripts/
 │   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
 │   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
 │   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
-│   ├── install-grok-harness.sh       # install Grok native wiring
-│   ├── grok/                         # Grok bridge scripts (HyperSwarm)
 │   ├── hooks/                           # shared hook logic and runtime adapters
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
 │   ├── test-swarm.sh                 # swarm pytest suite runner
@@ -400,21 +397,19 @@ compaction hooks. This harness includes `examples/hooks.json.example` for users 
 want auto-init behavior similar to the old Claude SessionStart hook. Codex requires
 non-managed hooks to be reviewed and trusted; inspect them with `/hooks` after install.
 
-The `scripts/hooks/` directory is the canonical runtime for hooks shared by Claude Code,
-Codex, and Grok. Point each tool's config at this directory instead of keeping executable
-copies under `~/.claude`, `~/.codex`, and `~/.grok`. All three run the same automatic PR
-tracker. Claude and Codex also run the local Ollama diff reviewer; Grok deliberately does
-not (see [Grok harness support](#grok-harness-support)). Thin Stop-hook adapters preserve
-each tool's JSON contract:
+The `scripts/hooks/` directory is the canonical runtime for hooks shared by Claude Code
+and Codex. Point each tool's config at this directory instead of keeping executable
+copies under `~/.claude` and `~/.codex`. Both run the same automatic PR tracker and the
+local Ollama diff reviewer. Thin Stop-hook adapters preserve each tool's JSON contract:
 
-| Behavior | Claude Code | Codex | Grok |
-|----------|-------------|-------|------|
-| Push branches and open draft PRs | `auto-pr-push.sh` | `auto-pr-push.sh` | `auto-pr-push.sh` (via `examples/grok/pr-tracking.json`) |
-| Enforce one PR per work branch | `enforce-pr-claude.sh` | `enforce-pr-codex.sh` | `enforce-pr-grok.sh` |
-| Review the current diff with Ollama | `local-diff-review.sh` | `local-diff-review-codex.sh` | **off** (GPU panic risk) |
-| Distil session left-off into HyperSwarm | Claude settings | `codex-hyperswarm-leftoff.sh` | `scripts/grok/hyperswarm-leftoff.sh` |
-| Sample OAuth login expiry | `oauth-expiry-monitor.sh` | n/a | n/a |
-| Write a session memory to Mem0 | plugin hooks | plugin hooks | `scripts/grok/mem0-session-write.sh` |
+| Behavior | Claude Code | Codex |
+|----------|-------------|-------|
+| Push branches and open draft PRs | `auto-pr-push.sh` | `auto-pr-push.sh` |
+| Enforce one PR per work branch | `enforce-pr-claude.sh` | `enforce-pr-codex.sh` |
+| Review the current diff with Ollama | `local-diff-review.sh` | `local-diff-review-codex.sh` |
+| Distil session left-off into HyperSwarm | Claude settings | `codex-hyperswarm-leftoff.sh` |
+| Sample OAuth login expiry | `oauth-expiry-monitor.sh` | n/a |
+| Write a session memory to Mem0 | plugin hooks | plugin hooks |
 
 `codex-hyperswarm-leftoff.sh` runs on Codex `SessionEnd` and gives Codex parity
 with Claude Code's HyperSwarm feed: it hands the ending session's id to
@@ -436,8 +431,8 @@ allowlist disables automatic pushes.
 #### Login-expiry monitor
 
 `oauth-expiry-monitor.sh` runs on Claude Code `SessionStart` (loud) and `SessionEnd`
-(`--quiet`). It stays silent while your login is healthy. Codex and Grok authenticate
-through their own CLIs, so this hook is Claude-only.
+(`--quiet`). It stays silent while your login is healthy. Codex authenticates through its
+own CLI, so this hook is Claude-only.
 
 It exists because Claude Code's banner is easy to misread. The banner reads one field,
 `refreshTokenExpiresAt` in the macOS keychain item `Claude Code-credentials`, and renders
@@ -469,36 +464,16 @@ synthetic credential instead of reading the keychain. Run
 path, a forward roll, the regression and expiring alerts, `--quiet`, a malformed
 credential blob, and the shape of the emitted hook JSON.
 
-#### Grok session memories
+#### Session memories
 
-Every other host contributes memories to Mem0: Claude Code and Codex run the
-mem0 plugin hooks, Hermes writes through its own provider. Grok reaches Mem0
-over **MCP only**, which is on-demand and read/write within a session, with no
-hook that records the session itself. Two consequences, both recorded as a known
-limitation in PR #18 and now closed:
-
-- Grok sessions were invisible to recall on every other host.
-- HyperSwarm's `mem0_session` distiller matches on `metadata.session_id`, so a
-  Grok session could never produce a corpus entry no matter what the leftoff
-  hook did.
-
-`scripts/grok/mem0-session-write.sh` runs on Grok `SessionEnd` and writes ONE
-memory tagged `metadata.session_id` and `source=grok`. It reads
-`~/.grok/sessions/<url-encoded cwd>/prompt_history.jsonl`, which holds what the
-user actually typed keyed by session id, plus that session's `summary.json` for
-Grok's own generated title. It deliberately does **not** parse
-`chat_history.jsonl`: its user turns are wrapped blocks (`<user_info>`,
-`<user_query>`) that need unwrapping, while `prompt_history` is already clean.
-
-The hook returns in ~0.2s and does the work in a detached worker, so session
-close is never delayed. It honours the same recursion markers as the other
-harness hooks (`CODEX_NO_INTERACTIVE`, plus its own `GROK_MEM0_NO_RECURSE`). It
-only ever **writes**, so it cannot consume the retrieval quota that
+Every host contributes memories to Mem0: Claude Code and Codex run the mem0
+plugin hooks, Hermes writes through its own provider. The session-memory hooks
+only ever **write**, so they cannot consume the retrieval quota that
 `mem0-local` exists to protect: Mem0 Starter allows 50,000 adds/month against
 5,000 retrievals, and adds are not the binding constraint.
 
-Verified against a real 539-message session: 4 prompts extracted, 5 memories
-landed with `source=grok`.
+HyperSwarm's `mem0_session` distiller matches on `metadata.session_id`, so any
+host that wants a corpus entry has to tag its session write with that key.
 
 #### Duplicate-PR guard after a squash merge
 
@@ -526,18 +501,16 @@ than the branch name, so reusing a branch for new commits after its PR merged st
 opens a fresh PR. This brings the automatic hook in line with `track-branch-pr.sh`,
 which already refused to add a second review history to a closed or merged PR.
 
-Because Claude Code, Codex, and Grok all run this same script — Claude via settings,
-Codex via `~/.codex/hooks.json`, Grok via native `~/.grok/hooks/pr-tracking.json` — the
-guard applies to all three. Do **not** enable Grok `[compat.claude] hooks = true` to get
-this behavior; that imports Claude's full hook chain (including the Ollama reviewer) and
-has panicked this host. Run `scripts/test-auto-pr-push-merged-guard.sh` after changing it.
+Because Claude Code and Codex both run this same script — Claude via settings, Codex via
+`~/.codex/hooks.json` — the guard applies to both. Run
+`scripts/test-auto-pr-push-merged-guard.sh` after changing it.
 The old top-level `scripts/codex-local-diff-review.sh` remains as a compatibility entry
 point. Run `scripts/test-shared-hooks.sh` after changing shared logic or an adapter.
 
 ## Workspace root (multi-org)
 
 When this harness is installed on a multi-org machine (e.g. Shawn's `~/projects`), hooks and
-skills are **user-global**. Opening Claude Code / Codex / Grok from the workspace root or
+skills are **user-global**. Opening Claude Code or Codex from the workspace root or
 from any org/repo under it uses the same harness. Workspace docs: `~/projects/CLAUDE.md`,
 `~/projects/AGENTS.md`. Org folders only add thin pointers; git `origin` selects company
 credentials.
@@ -546,47 +519,20 @@ credentials.
 |---------|------------------------|
 | Claude Code | `~/projects/CLAUDE.md`, `~/projects/.claude/skills` → `~/.claude/skills` |
 | Codex | `~/.codex/AGENTS.md` + `~/projects/AGENTS.md`; skills under `~/.codex/skills` (agents skills linked); hooks in `~/.codex/hooks.json`; zsh `codex` loads `~/projects/.env` |
-| Grok | `~/.grok/rules/projects-workspace.md`; `[skills].paths` includes agents + claude skills; native hooks; `grok` wrapper loads `~/projects/.env` |
 
-## Grok harness support
+## Retired: Grok harness support
 
-Grok Build TUI (`~/.grok`) gets a **native** harness slice, not Claude-compat import.
+The Grok Build TUI, `~/.grok`, and this repo's Grok slice — `scripts/install-grok-harness.sh`,
+`scripts/grok/`, `examples/grok/`, and `enforce-pr-grok.sh` — were removed on 2026-08-18.
 
-### Architecture (what works, and what must stay off)
+One finding from that host still governs this repo: never import a harness's full hook chain
+into a second harness's per-tool-call path. Doing that ran the Ollama diff reviewer on every
+Grok tool call and kernel-panicked this Mac twice on 2026-07-31, which is why the reviewer's
+resident cost is capped below.
 
-| Channel | How it reaches Grok | Notes |
-|---------|---------------------|-------|
-| HyperSwarm left-off | `~/.grok/hooks/hyperswarm.json` → `hyperswarm-leftoff.sh` | Same distiller path as Codex; detached worker sleeps 5s before capturing |
-| PR tracking | `~/.grok/hooks/pr-tracking.json` → shared `auto-pr-push.sh` + `enforce-pr-grok.sh` | Owned-org allowlist only |
-| Local Ollama diff review | **not wired** | Resident ~7.5 GB + council load kernel-panicked the Mac twice on 2026-07-31 |
-| `[compat.claude] hooks/mcps` | **must stay false** | True double-fires Claude's chain into Grok; was a root cause of the panics |
+## Local Ollama diff reviewer
 
-### Install
-
-```bash
-# From this repo — idempotent. Syncs scripts + hook JSON into ~/.grok.
-scripts/install-grok-harness.sh
-scripts/install-grok-harness.sh --check   # status only
-
-# First-time config.toml notes (installer never overwrites your file):
-#   [compat.claude]
-#   skills = true
-#   rules = true
-#   agents = true
-#   hooks = false         # use native ~/.grok/hooks/*.json instead
-```
-
-Restart Grok (new session) after install so hooks reload. Confirm with `/hooks` and:
-
-```bash
-  "SELECT platform_source, COUNT(*) FROM sdk_sessions GROUP BY 1;"
-```
-
-A healthy setup shows `platform_source=grok` rows growing as you work, context in
-reporting `proxy=host`, and **no** Ollama model loaded solely for Grok mem or a Grok Stop
-(`ollama ps` should stay empty unless you are in a local/qwen coding session or fusion).
-
-### Local diff reviewer GPU cost
+### GPU cost
 
 The reviewer runs on `Stop`, so it fires once per turn. It used to default to
 `gemma3:12b` with no rate limit, which meant a 13 GB load onto the GPU dozens of
