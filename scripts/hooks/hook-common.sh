@@ -64,15 +64,82 @@ hook_load_branch_context() {
   repo_identity="$(printf '%s %s' "$HOOK_ORIGIN_URL" "$HOOK_REPO_DIR" | tr '[:upper:]' '[:lower:]')"
   case "$repo_identity" in *rs21*) return 1 ;; esac
 
+  # The integration branch THIS branch forked from -- not a guessed default.
+  #
+  # This used to take the first of main/master that existed, which is wrong two
+  # different ways. A repo whose integration branch is something else (nebos-v2
+  # deploys `dev`; teamnebula.ai defaults to `staging`) had its "commits ahead"
+  # measured against a ref the work does not belong on, and because `gh pr create`
+  # was called with no --base, the PR then targeted the repo DEFAULT -- a third
+  # ref, agreeing with neither. teamnebula-ai/nebos-v2#365 opened against `main`
+  # in a repo where every PR targets `dev`.
+  #
+  # Scored by TOTAL DIVERGENCE, not by commits ahead. Derived per branch, so one
+  # repo can serve both a `dev` flow and a `main` flow.
+  #
+  # "Fewest commits ahead" is the obvious metric and it ties constantly: a branch
+  # cut from `main` with one commit is 1 ahead of `main` AND 1 ahead of `dev`, so
+  # the tie falls to list order and half the repos get the wrong answer.
+  #
+  # Divergence separates them, because it also counts what the candidate has that
+  # we do not:
+  #
+  #                        ahead  behind  total
+  #   cut from main:  main    1      0       1   <- forked here
+  #                   dev     1      1       2
+  #   cut from dev:   dev     1      0       1   <- forked here
+  #                   main    2      0       2
+  #
+  # The fork point is the candidate we have diverged from least in both
+  # directions, which is exactly what a human reads off the network graph.
+  # Remote-tracking refs are scored ALONE whenever any exist, and local branch
+  # names are a fallback for a repo that has none.
+  #
+  # Mixing the two tiers is a correctness bug, not a style choice. A local `main`
+  # can be arbitrarily stale, and a stale ref looks CLOSER on divergence than the
+  # remote one precisely when it matters most: after a squash merge, origin/main
+  # carries a commit this branch lacks (+1 behind) while the untouched local main
+  # does not, so the local ref wins the score and the "base already contains this
+  # tree" guard stops firing. That guard is what stops a second PR being opened for
+  # already-merged work, so losing it re-opens the llm-jury#18 duplicate.
+  local ref default_ref candidates remote_candidates counts ahead behind total best_total
+  default_ref="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  remote_candidates=""
+  # Order is the tie-break, and only the tie-break: divergence decides outright
+  # whenever the branch really did fork from one of these. Trunk leads, because a
+  # tie means "equally far from both" and trunk is the safer place to aim then.
+  # origin/HEAD is first so a repo whose default is not named here still wins.
+  for ref in $default_ref origin/main origin/master origin/dev origin/develop origin/staging; do
+    [ -n "$ref" ] || continue
+    git rev-parse --verify --quiet "$ref" >/dev/null 2>&1 && remote_candidates="$remote_candidates $ref"
+  done
+  if [ -n "$remote_candidates" ]; then
+    candidates="$remote_candidates"
+  else
+    candidates="main master dev develop staging"
+  fi
+
   HOOK_BASE=""
-  local ref
-  for ref in origin/main origin/master main master; do
-    if git rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+  best_total=""
+  for ref in $candidates; do
+    [ -n "$ref" ] || continue
+    git rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || continue
+    # "<behind>\t<ahead>": commits on ref we lack, then commits on HEAD it lacks.
+    counts="$(git rev-list --left-right --count "${ref}...HEAD" 2>/dev/null || true)"
+    [ -n "$counts" ] || continue
+    behind="$(printf '%s' "$counts" | awk '{print $1}')"
+    ahead="$(printf '%s' "$counts" | awk '{print $2}')"
+    case "$behind$ahead" in ''|*[!0-9]*) continue ;; esac
+    total=$((behind + ahead))
+    if [ -z "$best_total" ] || [ "$total" -lt "$best_total" ]; then
+      best_total="$total"
       HOOK_BASE="$ref"
-      break
     fi
   done
   [ -n "$HOOK_BASE" ] || return 1
+
+  # The branch name a PR can target: refs/remotes/origin/dev -> dev.
+  HOOK_BASE_BRANCH="${HOOK_BASE#origin/}"
 
   HOOK_AHEAD="$(git rev-list --count "${HOOK_BASE}..HEAD" 2>/dev/null || echo 0)"
   [ "${HOOK_AHEAD:-0}" -gt 0 ] 2>/dev/null || return 1
