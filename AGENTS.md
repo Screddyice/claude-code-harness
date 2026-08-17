@@ -37,23 +37,19 @@ Claude surfaces; `--strict` treats every legacy-only path as a failure.
 ## Workspace root (Shawn Mac)
 
 On this machine the multi-org workspace is `~/projects` (not a single git repo). Harness
-hooks install into user config (`~/.claude`, `~/.codex`, `~/.grok`) so they apply to
+hooks install into user config (`~/.claude`, `~/.codex`) so they apply to
 **any** cwd under `~/projects`, regardless of org folder. Workspace instructions live at
 `~/projects/AGENTS.md` and `~/projects/CLAUDE.md`; org identity is still git `origin`.
 Do not require re-installing the harness per org.
 
-## Grok (native, not compat import)
+## Retired hosts
 
-Grok lives under `~/.grok` with its own hooks and scripts. Install with
-`scripts/install-grok-harness.sh`. Hard rules:
+**Grok (removed 2026-08-18).** The Grok Build CLI, `~/.grok`, its native hook slice, and
+`scripts/install-grok-harness.sh` were removed from this machine and this repo. Do not
+re-add a Grok host without re-deriving the hard rules that governed it — chiefly that
+`[compat.claude] hooks` had to stay false, because importing Claude's full hook chain
+(including the Ollama diff reviewer) into every Grok tool call kernel-panicked this host.
 
-- Keep `[compat.claude] hooks = false` and `mcps = false`. Enabling them imports Claude
-  Code's full hook chain (including the Ollama diff reviewer) into every Grok tool call
-  and has kernel-panicked this host.
-- Wire PR tracking and  (claude-mem removed) /grok/*.json` + `scripts/grok/*`,
-  never by turning on Claude compat hooks.
-- Do not add `local-diff-review` to Grok Stop hooks.
-- **Mem compression is host-routed (2026-08-01):** Grok sessions compress with
-  Grok CLI, Codex with Codex CLI, Claude with Claude CLI (Codex fallback on
-  weekly limit). Local Ollama `qwen3.5:4b-mem` is only for local/qwen sessions.
-  Grok session must not load Ollama solely for mem.
+**Mem compression is host-routed (2026-08-01):** Codex sessions compress with Codex CLI,
+Claude with Claude CLI (Codex fallback on weekly limit). Local Ollama `qwen3.5:4b-mem` is
+only for local/qwen sessions.
