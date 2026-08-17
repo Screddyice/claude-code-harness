@@ -83,8 +83,9 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
   fi
 
   if [ "${AUTO_PR_PUSH_DRYRUN:-0}" = "1" ]; then
-    printf '%s [DRYRUN] %s@%s (owner=%s, ahead=%s) -> would push + ensure draft PR\n' \
-      "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$owner" "$HOOK_AHEAD" >>"$log" 2>&1
+    printf '%s [DRYRUN] %s@%s (owner=%s, base=%s, ahead=%s) -> would push + ensure draft PR --base %s\n' \
+      "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$owner" "$HOOK_BASE_BRANCH" "$HOOK_AHEAD" \
+      "$HOOK_BASE_BRANCH" >>"$log" 2>&1
     exit 0
   fi
 
@@ -133,8 +134,11 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
   pr_count="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
     --head "$HOOK_BRANCH" --state open --json number --jq 'length' 2>>"$log")"
   if [ "${pr_count:-0}" = "0" ]; then
+    # --base is explicit on purpose. Omitting it let GitHub fall back to the repo
+    # DEFAULT branch, which is a different ref from the one HOOK_AHEAD was measured
+    # against -- so the precondition and the PR disagreed (nebos-v2#365).
     if gh pr create ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
-      --draft --fill --head "$HOOK_BRANCH" >>"$log" 2>&1; then
+      --draft --fill --head "$HOOK_BRANCH" --base "$HOOK_BASE_BRANCH" >>"$log" 2>&1; then
       printf '%s [ok] opened draft PR for %s@%s\n' "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" >>"$log" 2>&1
     else
       # Reachable now only with a genuinely successful push, so this message can

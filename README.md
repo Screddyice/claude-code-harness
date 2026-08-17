@@ -290,6 +290,45 @@ landed" and "has an open review surface" are different facts, and anything that 
 reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
 only on exactly `needs_pr`.
 
+### The PR's base is derived, not defaulted
+
+`gh pr create` was called with no `--base`, so GitHub silently used the repository's **default**
+branch. Meanwhile `HOOK_BASE` only ever looked for `main`/`master`. Two guesses, and nothing made
+them agree with each other or with reality.
+
+Observed 2026-08-17: `teamnebula-ai/nebos-v2#365` opened against `main` in a repo where every PR
+targets `dev`. The hook had also counted "commits ahead" against `origin/main`, so a branch cut
+from `dev` was reported as 2 ahead when it carried 1 commit.
+
+`HOOK_BASE` now scores candidate integration refs by **total divergence** and picks the nearest,
+which is the branch the work actually forked from:
+
+| | ahead | behind | total |
+|---|---|---|---|
+| cut from `main` → `main` | 1 | 0 | **1** |
+| cut from `main` → `dev` | 1 | 1 | 2 |
+| cut from `dev` → `dev` | 1 | 0 | **1** |
+| cut from `dev` → `main` | 2 | 0 | 2 |
+
+"Fewest commits ahead" is the obvious metric and it ties constantly — a branch cut from `main`
+with one commit is 1 ahead of both. Divergence separates them because it also counts what the
+candidate has that the branch does not. Derived per branch, so one repo can serve both flows.
+`HOOK_BASE_BRANCH` is then passed explicitly as `--base`, so the PR and the precondition can no
+longer disagree.
+
+**Remote-tracking refs are scored alone whenever any exist**, with local branch names only as a
+fallback. Mixing the tiers is a correctness bug, not a style preference: after a squash merge
+`origin/main` carries a commit the branch lacks while a stale local `main` does not, so the local
+ref wins on divergence and the "base already contains this tree" guard above stops firing. That
+guard is what prevents a second PR for already-merged work, so losing it reopens the llm-jury#18
+duplicate. `test-auto-pr-push-merged-guard.sh` case 4 caught exactly this during development.
+
+The three `enforce-pr-*` Stop hooks interpolate `$HOOK_BASE` into their block message, so their
+"N commits ahead of X" line becomes accurate as a side effect.
+
+Covered by `scripts/test-auto-pr-push-base.sh` (5 cases: forked-from-dev, forked-from-main in the
+same repo, a main-only repo, the ahead-count agreeing with the base, and the stale-local-ref trap).
+
 ## gbrowse — headed browser sessions that survive
 
 `browse handoff` opens a visible browser so a human can log in, solve a CAPTCHA, or
