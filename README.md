@@ -323,7 +323,7 @@ ref wins on divergence and the "base already contains this tree" guard above sto
 guard is what prevents a second PR for already-merged work, so losing it reopens the llm-jury#18
 duplicate. `test-auto-pr-push-merged-guard.sh` case 4 caught exactly this during development.
 
-The three `enforce-pr-*` Stop hooks interpolate `$HOOK_BASE` into their block message, so their
+Both `enforce-pr-*` Stop hooks interpolate `$HOOK_BASE` into their block message, so their
 "N commits ahead of X" line becomes accurate as a side effect.
 
 Covered by `scripts/test-auto-pr-push-base.sh` (5 cases: forked-from-dev, forked-from-main in the
