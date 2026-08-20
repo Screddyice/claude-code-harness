@@ -530,11 +530,17 @@ credential blob, and the shape of the emitted hook JSON.
 
 #### Session memories
 
-Every host contributes memories to Mem0: Claude Code and Codex run the mem0
-plugin hooks, Hermes writes through its own provider. The session-memory hooks
-only ever **write**, so they cannot consume the retrieval quota that
-`mem0-local` exists to protect: Mem0 Starter allows 50,000 adds/month against
-5,000 retrievals, and adds are not the binding constraint.
+Every host contributes memories to **Cognee** (migrated from Mem0 on 2026-08-20):
+Claude Code runs the `cognee-memory@cognee` plugin, Codex runs `cognee@cognee`, and
+Hermes writes through a native Python provider at `~/.hermes/plugins/cognee/`. All three
+share one dataset, `agent_sessions`, tagged by node set (`user_context`, `project_docs`,
+`agent_actions`).
+
+Mem0 was retired because its Starter plan capped **retrievals** at 5,000/month and a
+single `user_id` shared across every host exhausted that quota, after which the API
+returned HTTP 402 on every call. The lesson generalises: one shared memory account
+across many hosts is a quota single point of failure, so watch the retrieval ceiling
+rather than the add ceiling.
 
 HyperSwarm's `mem0_session` distiller matches on `metadata.session_id`, so any
 host that wants a corpus entry has to tag its session write with that key.
@@ -614,6 +620,13 @@ times in a working session. Two defaults changed on 2026-07-31:
 The reviewer reads prior-work notes for the changed files out of the offline Mem0
 mirror (`~/.mem0-local/cache.db`) and prepends them to its system prompt, so it reviews
 a diff knowing what was decided about those files before.
+
+> **Post-migration note (2026-08-20).** This path still reads the Mem0 mirror, which is
+> now a **frozen archive** — it holds 16,127 memories and keeps working offline, but it
+> no longer receives new writes, so the reviewer's context ages from here. Repointing
+> `local-diff-review.sh` at Cognee is tracked separately; the hook was deliberately left
+> alone during the migration because the mirror is local-only and never touched the
+> quota that forced the cutover.
 
 Every other local brain gets this at the proxy: `src/proxy/memory.py` in
 `Screddyice/backdoor` injects recall into anything routed through `:8083`, which covers
