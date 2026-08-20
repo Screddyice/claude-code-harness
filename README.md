@@ -27,6 +27,8 @@ codex-harness/
 │   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
 │   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
 │   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
+│   ├── install-claude-resilient-updater.sh # resumable Claude native updates on macOS
+│   ├── claude-manual-update             # checksum-verified update worker
 │   ├── hooks/                           # shared hook logic and runtime adapters
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
 │   ├── test-swarm.sh                 # swarm pytest suite runner
@@ -94,7 +96,30 @@ scripts/install-llmjury-orchestration.sh
 
 # 8. Audit the whole workspace; this command is read-only.
 scripts/audit-codex-migration.sh ~/projects
+
+# 9. Optional: replace Claude Code's deadline-bound native updater on slow links.
+scripts/install-claude-resilient-updater.sh
 ```
+
+## Resilient Claude Code updates
+
+Claude Code's native updater can abandon a valid 300 MB download when a slow link
+exceeds its fixed deadline. `scripts/install-claude-resilient-updater.sh` installs a
+macOS LaunchAgent that checks the `latest` channel every six hours. Its worker bypasses
+local API proxies for the Google Cloud Storage download, preserves partial files across
+DNS and connection failures, resumes them on the next attempt, verifies
+the release manifest checksum, and swaps the version symlink atomically. A verified run
+also writes Claude's native update-result schema, so `claude doctor` does not keep
+reporting an older failed attempt after the replacement updater succeeds.
+
+Run a read-only channel and checksum check at any time:
+
+```bash
+~/.local/bin/claude-manual-update --check
+```
+
+Logs are stored in `~/.local/state/claude-resilient-updater/update.log`. Existing
+versions remain under `~/.local/share/claude/versions` for manual rollback.
 
 ## Optional LLM-Jury Orchestration
 
