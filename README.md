@@ -391,6 +391,34 @@ consistent mode. Patching the gstack checkout directly is not durable, because
 `/gstack-upgrade` hard-resets the working tree to origin/main, so the wrapper lives
 here and the real fix is a separate PR upstream.
 
+### browse-watchdog — notice, restore, file evidence
+
+`gbrowse` fixes the handoff path; `scripts/hooks/browse-watchdog.sh` covers every
+other way the session dies. Observed 2026-08-20 driving the IPRoyal dashboard: three
+daemon deaths in one session, one of which discarded a logged-in purchase flow. The
+worst part was not the crash — it was that the CLI silently auto-started a
+replacement server in `launched` mode on a different port with a clean profile, so
+every later command drove a browser nobody was looking at, and a dry run against
+production proxies read the *old* environment and returned wrong verdicts.
+
+```bash
+scripts/hooks/browse-watchdog.sh <project-dir> &   # watch that repo's session
+touch <project-dir>/.gstack/watchdog-stop           # stop it
+```
+
+Every `WATCHDOG_INTERVAL` (20s) it checks three things that must agree: the state
+file exists, its pid is alive, and `browse status` answers `Mode: headed`. Split
+brain in any direction is treated as a crash. On crash it captures evidence (state
+file, process table, port 34567 holders, connect-log tails), restarts with the same
+cleanup sequence that works by hand, navigates back to the last URL it recorded
+while healthy, and commits the evidence to the rolling `crash-reports` branch —
+one draft PR collects all of them, so a flapping server cannot spam the repo.
+`WATCHDOG_MAX_RESTARTS` (4/hour) stops the loop when the server needs a human
+rather than a supervisor. It never auto-fixes: gstack is third-party, and an
+unattended "fix" for an arbitrary crash is how you get two bugs.
+`WATCHDOG_AUTOFIX=1` additionally asks a headless `claude -p` to append an
+analysis to the report — analysis, not a merge.
+
 ## DNS Cutover Guards
 
 Moving a domain's DNS is not a website setting when that domain also carries email.
