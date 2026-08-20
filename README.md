@@ -759,6 +759,12 @@ This repo intentionally contains **no** secrets, API keys, OAuth tokens, server 
 account IDs, client names, team member names, or internal project identifiers. All
 company-specific content uses placeholders.
 
+The same bar applies to crash evidence on the rolling `crash-reports` branch: captured
+logs are redacted before they are pushed. Browse server token fields, crashpad API-key
+arguments, and exported environment key lines are replaced with `REDACTED` markers, and
+the branch history is rebuilt rather than amended when a leak slips through, since a
+follow-up commit leaves the exposed value reachable in prior commits.
+
 ## License
 
 [MIT](LICENSE)
