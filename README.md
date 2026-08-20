@@ -419,6 +419,33 @@ unattended "fix" for an arbitrary crash is how you get two bugs.
 `WATCHDOG_AUTOFIX=1` additionally asks a headless `claude -p` to append an
 analysis to the report — analysis, not a merge.
 
+## Automated PR review
+
+[Shawns QA Assist](https://github.com/Screddyice/shawns-qa-assist) reviews pull
+requests here, repairs what it finds, and merges once its gate passes.
+`.shawns-qa.toml` points at `scripts/verify.sh`, which parses every tracked
+shell and Python file.
+
+Without that gate the agent reports `merge_eligible=false` and hands **every**
+PR to a human, because nothing can vouch for the change. That is what happened
+to #29 and #30.
+
+The gate is syntax only, on purpose. This repo has no test suite, and a gate
+that failed on pre-existing style would block every PR on faults it did not
+introduce. What it does catch is the failure that actually costs something here:
+a broken hook reaching `main` and then dying inside somebody's session.
+
+```bash
+bash scripts/verify.sh   # exits non-zero and names the file on a syntax error
+```
+
+To pause the agent on this repo:
+
+```toml
+[behavior]
+enabled = false
+```
+
 ## DNS Cutover Guards
 
 Moving a domain's DNS is not a website setting when that domain also carries email.
