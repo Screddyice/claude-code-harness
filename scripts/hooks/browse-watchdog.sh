@@ -51,16 +51,26 @@ restart_log="$REPORT_ROOT/.restart-times"
 
 log() { printf '[watchdog %s] %s\n' "$(date -u '+%H:%M:%S')" "$*"; }
 
+browse_cmd() {
+    # The CLI keys its state file to the current directory, and any command
+    # issued while no server is running AUTO-SPAWNS a launched-mode squatter
+    # there. Both bites happened on this watchdog's first live run: probing
+    # from the wrong cwd created a second server for the wrong repo, then
+    # reported the healthy one dead. Every browse call goes through here,
+    # pinned to the project.
+    ( cd "$PROJECT_DIR" && timeout "${2:-20}" "$BROWSE" $1 2>/dev/null )
+}
+
 healthy() {
     # Healthy means: state file exists, its pid is alive, and the server
-    # answers `status` reporting headed mode. Any other combination is the
-    # split-brain state that burned us: a live CLI talking to a dead or wrong
-    # server.
+    # answers `status` reporting headed mode. The pid check comes FIRST --
+    # calling `status` with no live server auto-spawns the squatter that
+    # then blocks the real reconnect on the port.
     [[ -f "$STATE_FILE" ]] || return 1
     local pid
     pid="$(grep -o '"pid":[0-9]*' "$STATE_FILE" | grep -o '[0-9]*')" || return 1
     kill -0 "$pid" 2>/dev/null || return 1
-    timeout 20 "$BROWSE" status 2>/dev/null | grep -q "Mode: headed"
+    browse_cmd status | grep -q "Mode: headed"
 }
 
 recent_restarts() {
@@ -141,12 +151,17 @@ restart_browser() {
     sleep 2
     ( cd "$PROJECT_DIR" && nohup "$BROWSE" connect \
         > "$REPORT_ROOT/last-restart-connect.log" 2>&1 < /dev/null & )
-    sleep 20
+    # Wait for connect to write its own state file rather than sleeping blind:
+    # probing too early auto-spawns a squatter that steals the port.
+    local waited=0
+    until grep -q '"mode": *"headed"' "$STATE_FILE" 2>/dev/null || (( waited >= 45 )); do
+        sleep 3; waited=$(( waited + 3 ))
+    done
     local url
     url="$(cat "$LAST_URL_FILE" 2>/dev/null)"
     if [[ -n "$url" && "$url" != "about:blank" ]]; then
-        timeout 60 "$BROWSE" goto "$url" >/dev/null 2>&1
-        timeout 20 "$BROWSE" focus >/dev/null 2>&1
+        browse_cmd "goto $url" 60 >/dev/null
+        browse_cmd focus >/dev/null
     fi
 }
 
@@ -154,7 +169,7 @@ log "watching $PROJECT_DIR every ${INTERVAL}s (stop: touch $STOP_FILE)"
 while true; do
     [[ -f "$STOP_FILE" ]] && { rm -f "$STOP_FILE"; log "stop requested"; exit 0; }
     if healthy; then
-        url="$(timeout 15 "$BROWSE" url 2>/dev/null | tail -1)"
+        url="$(browse_cmd url 15 | tail -1)"
         [[ -n "$url" && "$url" == http* ]] && printf '%s' "$url" > "$LAST_URL_FILE"
     else
         ts="$(date -u '+%Y%m%dT%H%M%SZ')"
