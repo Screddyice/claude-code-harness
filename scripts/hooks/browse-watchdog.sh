@@ -68,7 +68,7 @@ healthy() {
     # then blocks the real reconnect on the port.
     [[ -f "$STATE_FILE" ]] || return 1
     local pid
-    pid="$(grep -o '"pid":[0-9]*' "$STATE_FILE" | grep -o '[0-9]*')" || return 1
+    pid="$(grep -o '"pid":[[:space:]]*[0-9]*' "$STATE_FILE" | grep -o '[0-9]*')" || return 1
     kill -0 "$pid" 2>/dev/null || return 1
     browse_cmd status | grep -q "Mode: headed"
 }
@@ -141,7 +141,7 @@ file_report() {
 
 restart_browser() {
     local pid
-    pid="$(grep -o '"pid":[0-9]*' "$STATE_FILE" 2>/dev/null | grep -o '[0-9]*')"
+    pid="$(grep -o '"pid":[[:space:]]*[0-9]*' "$STATE_FILE" 2>/dev/null | grep -o '[0-9]*')"
     [[ -n "${pid:-}" ]] && kill -9 "$pid" 2>/dev/null
     rm -f "$STATE_FILE"
     lsof -ti :34567 2>/dev/null | xargs kill -9 2>/dev/null
