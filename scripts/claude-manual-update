@@ -104,18 +104,23 @@ fi
 mkdir -p "$WORK" "$VERSIONS_DIR" "$(dirname "$LINK")"
 DL="$WORK/$VERSION.$PLATFORM"
 echo "downloading (resumable; safe to interrupt and re-run)..."
-attempt=1
-while ! "${CURL[@]}" --continue-at - --progress-bar -o "$DL" \
-  "$BUCKET/$VERSION/$PLATFORM/claude" >&2; do
-  if [[ $attempt -ge 10 ]]; then
-    echo "download failed after $attempt attempts; partial file preserved at $DL" >&2
-    exit 1
-  fi
-  bytes="$(stat -f %z "$DL" 2>/dev/null || stat -c %s "$DL" 2>/dev/null || echo 0)"
-  echo "download interrupted; preserving $bytes bytes and retrying" >&2
-  attempt=$((attempt + 1))
-  sleep "$RETRY_DELAY"
-done
+downloaded="$(stat -f %z "$DL" 2>/dev/null || stat -c %s "$DL" 2>/dev/null || echo 0)"
+if [[ "$downloaded" == "$SIZE" ]]; then
+  echo "complete download already present; verifying it"
+else
+  attempt=1
+  while ! "${CURL[@]}" --continue-at - --progress-bar -o "$DL" \
+    "$BUCKET/$VERSION/$PLATFORM/claude" >&2; do
+    if [[ $attempt -ge 10 ]]; then
+      echo "download failed after $attempt attempts; partial file preserved at $DL" >&2
+      exit 1
+    fi
+    bytes="$(stat -f %z "$DL" 2>/dev/null || stat -c %s "$DL" 2>/dev/null || echo 0)"
+    echo "download interrupted; preserving $bytes bytes and retrying" >&2
+    attempt=$((attempt + 1))
+    sleep "$RETRY_DELAY"
+  done
+fi
 
 GOT="$(shasum -a 256 "$DL" | cut -d' ' -f1)"
 if [[ "$GOT" != "$SHA" ]]; then
