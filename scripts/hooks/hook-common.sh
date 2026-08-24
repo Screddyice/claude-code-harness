@@ -26,6 +26,26 @@ hook_load_branch_context() {
   [ -n "$HOOK_BRANCH" ] || return 1
   case "$HOOK_BRANCH" in main|master) return 1 ;; esac
 
+  # Branches the PR rule does not apply to. EMPTY BY DEFAULT, and that is the
+  # whole design: "every branch gets a PR" is only worth anything if the machine
+  # cannot quietly decide a branch does not count. A pattern list guessed here
+  # (`*-check`, `*-tmp`) would silently exempt `feat/add-health-check`, and the
+  # branch that stops being enforced is exactly the one nobody notices.
+  #
+  # So the exemption is opt-in and per-shell: set the variable when you know the
+  # branch is disposable. Space-separated shell globs, matched whole.
+  #
+  #   HARNESS_PR_SKIP_BRANCHES='scratch/* tmp/*' claude
+  #
+  # For the far more common accident — an integration branch whose commits you
+  # already pushed somewhere else — you do not need this at all. That case is
+  # caught automatically by hook_head_has_pr_elsewhere().
+  local skip_pattern
+  for skip_pattern in ${HARNESS_PR_SKIP_BRANCHES:-}; do
+    # shellcheck disable=SC2254  # the glob is the point
+    case "$HOOK_BRANCH" in $skip_pattern) return 1 ;; esac
+  done
+
   HOOK_ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
   [ -n "$HOOK_ORIGIN_URL" ] || return 1
 
@@ -171,6 +191,58 @@ hook_branch_already_merged() {
   [ -n "$merged_oid" ] && [ "$merged_oid" = "$head_oid" ]
 }
 
+# True when THIS exact commit is already the head of a PR on another branch.
+#
+# The duplicate this prevents has nothing to do with merging. Push a local
+# branch's HEAD to a *different* remote branch — `git push origin HEAD:feat/real`
+# while sitting on a throwaway integration branch — and the work now has a PR,
+# but under a name this checkout has never heard of. hook_branch_already_merged()
+# cannot see it: that asks `--head "$HOOK_BRANCH"`, and the PR is on `feat/real`.
+# So the auto-PR hook pushes the scratch name too and opens a second PR for
+# commits already under review. Observed 2026-08-25 in Screddyice/backdoor, where
+# #51 and #52 appeared for the `pr47-check` and `pr44-check` branches used to
+# test-merge #47 and #44.
+#
+# Keyed on the head SHA rather than the tree, matching the two guards that
+# already exist. A branch that gains a NEW commit has a new HEAD and correctly
+# needs its own PR, so this cannot strand real work behind a stale match.
+#
+# Searches open and merged PRs in one call. A CLOSED (unmerged) PR is deliberately
+# not a match: that work was rejected, and rejected work has no review surface.
+hook_head_has_pr_elsewhere() {
+  local head_oid
+
+  command -v gh >/dev/null 2>&1 || return 1
+  head_oid="$(git rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$head_oid" ] || return 1
+
+  HOOK_PR_ELSEWHERE="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
+    --state all --limit 100 \
+    --json number,headRefName,headRefOid,state \
+    --jq "[.[] | select(.headRefOid == \"$head_oid\")
+             | select(.headRefName != \"$HOOK_BRANCH\")
+             | select(.state != \"CLOSED\")][0]
+          | if . then \"#\(.number) \(.headRefName)\" else empty end" 2>/dev/null)"
+
+  # Shape-checked, not just non-empty. This guard SUPPRESSES a pull request, so
+  # every way it can be wrong costs review coverage, and "gh printed something"
+  # is not evidence a PR exists. A mocked or older gh answering an unrecognised
+  # query with `0`, a deprecation notice on stdout, or a jq expression that stops
+  # matching after a schema change would all read as a match and silently stop
+  # proposing PRs for real work. Demand `#<number> <branch>` and treat anything
+  # else as no match, so an unexpected answer fails toward opening the PR.
+  case "${HOOK_PR_ELSEWHERE:-}" in
+    '#'[0-9]*' '?*)
+      case "${HOOK_PR_ELSEWHERE%% *}" in
+        '#'*[!0-9#]*) HOOK_PR_ELSEWHERE="" ;;
+      esac
+      ;;
+    *) HOOK_PR_ELSEWHERE="" ;;
+  esac
+
+  [ -n "${HOOK_PR_ELSEWHERE:-}" ]
+}
+
 hook_load_pr_status() {
   HOOK_PR_STATUS=""
   HOOK_PR_COUNT="0"
@@ -191,6 +263,10 @@ hook_load_pr_status() {
     # open" are different facts, and a consumer that logs or reports should be
     # able to tell them apart.
     HOOK_PR_STATUS="merged_pr"
+  elif hook_head_has_pr_elsewhere; then
+    # Same commits, different branch name. HOOK_PR_ELSEWHERE names the PR so a
+    # blocked stop can say WHERE the work is instead of demanding a second one.
+    HOOK_PR_STATUS="pr_elsewhere"
   else
     HOOK_PR_STATUS="needs_pr"
   fi

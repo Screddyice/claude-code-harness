@@ -312,6 +312,67 @@ landed" and "has an open review surface" are different facts, and anything that 
 reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
 only on exactly `needs_pr`.
 
+### A head already under review does not get a second PR
+
+The merged-PR guard above asks GitHub about `--head "$HOOK_BRANCH"`, so it only sees PRs opened
+under the name currently checked out. Push a branch's HEAD somewhere else and it goes blind:
+
+```
+git checkout -b pr44-check origin/fix/first-failure-failover
+git merge origin/main            # test the integration
+git push origin HEAD:fix/first-failure-failover
+```
+
+Those commits are now under review as `fix/first-failure-failover`. The checkout still says
+`pr44-check`, which has commits ahead of `main` and no PR of its own, so the hook pushed that
+name too and opened a PR for work already in review. Observed 2026-08-25 in
+`Screddyice/backdoor`: #51 and #52 appeared for the `pr47-check` and `pr44-check` branches used
+to test-merge #47 and #44.
+
+`hook_head_has_pr_elsewhere()` asks a different question — is this exact commit the head of any
+PR, under any branch name:
+
+```
+open PR, this branch     -> has_pr
+merged PR, same head     -> merged_pr        (work already landed)
+any PR elsewhere, same head -> pr_elsewhere  (reviewed under another name)
+none of the above        -> needs_pr         (blocks)
+```
+
+`auto-pr-push.sh` checks it **before pushing**, not just before `gh pr create`. Skipping only the
+create still publishes a redundant remote branch, which the Stop hook then demands a PR for.
+`enforce-pr-claude.sh` reports `pr_elsewhere` and names the PR instead of blocking, since there is
+nothing to open. `enforce-pr-codex.sh` needed no change; it blocks only on exactly `needs_pr`.
+
+A **closed, unmerged** PR is not a match. That work was rejected, and rejected work is not a
+review surface.
+
+**The result is shape-checked, and that is load-bearing.** This guard suppresses a pull request,
+so every way it can be wrong costs review coverage. A non-empty check is not good enough: the two
+older `auto-pr-push` tests mock `gh` with a catch-all that answers an unrecognised `pr list` query
+with `0`, and that lone character read as a match and stopped proposing PRs on every branch they
+exercise. All three suites went red at once. The guard now demands `#<number> <branch>` and treats
+anything else as no match, so a schema change, a deprecation notice on stdout, or an older `gh`
+fails toward opening the PR.
+
+### Disposable branches, only when you say so
+
+`HARNESS_PR_SKIP_BRANCHES` holds space-separated globs of branch names the rule ignores:
+
+```
+HARNESS_PR_SKIP_BRANCHES='scratch/* tmp/*' claude
+```
+
+**Empty by default.** A guessed pattern list would exempt `feat/add-health-check` on its way to
+catching `pr44-check`, and the branch that quietly stops being enforced is the one nobody notices.
+Most of the time you want the automatic guard above instead — it recognises the same integration
+branches without being told, because it looks at what is under review rather than at a name.
+
+Covered by `scripts/test-auto-pr-push-elsewhere-guard.sh` (8 cases: unreviewed work still
+proposed, open and merged matches skipped, closed-unmerged still proposed, a reused branch with
+new commits, the opt-out matching and not matching, and four shapes of unrecognised `gh` output
+that must all fail safe).
+
 ### The PR's base is derived, not defaulted
 
 `gh pr create` was called with no `--base`, so GitHub silently used the repository's **default**
