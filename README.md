@@ -524,7 +524,20 @@ zone at a new provider is inert until the nameservers point at it, so it can be 
 and verified at zero risk. Switching first is not a faster path to the same place.
 
 `dns-preflight.sh` is read-only and exits non-zero on a blocking finding. It catches
-the two failures that take a domain fully offline:
+the three failures that take a domain fully offline:
+
+- **A destination that does not exist.** Providers commonly run their advertised
+  nameservers as open recursive resolvers, so querying one for a domain it does not
+  host resolves through the public internet and hands back the CURRENT zone at the
+  OLD provider. Every record then "matches", and the pre-flight passes a destination
+  that was never built. Measured on `reddy2help.org` against
+  `ns0{1..4}.squarespacedns.com`: A, MX, SPF and the DKIM fingerprint all matched
+  byte-for-byte while the Squarespace panel showed its own parking IPs. Cutting over
+  on that evidence points the apex at `198.185.159.x` — site down, mail unverified.
+  The gate compares the SOA's primary (MNAME): a server echoing the source returns
+  the source's MNAME, one actually hosting the zone returns its own. **Not** the `aa`
+  flag — real anycast nameservers answer `+norecurse` with REFUSED and no `aa` even
+  for zones they serve, so an `aa` gate rejects legitimate destinations.
 
 - **DNSSEC.** If the registry publishes a DS record, a nameserver move to an unsigned
   provider means the registrar disables signing immediately while the DS leaves the
