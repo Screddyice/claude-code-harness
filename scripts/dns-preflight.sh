@@ -89,6 +89,9 @@ echo
 # than merely noted, because a key that is present but mangled looks healthy and
 # silently fails authentication.
 echo "── Mail records to carry over ──"
+# The zone's current primary, used below to tell a real destination zone apart
+# from a nameserver that merely resolved this name for us.
+SRC_MNAME="$(dig +short SOA "$DOMAIN" $R 2>/dev/null | awk '{print $1; exit}')"
 MX="$(dig +short MX "$DOMAIN" $R 2>/dev/null | sort | tr '\n' ' ')"
 SPF="$(dig +short TXT "$DOMAIN" $R 2>/dev/null | tr -d '"' | grep -i '^v=spf1' || true)"
 DMARC="$(dig +short TXT "_dmarc.$DOMAIN" $R 2>/dev/null | tr -d '"' | grep -i '^v=DMARC1' || true)"
@@ -144,6 +147,44 @@ if [ ${#TARGETS[@]} -gt 0 ]; then
   echo "── Destination zone (queried directly, before any cutover) ──"
   for t in "${TARGETS[@]}"; do
     echo "  via $t"
+
+    # AUTHORITY GATE — must run before any record comparison.
+    #
+    # "Got an answer" is not "the zone is here". Providers commonly run their
+    # advertised nameservers as open recursive resolvers, so a query for a
+    # domain they do not host is resolved through the PUBLIC internet and
+    # handed straight back. That answer IS the current zone at the OLD
+    # provider, so every comparison below matches perfectly and the pre-flight
+    # reports a destination that is ready when no destination exists.
+    #
+    # Measured on reddy2help.org -> ns0{1..4}.squarespacedns.com (2026-08-25):
+    # every record "matched byte-for-byte", DKIM fingerprint included, while
+    # the Squarespace panel showed its own parking IPs. Cutting over on that
+    # evidence would have pointed the apex at 198.185.159.x — public site down,
+    # mail unverified.
+    #
+    # The discriminator is the SOA's primary (MNAME), NOT the aa flag: real
+    # anycast nameservers answer +norecurse with REFUSED and no aa even for
+    # zones they serve, so an aa gate rejects legitimate destinations. A server
+    # echoing the source returns the SOURCE's MNAME; a server actually hosting
+    # the zone returns its own.
+    t_mname="$(dig +short SOA "$DOMAIN" "@$t" +time=5 +tries=1 2>/dev/null | awk '{print $1; exit}')"
+    if [ -z "$t_mname" ]; then
+      echo "    ✗ no SOA — the zone has not been created at $t yet"
+      echo "            Build the destination zone first, then re-run."
+      fail=1; continue
+    fi
+    if [ -n "$SRC_MNAME" ] && [ "$t_mname" = "$SRC_MNAME" ]; then
+      echo "    ✗ $t returned the SOURCE zone, not a destination zone"
+      echo "            SOA primary is $t_mname — the same one $DOMAIN uses today."
+      probe="$(dig +short A example.com "@$t" +time=5 +tries=1 2>/dev/null | head -1 || true)"
+      [ -n "$probe" ] && echo "            (it also resolved example.com, so it is recursing)"
+      echo "            Any 'match' below would be today's zone read back to us."
+      echo "            Build the destination zone first, then re-run."
+      fail=1; continue
+    fi
+    echo "    SOA   : $t_mname (hosts its own zone)"
+
     t_a="$(dig +short A "$DOMAIN" "@$t" +time=5 +tries=1 2>/dev/null | head -2 | tr '\n' ' ')"
     if [ -z "$t_a" ]; then
       echo "    ✗ no answer — the zone does not exist there, or $t is not authoritative"
