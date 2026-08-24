@@ -22,6 +22,14 @@ case "$HOOK_PR_STATUS" in
   # Already landed via squash merge — nothing to open. See
   # hook_branch_already_merged() for why an --state open lookup cannot see this.
   merged_pr) exit 0 ;;
+  # Same commits, reviewed under another branch name. Opening a second PR would
+  # duplicate it, so this reports rather than blocks — the reader still needs to
+  # know the branch under their feet is not the one being reviewed.
+  pr_elsewhere)
+    message="PR-tracking rule: '$HOOK_BRANCH' has $HOOK_AHEAD commit(s) and no PR of its own, but this exact commit is already under review as $HOOK_PR_ELSEWHERE. Nothing to open; delete the local branch when you are done with it."
+    printf '{"systemMessage":%s}\n' "$(hook_json_string "$message")"
+    exit 0
+    ;;
   gh_missing)
     message="PR-tracking rule: branch '$HOOK_BRANCH' has $HOOK_AHEAD commit(s) with no PR, and 'gh' is not installed, so Claude cannot verify or create one. Install gh or open the PR manually."
     printf '{"systemMessage":%s}\n' "$(hook_json_string "$message")"

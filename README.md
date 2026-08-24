@@ -312,6 +312,67 @@ landed" and "has an open review surface" are different facts, and anything that 
 reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
 only on exactly `needs_pr`.
 
+### A head already under review does not get a second PR
+
+The merged-PR guard above asks GitHub about `--head "$HOOK_BRANCH"`, so it only sees PRs opened
+under the name currently checked out. Push a branch's HEAD somewhere else and it goes blind:
+
+```
+git checkout -b pr44-check origin/fix/first-failure-failover
+git merge origin/main            # test the integration
+git push origin HEAD:fix/first-failure-failover
+```
+
+Those commits are now under review as `fix/first-failure-failover`. The checkout still says
+`pr44-check`, which has commits ahead of `main` and no PR of its own, so the hook pushed that
+name too and opened a PR for work already in review. Observed 2026-08-25 in
+`Screddyice/backdoor`: #51 and #52 appeared for the `pr47-check` and `pr44-check` branches used
+to test-merge #47 and #44.
+
+`hook_head_has_pr_elsewhere()` asks a different question — is this exact commit the head of any
+PR, under any branch name:
+
+```
+open PR, this branch     -> has_pr
+merged PR, same head     -> merged_pr        (work already landed)
+any PR elsewhere, same head -> pr_elsewhere  (reviewed under another name)
+none of the above        -> needs_pr         (blocks)
+```
+
+`auto-pr-push.sh` checks it **before pushing**, not just before `gh pr create`. Skipping only the
+create still publishes a redundant remote branch, which the Stop hook then demands a PR for.
+`enforce-pr-claude.sh` reports `pr_elsewhere` and names the PR instead of blocking, since there is
+nothing to open. `enforce-pr-codex.sh` needed no change; it blocks only on exactly `needs_pr`.
+
+A **closed, unmerged** PR is not a match. That work was rejected, and rejected work is not a
+review surface.
+
+**The result is shape-checked, and that is load-bearing.** This guard suppresses a pull request,
+so every way it can be wrong costs review coverage. A non-empty check is not good enough: the two
+older `auto-pr-push` tests mock `gh` with a catch-all that answers an unrecognised `pr list` query
+with `0`, and that lone character read as a match and stopped proposing PRs on every branch they
+exercise. All three suites went red at once. The guard now demands `#<number> <branch>` and treats
+anything else as no match, so a schema change, a deprecation notice on stdout, or an older `gh`
+fails toward opening the PR.
+
+### Disposable branches, only when you say so
+
+`HARNESS_PR_SKIP_BRANCHES` holds space-separated globs of branch names the rule ignores:
+
+```
+HARNESS_PR_SKIP_BRANCHES='scratch/* tmp/*' claude
+```
+
+**Empty by default.** A guessed pattern list would exempt `feat/add-health-check` on its way to
+catching `pr44-check`, and the branch that quietly stops being enforced is the one nobody notices.
+Most of the time you want the automatic guard above instead — it recognises the same integration
+branches without being told, because it looks at what is under review rather than at a name.
+
+Covered by `scripts/test-auto-pr-push-elsewhere-guard.sh` (8 cases: unreviewed work still
+proposed, open and merged matches skipped, closed-unmerged still proposed, a reused branch with
+new commits, the opt-out matching and not matching, and four shapes of unrecognised `gh` output
+that must all fail safe).
+
 ### The PR's base is derived, not defaulted
 
 `gh pr create` was called with no `--base`, so GitHub silently used the repository's **default**
@@ -418,6 +479,33 @@ rather than a supervisor. It never auto-fixes: gstack is third-party, and an
 unattended "fix" for an arbitrary crash is how you get two bugs.
 `WATCHDOG_AUTOFIX=1` additionally asks a headless `claude -p` to append an
 analysis to the report — analysis, not a merge.
+
+## Automated PR review
+
+[Shawns QA Assist](https://github.com/Screddyice/shawns-qa-assist) reviews pull
+requests here, repairs what it finds, and merges once its gate passes.
+`.shawns-qa.toml` points at `scripts/verify.sh`, which parses every tracked
+shell and Python file.
+
+Without that gate the agent reports `merge_eligible=false` and hands **every**
+PR to a human, because nothing can vouch for the change. That is what happened
+to #29 and #30.
+
+The gate is syntax only, on purpose. This repo has no test suite, and a gate
+that failed on pre-existing style would block every PR on faults it did not
+introduce. What it does catch is the failure that actually costs something here:
+a broken hook reaching `main` and then dying inside somebody's session.
+
+```bash
+bash scripts/verify.sh   # exits non-zero and names the file on a syntax error
+```
+
+To pause the agent on this repo:
+
+```toml
+[behavior]
+enabled = false
+```
 
 ## DNS Cutover Guards
 
@@ -558,11 +646,17 @@ credential blob, and the shape of the emitted hook JSON.
 
 #### Session memories
 
-Every host contributes memories to Mem0: Claude Code and Codex run the mem0
-plugin hooks, Hermes writes through its own provider. The session-memory hooks
-only ever **write**, so they cannot consume the retrieval quota that
-`mem0-local` exists to protect: Mem0 Starter allows 50,000 adds/month against
-5,000 retrievals, and adds are not the binding constraint.
+Every host contributes memories to **Cognee** (migrated from Mem0 on 2026-08-20):
+Claude Code runs the `cognee-memory@cognee` plugin, Codex runs `cognee@cognee`, and
+Hermes writes through a native Python provider at `~/.hermes/plugins/cognee/`. All three
+share one dataset, `agent_sessions`, tagged by node set (`user_context`, `project_docs`,
+`agent_actions`).
+
+Mem0 was retired because its Starter plan capped **retrievals** at 5,000/month and a
+single `user_id` shared across every host exhausted that quota, after which the API
+returned HTTP 402 on every call. The lesson generalises: one shared memory account
+across many hosts is a quota single point of failure, so watch the retrieval ceiling
+rather than the add ceiling.
 
 HyperSwarm's `mem0_session` distiller matches on `metadata.session_id`, so any
 host that wants a corpus entry has to tag its session write with that key.
@@ -642,6 +736,13 @@ times in a working session. Two defaults changed on 2026-07-31:
 The reviewer reads prior-work notes for the changed files out of the offline Mem0
 mirror (`~/.mem0-local/cache.db`) and prepends them to its system prompt, so it reviews
 a diff knowing what was decided about those files before.
+
+> **Post-migration note (2026-08-20).** This path still reads the Mem0 mirror, which is
+> now a **frozen archive** — it holds 16,127 memories and keeps working offline, but it
+> no longer receives new writes, so the reviewer's context ages from here. Repointing
+> `local-diff-review.sh` at Cognee is tracked separately; the hook was deliberately left
+> alone during the migration because the mirror is local-only and never touched the
+> quota that forced the cutover.
 
 Every other local brain gets this at the proxy: `src/proxy/memory.py` in
 `Screddyice/backdoor` injects recall into anything routed through `:8083`, which covers
@@ -758,6 +859,12 @@ company-specific app accounts separated in instructions and environment naming.
 This repo intentionally contains **no** secrets, API keys, OAuth tokens, server IPs,
 account IDs, client names, team member names, or internal project identifiers. All
 company-specific content uses placeholders.
+
+The same bar applies to crash evidence on the rolling `crash-reports` branch: captured
+logs are redacted before they are pushed. Browse server token fields, crashpad API-key
+arguments, and exported environment key lines are replaced with `REDACTED` markers, and
+the branch history is rebuilt rather than amended when a leak slips through, since a
+follow-up commit leaves the exposed value reachable in prior commits.
 
 ## License
 
