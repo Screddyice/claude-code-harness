@@ -82,6 +82,18 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
     fi
   fi
 
+  # (c) These exact commits are already under review on a DIFFERENT branch,
+  #     which happens whenever HEAD was pushed somewhere other than the branch
+  #     currently checked out. Checked before the push, not just before
+  #     `gh pr create`: pushing would publish a redundant remote branch that the
+  #     Stop hook then demands a PR for, so skipping only the create leaves the
+  #     duplicate half-made.
+  if hook_head_has_pr_elsewhere; then
+    printf '%s [skip] %s@%s head already under review as %s\n' \
+      "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$HOOK_PR_ELSEWHERE" >>"$log" 2>&1
+    exit 0
+  fi
+
   if [ "${AUTO_PR_PUSH_DRYRUN:-0}" = "1" ]; then
     printf '%s [DRYRUN] %s@%s (owner=%s, base=%s, ahead=%s) -> would push + ensure draft PR --base %s\n' \
       "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$owner" "$HOOK_BASE_BRANCH" "$HOOK_AHEAD" \
