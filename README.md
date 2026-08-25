@@ -550,15 +550,44 @@ the three failures that take a domain fully offline:
   well-formed, and cryptographically junk. Mail keeps sending and silently fails
   authentication.
 
-`dns-postflight.sh` catches the two that make a *correct* cutover still serve nothing:
+`dns-postflight.sh` catches the three that make a *correct* cutover still serve nothing
+— or look broken when it is fine:
 
 - **Staged propagation.** The NS change and the DS removal reach the registry
   independently, so it polls four validating resolvers rather than one.
+- **A vantage point that lies.** Everything a recursive resolver says is cache, not
+  zone content: a deleted record keeps resolving for its full TTL, and a just-added
+  one does not appear at all. Worse, on a host behind a VPN resolver or a local DNS
+  proxy, `dig @some.nameserver` may never reach that nameserver — port 53 is
+  intercepted and answered from cache whatever `@server` is given. Measured on
+  2026-08-25: `os.reddy2help.org` read as NXDOMAIN on all four delegated nameservers
+  *and* on the previous provider's, and the record had been published and serving the
+  entire time. So the post-flight proves the delegated nameservers are answering for
+  themselves before believing anything they say, and reads the apex, MX, SPF and DKIM
+  from authority rather than from a resolver. It also flags the inverse — resolver and
+  authority disagreeing — which is the stale-cache case that hides a deleted record.
+
+  This gate **is** the `aa` flag, which the pre-flight deliberately rejects, and the
+  difference is the direction of the test. Before cutover the destination zone is
+  inert and not yet delegated, so a legitimate nameserver may answer `+norecurse` with
+  REFUSED and no `aa`; gating on `aa` there rejects good destinations. After cutover
+  the delegated nameservers genuinely host the zone, so `aa` is exactly what they must
+  set — and an interceptor cannot forge it, because it sets `ra` and omits `aa`.
+
+  The flag test reads the parsed flag field, not a substring of the header line.
+  The last flag is followed by `;`, not a space, so matching `" ra "` against the raw
+  line silently never fires — which is how this check was unreachable on its first
+  pass, failing closed and printing no reason.
 - **A stuck ACME backoff.** An ACME client cannot observe that DNS changed. Caddy had
   been failing since the VM was built and by cutover was on attempt 33 with a
   **six-hour** retry, having fallen through to Let's Encrypt staging (browser-rejected).
   DNS was right, mail was right, the site served nothing. `--acme-host` restarts the
   service and the issuer is checked afterwards so a staging cert cannot pass.
+
+  The HTTPS checks bypass `HTTPS_PROXY`. curl honours it and resolves the name **at
+  the proxy**, so `--resolve` is ignored and a proxy that cannot resolve returns 502 —
+  indistinguishable from the origin being down, with nothing in the error naming the
+  proxy. That 502 was read as an outage on 2026-08-25 while the origin served 200.
 
 The `dns-cutover` skill wraps both with the procedure and the DNSSEC-restore ordering
 rule (**sign first, publish the DS second**).
