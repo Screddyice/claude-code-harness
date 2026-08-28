@@ -47,13 +47,24 @@ codex-harness/
 `scripts/hooks/auto-pr-push.sh` pushes a branch and opens its draft PR the moment
 it has a commit. The base it picks is derived per branch, never assumed.
 
-Two questions, answered separately, because they have different answers:
+Three questions, answered separately, because they have different answers:
 
 1. **Where did this branch fork?** Scored by total divergence (`behind + ahead`)
    against `origin/HEAD`, `main`, `master`, `dev`, `develop`, `staging`. Remote
    refs are scored alone whenever any exist — a stale local `main` looks closer
    than the real one exactly when it matters.
-2. **Where is a PR from this branch allowed to land?** `hook_resolve_pr_base`.
+2. **Is this branch stacked on another one?** `hook_tighten_base_to_parent`. The
+   scorer above only knows trunk and the integration branches, so a branch cut from
+   another *feature* branch scores `dev` or `main` — and the PR then carries the
+   parent's commits as its own. Three of them on `nebos-v2` #531; ten on the branch
+   behind #508, which belonged to `hotfix/nebby-slack-backoff`.
+
+   Detected from the oldest commit the PR would carry: if another remote branch
+   already contains it, that commit is not this branch's work and that branch is the
+   base. One `git branch -r --contains`, not a count per remote — this runs after
+   every Bash call. The base only ever moves forward, so a branch forked straight off
+   `dev` is untouched.
+3. **Where is a PR from this branch allowed to land?** `hook_resolve_pr_base`.
 
 The second question exists because trunk is a deploy branch in any repo that keeps
 an integration branch, and it takes work only after that branch. `nebos-v2` states
@@ -84,7 +95,17 @@ Verify what a branch would target without opening anything:
 ```
 
 Covered by `scripts/test-shared-hooks.sh`: a `fix/*` branch in a repo with `dev`,
-a `hotfix/*` keeping trunk, a trunk-only repo, and a repo-declared base.
+a `hotfix/*` keeping trunk, a trunk-only repo, a repo-declared base, a branch stacked
+on a feature branch (base and commit count both), and a branch forked straight off
+`dev` that must not move.
+
+Checked against the real branches too, which is the check that matters — a truncated
+function once passed `bash -n` and the whole suite while being broken:
+
+```
+feat/nebby-verdict-routing  -> hotfix/nebby-slack-backoff  (7 commits, not 16)
+hotfix/nebby-slack-backoff  -> main                        (escape hatch)
+```
 
 ## Who This Is For
 

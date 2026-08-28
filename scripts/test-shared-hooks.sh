@@ -118,3 +118,59 @@ got="$(resolved_base "$tmp/base-declared")"
 [ "$got" = "staging" ] || { echo "FAIL: declared base resolved to '$got', expected staging"; exit 1; }
 
 echo "PR base resolution: ok"
+
+# --- Stacked branches -------------------------------------------------------
+#
+# The fork-point scorer only knows trunk and the integration branches, so a branch
+# cut from another FEATURE branch scored dev or main, and the PR carried the
+# parent's commits as its own: three of them on nebos-v2 #531, ten on the branch
+# behind #508.
+
+stacked_repo() {
+  # main <- origin/feat/parent (3) <- feat/child (2), with origin/dev present so the
+  # integration rule would otherwise claim this branch.
+  local d="$1"
+  rm -rf "$d"; mkdir -p "$d"
+  git -C "$d" init -q -b main
+  local c="git -C $d -c user.name=T -c user.email=t@e.invalid"
+  $c commit --allow-empty -qm init
+  git -C "$d" remote add origin https://github.com/example/repo.git
+  git -C "$d" update-ref refs/remotes/origin/main "$(git -C "$d" rev-parse main)"
+  git -C "$d" update-ref refs/remotes/origin/dev "$(git -C "$d" rev-parse main)"
+  git -C "$d" switch -qc feat/parent
+  $c commit --allow-empty -qm p1; $c commit --allow-empty -qm p2; $c commit --allow-empty -qm p3
+  git -C "$d" update-ref refs/remotes/origin/feat/parent "$(git -C "$d" rev-parse feat/parent)"
+  git -C "$d" switch -qc feat/child
+  $c commit --allow-empty -qm c1; $c commit --allow-empty -qm c2
+}
+
+stacked_repo "$tmp/stacked"
+got="$(resolved_base "$tmp/stacked")"
+[ "$got" = "feat/parent" ] || { echo "FAIL: stacked branch resolved to '$got', expected feat/parent"; exit 1; }
+# And it must propose only its OWN two commits, not the parent's three.
+ahead="$( cd "$tmp/stacked" && . "$hooks/hook-common.sh" && hook_load_branch_context >/dev/null 2>&1 \
+    && printf '%s' "$HOOK_AHEAD" )"
+[ "$ahead" = "2" ] || { echo "FAIL: stacked branch would carry $ahead commits, expected 2"; exit 1; }
+
+# A branch forked straight off dev must NOT be dragged onto some other branch that
+# happens to share history. Tightening only ever moves the base FORWARD.
+plain_dev_repo() {
+  local d="$1"
+  rm -rf "$d"; mkdir -p "$d"
+  git -C "$d" init -q -b main
+  local c="git -C $d -c user.name=T -c user.email=t@e.invalid"
+  $c commit --allow-empty -qm init
+  git -C "$d" remote add origin https://github.com/example/repo.git
+  git -C "$d" update-ref refs/remotes/origin/main "$(git -C "$d" rev-parse main)"
+  git -C "$d" switch -qc dev
+  $c commit --allow-empty -qm d1
+  git -C "$d" update-ref refs/remotes/origin/dev "$(git -C "$d" rev-parse dev)"
+  git -C "$d" switch -qc feat/off-dev
+  $c commit --allow-empty -qm f1
+}
+
+plain_dev_repo "$tmp/plain-dev"
+got="$(resolved_base "$tmp/plain-dev")"
+[ "$got" = "dev" ] || { echo "FAIL: branch off dev resolved to '$got', expected dev"; exit 1; }
+
+echo "stacked-branch base resolution: ok"

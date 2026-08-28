@@ -171,6 +171,51 @@ hook_load_branch_context() {
   return 0
 }
 
+# Retarget onto the branch this one is stacked on, when there is one.
+#
+# The fork-point scorer only considers trunk and the integration branches, so a branch
+# cut from another FEATURE branch scores dev or main and the PR then shows the parent's
+# commits alongside its own. That is the "foreign commits" on nebos-v2 #531.
+#
+# The test is the oldest commit the PR would carry. A commit that another remote branch
+# already contains is that branch's work, not this one's, so that branch is the base.
+# Cheap on purpose: one --contains, then a count per surviving candidate, which is
+# almost always zero or one.
+#
+# Leaves the base alone unless the candidate is strictly tighter, so a branch that
+# forked straight off dev is untouched.
+hook_tighten_base_to_parent() {
+  local range_oldest candidate best best_ahead ahead self_ref
+  self_ref="origin/$HOOK_BRANCH"
+
+  range_oldest="$(git rev-list "${HOOK_BASE}..HEAD" 2>/dev/null | tail -1)"
+  [ -n "$range_oldest" ] || return 0
+
+  best=""
+  best_ahead="$(git rev-list --count "${HOOK_BASE}..HEAD" 2>/dev/null || echo 0)"
+  [ "${best_ahead:-0}" -gt 0 ] 2>/dev/null || return 0
+
+  for candidate in $(git branch -r --contains "$range_oldest" --format='%(refname:short)' 2>/dev/null); do
+    case "$candidate" in
+      "$self_ref"|"$HOOK_BASE"|*HEAD) continue ;;
+    esac
+    # Only ever move FORWARD: the candidate must still leave this branch something of
+    # its own to propose, or the PR would be empty.
+    ahead="$(git rev-list --count "${candidate}..HEAD" 2>/dev/null || echo 0)"
+    case "$ahead" in ''|*[!0-9]*) continue ;; esac
+    [ "$ahead" -gt 0 ] || continue
+    if [ "$ahead" -lt "$best_ahead" ]; then
+      best_ahead="$ahead"
+      best="$candidate"
+    fi
+  done
+
+  [ -n "$best" ] || return 0
+  HOOK_BASE="$best"
+  HOOK_BASE_BRANCH="${best#origin/}"
+  return 0
+}
+
 # Where a PR from this branch is allowed to LAND, which is not always where it forked.
 #
 # In a repo that keeps an integration branch, trunk is a deploy branch and takes work
@@ -200,6 +245,17 @@ hook_resolve_pr_base() {
       && HOOK_BASE="origin/$declared"
     return 0
   fi
+
+  # A branch stacked on another branch has no correct base in the candidate list
+  # above, which only knows trunk and the integration branches. The fork-point score
+  # then lands on dev or main, and the PR carries the PARENT branch's commits as its
+  # own — three of them on nebos-v2 #531, ten on the branch behind #508.
+  #
+  # Detected from the OLDEST commit the PR would carry: if some other remote branch
+  # already contains it, that commit is not this branch's work and that branch is the
+  # real base. One `git branch -r --contains` rather than a count per remote, because
+  # this runs after every Bash call and nebos-v2 carries ~50 branches.
+  hook_tighten_base_to_parent
 
   # Only trunk is ever wrong this way. A branch already aimed at dev is aimed right.
   case "$HOOK_BASE_BRANCH" in
