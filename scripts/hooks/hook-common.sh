@@ -161,8 +161,65 @@ hook_load_branch_context() {
   # The branch name a PR can target: refs/remotes/origin/dev -> dev.
   HOOK_BASE_BRANCH="${HOOK_BASE#origin/}"
 
+  # Divergence found where the branch FORKED. That is not always where a PR may
+  # LAND, and the two differ in exactly the repos that matter most. See
+  # hook_resolve_pr_base.
+  hook_resolve_pr_base
+
   HOOK_AHEAD="$(git rev-list --count "${HOOK_BASE}..HEAD" 2>/dev/null || echo 0)"
   [ "${HOOK_AHEAD:-0}" -gt 0 ] 2>/dev/null || return 1
+  return 0
+}
+
+# Where a PR from this branch is allowed to LAND, which is not always where it forked.
+#
+# In a repo that keeps an integration branch, trunk is a deploy branch and takes work
+# only after it has been through that branch. nebos-v2 says so outright in
+# guard-main-base.yml: only `dev`, `promote/*` and `hotfix/*` may target `main`,
+# because main and dev once forked 85/43 commits apart when nothing stopped PRs being
+# opened against both. A branch cut from main — a stale checkout, a rebase onto the
+# wrong ref — still scores main as its fork point, so the hook aimed there and CI
+# rejected it on arrival: nebos-v2 #531 and #532, and #365 before them.
+#
+# Precedence, most specific first:
+#   1. HOOK_PR_BASE in the environment — a one-off, or a wrapper that knows better.
+#   2. .claude-harness/pr-base in the repo — the repo declaring its own policy, which
+#      beats this hook inferring it.
+#   3. The integration-branch rule below.
+#
+# A silent no-op for a repo with no integration branch, which is most of them.
+hook_resolve_pr_base() {
+  local declared integration
+  declared="${HOOK_PR_BASE:-}"
+  if [ -z "$declared" ] && [ -r .claude-harness/pr-base ]; then
+    declared="$(tr -d '[:space:]' < .claude-harness/pr-base 2>/dev/null || true)"
+  fi
+  if [ -n "$declared" ]; then
+    HOOK_BASE_BRANCH="$declared"
+    git rev-parse --verify --quiet "origin/$declared" >/dev/null 2>&1 \
+      && HOOK_BASE="origin/$declared"
+    return 0
+  fi
+
+  # Only trunk is ever wrong this way. A branch already aimed at dev is aimed right.
+  case "$HOOK_BASE_BRANCH" in
+    main|master) ;;
+    *) return 0 ;;
+  esac
+
+  # The escape hatches, matching guard-main-base.yml. release/* is included because a
+  # release branch merging to trunk is the same shape of exception.
+  case "$HOOK_BRANCH" in
+    dev|develop|promote/*|hotfix/*|release/*) return 0 ;;
+  esac
+
+  for integration in dev develop; do
+    git rev-parse --verify --quiet "origin/$integration" >/dev/null 2>&1 || continue
+    [ "$integration" = "$HOOK_BRANCH" ] && continue
+    HOOK_BASE="origin/$integration"
+    HOOK_BASE_BRANCH="$integration"
+    return 0
+  done
   return 0
 }
 
