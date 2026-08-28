@@ -234,7 +234,7 @@ hook_tighten_base_to_parent() {
 #
 # A silent no-op for a repo with no integration branch, which is most of them.
 hook_resolve_pr_base() {
-  local declared integration
+  local declared integration fork_point
   declared="${HOOK_PR_BASE:-}"
   if [ -z "$declared" ] && [ -r .claude-harness/pr-base ]; then
     declared="$(tr -d '[:space:]' < .claude-harness/pr-base 2>/dev/null || true)"
@@ -272,6 +272,9 @@ hook_resolve_pr_base() {
   for integration in dev develop; do
     git rev-parse --verify --quiet "origin/$integration" >/dev/null 2>&1 || continue
     [ "$integration" = "$HOOK_BRANCH" ] && continue
+    fork_point="$(git merge-base "$HOOK_BASE" HEAD 2>/dev/null || true)"
+    [ -n "$fork_point" ] || continue
+    git merge-base --is-ancestor "$fork_point" "origin/$integration" 2>/dev/null || continue
     HOOK_BASE="origin/$integration"
     HOOK_BASE_BRANCH="$integration"
     return 0
