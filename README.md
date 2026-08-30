@@ -30,6 +30,7 @@ codex-harness/
 │   ├── install-claude-resilient-updater.sh # resumable Claude native updates on macOS
 │   ├── claude-manual-update             # checksum-verified update worker
 │   ├── hooks/                           # shared hook logic and runtime adapters
+│   ├── test-shared-hooks.sh          # hook unit tests (PR base resolution, enforcement)
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
@@ -39,6 +40,71 @@ codex-harness/
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
     └── example-local/                # Codex local plugin marketplace example
+```
+
+## Where an auto-opened PR is aimed
+
+`scripts/hooks/auto-pr-push.sh` pushes a branch and opens its draft PR the moment
+it has a commit. The base it picks is derived per branch, never assumed.
+
+Three questions, answered separately, because they have different answers:
+
+1. **Where did this branch fork?** Scored by total divergence (`behind + ahead`)
+   against `origin/HEAD`, `main`, `master`, `dev`, `develop`, `staging`. Remote
+   refs are scored alone whenever any exist — a stale local `main` looks closer
+   than the real one exactly when it matters.
+2. **Is this branch stacked on another one?** `hook_tighten_base_to_parent`. The
+   scorer above only knows trunk and the integration branches, so a branch cut from
+   another *feature* branch scores `dev` or `main` — and the PR then carries the
+   parent's commits as its own. Three of them on `nebos-v2` #531; ten on the branch
+   behind #508, which belonged to `hotfix/nebby-slack-backoff`.
+
+   Detected from the oldest commit the PR would carry: if another remote branch
+   already contains it, that commit is not this branch's work and that branch is the
+   base. One `git branch -r --contains`, not a count per remote — this runs after
+   every Bash call. The base only ever moves forward, so a branch forked straight off
+   `dev` is untouched.
+3. **Where is a PR from this branch allowed to land?** `hook_resolve_pr_base`.
+
+The second question exists because trunk is a deploy branch in any repo that keeps
+an integration branch, and it takes work only after that branch. `nebos-v2` states
+it in `guard-main-base.yml`: only `dev`, `promote/*` and `hotfix/*` may target
+`main`. A branch cut from `main` — a stale checkout, a rebase onto the wrong ref —
+still scores `main` as its fork point, so the hook aimed there and CI rejected it
+on arrival. That happened on `nebos-v2` #531 and #532, and #365 before them.
+
+Precedence, most specific first:
+
+| | Source | Use it when |
+|---|---|---|
+| 1 | `HOOK_PR_BASE` in the environment | a one-off, or a wrapper that knows better |
+| 2 | `.claude-harness/pr-base` in the repo | the repo has a policy and should say so itself |
+| 3 | the integration-branch rule | everything else |
+
+The rule: if the fork point resolved to `main`/`master`, the repo has an
+`origin/dev` or `origin/develop`, and the branch is not itself `dev`/`develop` or
+an escape hatch (`promote/*`, `hotfix/*`, `release/*`), aim at the integration
+branch instead. A repo with no integration branch is untouched, which is most of
+them.
+
+Verify what a branch would target without opening anything:
+
+```bash
+( . scripts/hooks/hook-common.sh
+  hook_load_branch_context && echo "$HOOK_BRANCH -> $HOOK_BASE_BRANCH" )
+```
+
+Covered by `scripts/test-shared-hooks.sh`: a `fix/*` branch in a repo with `dev`,
+a `hotfix/*` keeping trunk, a trunk-only repo, a repo-declared base, a branch stacked
+on a feature branch (base and commit count both), and a branch forked straight off
+`dev` that must not move.
+
+Checked against the real branches too, which is the check that matters — a truncated
+function once passed `bash -n` and the whole suite while being broken:
+
+```
+feat/nebby-verdict-routing  -> hotfix/nebby-slack-backoff  (7 commits, not 16)
+hotfix/nebby-slack-backoff  -> main                        (escape hatch)
 ```
 
 ## Who This Is For
