@@ -1,41 +1,42 @@
-# holyclaude-cloud
+# holyclaude-cloud (vendored copy)
 
-## Project Overview
-<!-- Describe what this project does -->
+## What this is
 
-## Tech Stack
-- Python
+A vendored copy of the `holyclaude-cloud` project, carried inside the
+claude-code-harness repo so the harness ships with the `legion` orchestration
+layer. `legion` decomposes a goal into tasks, dispatches local and cloud workers,
+reconciles their output, and ships it; Modal provides the remote compute.
 
-## Common Commands
+## This is not the canonical copy
 
+The upstream project lives at `~/projects/holyclaude-cloud`
+(`Screddyice/holyclaude-cloud`). **Make changes there and re-vendor them here.**
+Editing this copy directly forks the two, and the divergence is invisible until
+someone hits a bug that is already fixed upstream.
 
-## Session Startup Protocol
-On every session start:
-1. Working context is auto-injected at session start (features, decisions, failures, rules)
-2. Run `/claude-harness:start` for full context refresh with GitHub sync (optional)
-3. Check `.claude-harness/features/active.json` for current priorities
+## Stack
 
-## Development Rules
-- Work on ONE feature at a time
-- Always run /claude-harness:checkpoint after completing work
-- Run tests before marking features complete
-- Commit with descriptive messages
-- Leave codebase in clean, working state
+Python `>=3.11`, pytest configured in `pyproject.toml`, console script `legion`.
+There is no `uv.lock`, so use a venv and pip. No Node toolchain — earlier versions of
+this file listed `npm run build` and `npm test`, neither of which exists.
 
-## Testing Requirements
-<!-- Add your test commands -->
-- Build: `npm run build`
-- Lint: `npm run lint`
-- Test: `pytest`
-- Typecheck: `npx tsc --noEmit`
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e .
+python3 -m pytest tests/
+legion --help
+```
 
-## Progress Tracking
-See: `.claude-harness/sessions/{session-id}/context.json` and `.claude-harness/features/active.json`
+`legion.toml` caps concurrent cloud workers. The Pro session is shared across
+workers and throttles hard above roughly five, so raise `max_workers` only after
+watching a run.
 
-## Memory Architecture (v3.0)
-- `sessions/{session-id}/` - Current session context (per-session, gitignored)
-- `memory/episodic/` - Recent decisions (rolling window)
-- `memory/semantic/` - Project knowledge (persistent)
-- `memory/procedural/` - Success/failure patterns (append-only)
-- `memory/learned/` - Rules from user corrections (append-only)
+## Rules that apply here
 
+Harness-wide rules are in `../CLAUDE.md` and `../AGENTS.md`. Machine hard rules:
+`~/.claude/CLAUDE.md`.
+
+Durable facts go to **Cognee**, the only memory on this machine. The
+`.claude-harness/memory/` tree is scaffolding, not a live memory layer.
+
+Every branch gets a PR, and every PR updates the repo README.
