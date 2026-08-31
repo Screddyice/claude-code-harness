@@ -29,6 +29,8 @@ codex-harness/
 │   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
 │   ├── install-claude-resilient-updater.sh # resumable Claude native updates on macOS
 │   ├── claude-manual-update             # checksum-verified update worker
+│   ├── statusline.sh                     # Claude model and failover status source
+│   ├── test-statusline.sh                # failover badge fixture tests
 │   ├── hooks/                           # shared hook logic and runtime adapters
 │   ├── test-shared-hooks.sh          # hook unit tests (PR base resolution, enforcement)
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
@@ -132,6 +134,28 @@ while sharing one Codex setup.
 | Claude status line | No direct Codex equivalent; use `scripts/codex-workspace-summary.sh` |
 | Claude plugin marketplace | `.agents/plugins/marketplace.json` and `codex plugin marketplace add` |
 | Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
+
+## Claude failover status line
+
+`scripts/statusline.sh` is the canonical source for Claude's optional status line. Routing and
+failover have separate meanings. A routed cloud session shows no Backdoor badge. A direct cloud
+session shows `BACKDOOR OFF`, and a deliberate local model shows `QWEN LOCAL`. During confirmed
+Anthropic failover, a routed Claude session shows `QWEN LOCAL · BACKDOOR ON`.
+
+The script reads `${BACKDOOR_STATE_FILE:-$HOME/.backdoor/failover-state.json}` and never writes
+it. The active badge requires `failover_active=true`, an `anthropic` entry in `active_sources`, a
+live publisher PID, and a process command that identifies `src.proxy.serve` or the Backdoor
+router. Missing JSON, a dead PID, an unrelated process, and Codex-only state all hide
+`BACKDOOR ON`.
+
+Run the fixture gate with:
+
+```bash
+scripts/test-statusline.sh
+```
+
+Repository changes do not install the script into `~/.claude`. Installation needs a separate
+decision, a backup of the current script, a passing fixture run, `bash -n`, and an atomic rename.
 
 ## Installation
 
