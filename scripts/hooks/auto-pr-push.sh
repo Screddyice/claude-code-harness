@@ -162,6 +162,58 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
     fi
   else
     printf '%s [ok] pushed %s@%s (PR already open)\n' "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" >>"$log" 2>&1
+
+    # Put a fixed PR back in front of the person who rejected it.
+    #
+    # GitHub does not clear CHANGES_REQUESTED when the author pushes a fix, and
+    # it does not re-notify the reviewer either. So the PR sits: the work is
+    # done, the review request is spent, and nothing on either side says so.
+    # On 2026-08-31 a sweep of the teamnebula-ai org found ELEVEN PRs holding
+    # CHANGES_REQUESTED, and roughly two thirds of them had already been fixed
+    # in an earlier session and were waiting on nothing but this call.
+    #
+    # Deliberately narrow, because a review request is a notification to a
+    # person:
+    #   * only the reviewers whose CURRENT state is CHANGES_REQUESTED, not the
+    #     default roster. A rejection is a conversation with one person; routing
+    #     the fix elsewhere makes someone else re-derive context that reviewer
+    #     already has, and leaves the original request looking ignored.
+    #   * never the PR author. GitHub 422s a self-request, and a self-rejection
+    #     would otherwise ping Shawn about his own branch.
+    #   * once per head SHA. This hook fires after every Bash call, so without
+    #     the stamp a single session would re-notify on every no-op push.
+    pr_meta="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
+      --head "$HOOK_BRANCH" --state open --json number,author,headRefOid \
+      --jq '.[0] | "\(.number) \(.author.login) \(.headRefOid)"' 2>>"$log")"
+    set -- ${pr_meta:-}
+    pr_num="${1:-}"; pr_author="${2:-}"; pr_head="${3:-}"
+
+    stamp="$log_dir/rerequested-$(printf '%s' "$HOOK_REPO_SLUG" | tr '/' '_')-${pr_num}-${pr_head}"
+    if [ -n "$pr_num" ] && [ -n "$pr_head" ] && [ ! -f "$stamp" ]; then
+      hook_load_change_requesters "$pr_num"
+      to_request=""
+      for who in ${HOOK_CHANGE_REQUESTERS:-}; do
+        [ "$who" = "$pr_author" ] && continue
+        to_request="$to_request $who"
+      done
+
+      if [ -n "$to_request" ]; then
+        args=()
+        for who in $to_request; do args+=(-f "reviewers[]=$who"); done
+        if gh api -X POST "repos/$HOOK_REPO_SLUG/pulls/$pr_num/requested_reviewers" \
+          "${args[@]}" --silent >>"$log" 2>&1; then
+          : > "$stamp"
+          printf '%s [ok] re-requested review on %s#%s from%s (fix pushed over CHANGES_REQUESTED)\n' \
+            "$timestamp" "$HOOK_REPO_SLUG" "$pr_num" "$to_request" >>"$log" 2>&1
+        else
+          # Loud, because the silent version of this failure is the whole bug:
+          # a fixed PR that nobody has been told about looks identical to one
+          # nobody has fixed.
+          printf '%s %s#%s fix pushed over CHANGES_REQUESTED but re-request FAILED for%s — the reviewer has not been told\n' \
+            "$timestamp" "$HOOK_REPO_SLUG" "$pr_num" "$to_request" >>"$faillog" 2>&1
+        fi
+      fi
+    fi
   fi
 ) >/dev/null 2>&1 &
 disown 2>/dev/null || true

@@ -388,6 +388,41 @@ hook_load_pr_status() {
   fi
 }
 
+# Humans whose CURRENT review state on this PR is CHANGES_REQUESTED.
+#
+# GitHub keeps a CHANGES_REQUESTED review in force until the same person
+# APPROVES or the review is DISMISSED, so "latest state per person" is the only
+# reading that matches what the merge box enforces. Counting raw review events
+# instead would keep naming someone who has since approved.
+#
+# Bots are excluded. Re-requesting a review bot after its own auto-fix is a
+# loop, not a review. The PR author is excluded by the caller, because a
+# self-rejection re-requesting the author is a no-op GitHub rejects with 422.
+#
+# Sets HOOK_CHANGE_REQUESTERS to a space-separated list, empty when none.
+hook_load_change_requesters() {
+  HOOK_CHANGE_REQUESTERS=""
+  [ -n "${HOOK_REPO_SLUG:-}" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+
+  HOOK_CHANGE_REQUESTERS="$(gh api --paginate \
+    "repos/$HOOK_REPO_SLUG/pulls/$1/reviews" \
+    --jq '.[] | select(.user.type != "Bot")
+              | select(.user.login | endswith("[bot]") | not)
+              | select(.state == "CHANGES_REQUESTED" or .state == "APPROVED" or .state == "DISMISSED")
+              | "\(.user.login) \(.state)"' 2>/dev/null \
+    | python3 -c '
+import sys
+latest = {}
+for line in sys.stdin:
+    parts = line.split()
+    if len(parts) != 2:
+        continue
+    # Reviews arrive oldest-first, so the last write per login wins.
+    latest[parts[0]] = parts[1]
+print(" ".join(sorted(u for u, s in latest.items() if s == "CHANGES_REQUESTED")))' 2>/dev/null)"
+}
+
 hook_json_string() {
   local value="$1"
   VALUE="$value" python3 -c 'import json, os; print(json.dumps(os.environ["VALUE"]))'
