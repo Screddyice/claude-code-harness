@@ -738,6 +738,38 @@ git repository:
 If the target repo does not already have `AGENTS.md`, the script also seeds a small
 project-level starter.
 
+## Durable Cognee writes
+
+`scripts/cognee-remember-durable.sh` wraps the Cognee plugin's `cognee-remember.sh` so
+an explicit memory write cannot vanish silently. Cognee returns `ok` the moment a write
+is queued and then holds it in process memory until the cognify pipeline reaches it; a
+restart in that window drops the write with no error anywhere. On 2026-09-03 an evening
+of acknowledged writes was lost exactly that way, to a watchdog that restarted the
+container hourly.
+
+The wrapper journals the content under `~/.cognee/outbox` keyed by its MD5, sends it
+through the plugin, then verifies it landed by listing the dataset: Cognee names every
+raw file `text_<md5(content)>.txt`, so one list call answers without touching the
+pipeline lock. If the row is not there inside `COGNEE_DURABLE_WAIT` (60 s), the entry
+stays in the outbox and a detached drainer re-checks every `COGNEE_DURABLE_POLL` (300 s),
+re-sending after `COGNEE_DURABLE_RESEND` (1200 s) of silence, up to
+`COGNEE_DURABLE_MAX_ATTEMPTS` (6) or `COGNEE_DURABLE_MAX_AGE` (6 h). Cognee de-duplicates
+identical content, so a re-send of something that did land later is harmless.
+
+```bash
+scripts/cognee-remember-durable.sh "fact to keep" --node-set project_docs
+scripts/cognee-remember-durable.sh --file notes.md --node-set user_context
+scripts/cognee-remember-durable.sh --status        # what is still pending
+scripts/cognee-remember-durable.sh --drain --once  # one manual pass over the outbox
+```
+
+Output is one JSON line: `stored: true` means the row exists on the server now;
+`queued: true` means the drainer owns it. Configuration comes from `~/.cognee/.env`
+(`COGNEE_BASE_URL`, `COGNEE_API_KEY`, `COGNEE_PLUGIN_DATASET`), with `COGNEE_OUTBOX` and
+`COGNEE_REMEMBER_BIN` as overrides. `~/.claude/scripts/cognee-remember-durable.sh` is a
+compat wrapper that execs the copy here. `scripts/test-cognee-remember-durable.sh` runs
+both paths against a fake Cognee with no network.
+
 ## Optional Hooks
 
 Codex supports lifecycle hooks including `SessionStart`, `Stop`, tool hooks, and
