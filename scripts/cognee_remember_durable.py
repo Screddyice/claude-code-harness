@@ -109,10 +109,16 @@ def _landed_hashes(dataset_id: str) -> set[str] | None:
     return out
 
 
+def normalize(content: str) -> str:
+    """The exact bytes we send. Cognee names the raw file by the MD5 of what it
+    receives, newline for newline, so the journal must hold the same bytes the
+    hash is computed from. A --file read carries a trailing newline that a CLI
+    argument does not; strip it once here so both paths agree."""
+    return content.rstrip("\n")
+
+
 def content_md5(content: str) -> str:
-    # Cognee hashes the text it stores, which is the submitted text without a
-    # trailing newline; the plugin strips one before upload.
-    return hashlib.md5(content.rstrip("\n").encode("utf-8")).hexdigest()
+    return hashlib.md5(normalize(content).encode("utf-8")).hexdigest()
 
 
 def _send(content_path: Path, node_set: str) -> tuple[bool, str]:
@@ -132,6 +138,7 @@ def _entry_paths(md5: str) -> tuple[Path, Path]:
 
 def _journal(content: str, node_set: str) -> str:
     OUTBOX.mkdir(parents=True, exist_ok=True)
+    content = normalize(content)
     md5 = content_md5(content)
     txt, meta = _entry_paths(md5)
     if not txt.exists():

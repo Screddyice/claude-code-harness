@@ -39,7 +39,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # Case 1: lands on the second listing -> stored:true, outbox empty, exactly one send.
 python3 "$TMP/fake_cognee.py" "$PORT" 2 & SERVER_PID=$!; sleep 0.5
-out=$("$HERE/cognee-remember-durable.sh" "$CONTENT" --node-set project_docs)
+printf '%s\n' "$CONTENT" > "$TMP/content.txt"   # trailing newline: the fake server hashes the stripped text, as Cognee hashes what is sent
+out=$("$HERE/cognee-remember-durable.sh" --file "$TMP/content.txt" --node-set project_docs)
 echo "$out" | grep -q '"stored": true' || fail "case1 expected stored:true, got: $out"
 [ -z "$(ls -A "$TMP/outbox" 2>/dev/null | grep -v drain)" ] || fail "case1 outbox not empty"
 [ "$(wc -l < "$SENDS")" -eq 1 ] || fail "case1 expected one send"
