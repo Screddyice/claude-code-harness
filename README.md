@@ -478,6 +478,66 @@ Both `enforce-pr-*` Stop hooks interpolate `$HOOK_BASE` into their block message
 Covered by `scripts/test-auto-pr-push-base.sh` (5 cases: forked-from-dev, forked-from-main in the
 same repo, a main-only repo, the ahead-count agreeing with the base, and the stale-local-ref trap).
 
+### A fix pushed over a rejection goes back to the reviewer
+
+GitHub does not clear `CHANGES_REQUESTED` when the author pushes a fix, and it does not re-notify
+the reviewer. The review request is spent, the red state stands, and the PR looks the same from
+outside whether the work was done or not.
+
+On **2026-08-31** a sweep of `teamnebula-ai` found **eleven** open PRs holding `CHANGES_REQUESTED`,
+and roughly two thirds had already been fixed in an earlier session. They were waiting on nothing
+but a re-request. Two sessions also wrote the same fix for `hyperscale#94` in parallel, because
+neither could see the work was already done.
+
+After a successful push onto a branch that already has an open PR, `auto-pr-push.sh` now
+re-requests review. Deliberately narrow, because a review request is a notification to a person:
+
+- **Only reviewers whose current state is `CHANGES_REQUESTED`**, not the default roster. A
+  rejection is a conversation with one person. Routing the fix to someone else makes them
+  re-derive context the original reviewer already has, and leaves that reviewer's request looking
+  ignored. Latest-state-per-person, so someone who rejected and later approved is not re-asked.
+- **Never the PR author.** GitHub answers 422, and a self-rejection would otherwise ping you about
+  your own branch.
+- **Once per head SHA.** This hook runs after every Bash call; without the stamp under
+  `~/.cache/claude-code-harness/` one session would notify the reviewer dozens of times.
+- **A failed re-request is loud**, appended to `auto-pr-push-failures.log`. The silent version of
+  that failure is the original bug: a fixed PR nobody has been told about is indistinguishable
+  from an unfixed one.
+
+Covered by `scripts/test-auto-pr-push-rerequest.sh` (7 cases, pushing against a local bare remote
+because the re-request runs after the push that `AUTO_PR_PUSH_DRYRUN` returns before).
+
+### `rejected-prs.sh` — which rejections are actually waiting on you
+
+```
+scripts/rejected-prs.sh                 # your open PRs, every repo
+scripts/rejected-prs.sh teamnebula-ai   # one owner
+scripts/rejected-prs.sh --author noya   # someone else's
+```
+
+`gh search prs` **cannot** return or filter `reviewDecision` — it is not in that command's schema,
+and a GraphQL search reaching for it alongside `reviews` and `statusCheckRollup` times out on a few
+dozen PRs. So this searches for the repositories cheaply, then asks each repository separately.
+
+`CHANGES_REQUESTED` on its own is not a to-do item, so each PR is classified by what happened
+after the rejection:
+
+| State | Meaning |
+|---|---|
+| `needs-work` | No commits since the rejection. Work is outstanding. |
+| `fixed?` | Commits landed, but the rejecter was never asked to look again. Read the diff before rewriting anything. |
+| `resubmitted` | Commits landed and the rejecter holds a live review request. Waiting on them. |
+
+The question mark on `fixed?` is deliberate: commits after a rejection are evidence someone
+worked, not proof they addressed the review.
+
+Covered by `scripts/test-rejected-prs.sh` (5 cases). One of them pins a bug worth naming, because
+it was silent and wrong in the expensive direction: the commit count was fetched with
+`gh api --jq --arg since …`, and `gh api` has no `--arg` flag, so jq read `"$since"` as a filter
+and matched nothing. Every PR reported zero commits since its rejection and came back
+`needs-work`, including eleven that had just been fixed. A tool that says "needs work" about
+finished work does not fail safe — it causes the duplicate.
+
 ## gbrowse — headed browser sessions that survive
 
 `browse handoff` opens a visible browser so a human can log in, solve a CAPTCHA, or

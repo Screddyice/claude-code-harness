@@ -234,7 +234,7 @@ hook_tighten_base_to_parent() {
 #
 # A silent no-op for a repo with no integration branch, which is most of them.
 hook_resolve_pr_base() {
-  local declared integration
+  local declared integration fork_point
   declared="${HOOK_PR_BASE:-}"
   if [ -z "$declared" ] && [ -r .claude-harness/pr-base ]; then
     declared="$(tr -d '[:space:]' < .claude-harness/pr-base 2>/dev/null || true)"
@@ -272,6 +272,9 @@ hook_resolve_pr_base() {
   for integration in dev develop; do
     git rev-parse --verify --quiet "origin/$integration" >/dev/null 2>&1 || continue
     [ "$integration" = "$HOOK_BRANCH" ] && continue
+    fork_point="$(git merge-base "$HOOK_BASE" HEAD 2>/dev/null || true)"
+    [ -n "$fork_point" ] || continue
+    git merge-base --is-ancestor "$fork_point" "origin/$integration" 2>/dev/null || continue
     HOOK_BASE="origin/$integration"
     HOOK_BASE_BRANCH="$integration"
     return 0
@@ -383,6 +386,41 @@ hook_load_pr_status() {
   else
     HOOK_PR_STATUS="needs_pr"
   fi
+}
+
+# Humans whose CURRENT review state on this PR is CHANGES_REQUESTED.
+#
+# GitHub keeps a CHANGES_REQUESTED review in force until the same person
+# APPROVES or the review is DISMISSED, so "latest state per person" is the only
+# reading that matches what the merge box enforces. Counting raw review events
+# instead would keep naming someone who has since approved.
+#
+# Bots are excluded. Re-requesting a review bot after its own auto-fix is a
+# loop, not a review. The PR author is excluded by the caller, because a
+# self-rejection re-requesting the author is a no-op GitHub rejects with 422.
+#
+# Sets HOOK_CHANGE_REQUESTERS to a space-separated list, empty when none.
+hook_load_change_requesters() {
+  HOOK_CHANGE_REQUESTERS=""
+  [ -n "${HOOK_REPO_SLUG:-}" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+
+  HOOK_CHANGE_REQUESTERS="$(gh api --paginate \
+    "repos/$HOOK_REPO_SLUG/pulls/$1/reviews" \
+    --jq '.[] | select(.user.type != "Bot")
+              | select(.user.login | endswith("[bot]") | not)
+              | select(.state == "CHANGES_REQUESTED" or .state == "APPROVED" or .state == "DISMISSED")
+              | "\(.user.login) \(.state)"' 2>/dev/null \
+    | python3 -c '
+import sys
+latest = {}
+for line in sys.stdin:
+    parts = line.split()
+    if len(parts) != 2:
+        continue
+    # Reviews arrive oldest-first, so the last write per login wins.
+    latest[parts[0]] = parts[1]
+print(" ".join(sorted(u for u, s in latest.items() if s == "CHANGES_REQUESTED")))' 2>/dev/null)"
 }
 
 hook_json_string() {

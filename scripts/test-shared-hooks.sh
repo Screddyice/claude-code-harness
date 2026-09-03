@@ -100,6 +100,28 @@ base_repo "$tmp/base-dev" "fix/thing" dev
 got="$(resolved_base "$tmp/base-dev")"
 [ "$got" = "dev" ] || { echo "FAIL: fix/* in a dev repo resolved to '$got', expected dev"; exit 1; }
 
+# A main-based branch must not be moved to a dev branch that cannot contain its fork point.
+diverged_main_dev_repo() {
+  local d="$1"
+  rm -rf "$d"; mkdir -p "$d"
+  git -C "$d" init -q -b main
+  local c="git -C $d -c user.name=T -c user.email=t@e.invalid"
+  $c commit --allow-empty -qm init
+  git -C "$d" remote add origin https://github.com/example/repo.git
+  git -C "$d" switch -qc dev
+  $c commit --allow-empty -qm d1
+  git -C "$d" update-ref refs/remotes/origin/dev "$(git -C "$d" rev-parse dev)"
+  git -C "$d" switch main
+  $c commit --allow-empty -qm m1
+  git -C "$d" update-ref refs/remotes/origin/main "$(git -C "$d" rev-parse main)"
+  git -C "$d" switch -qc fix/from-main
+  $c commit --allow-empty -qm work
+}
+
+diverged_main_dev_repo "$tmp/base-diverged-dev"
+got="$(resolved_base "$tmp/base-diverged-dev")"
+[ "$got" = "main" ] || { echo "FAIL: main-based branch in diverged dev repo resolved to '$got', expected main"; exit 1; }
+
 # hotfix/* is an explicit escape hatch and keeps trunk.
 base_repo "$tmp/base-hotfix" "hotfix/outage" dev
 got="$(resolved_base "$tmp/base-hotfix")"
