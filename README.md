@@ -1069,3 +1069,17 @@ follow-up commit leaves the exposed value reachable in prior commits.
 ## License
 
 [MIT](LICENSE)
+
+## Memory capture gate (claude-mem)
+
+`scripts/hooks/memory-capture-gate.sh` runs on SessionStart and keeps client repositories out of
+agent memory. It reads the git **origin remote**, and for `teamnebula-ai` or `Reddy2help` writes
+`.claude/settings.local.json` with `enabledPlugins["claude-mem@thedotmack"] = false`, which beats
+the user-level `true` by settings precedence. It replaces the identical gate that guarded the
+Cognee plugin until 2026-09-04; only the plugin id changed.
+
+Two things it deliberately does not do. It does not use `CLAUDE_MEM_EXCLUDED_PROJECTS`, which
+matches on folder name, because a client repo cloned under any other name would capture. And it
+cannot affect the session that writes the file: plugin enablement resolves at startup, so the
+first session in a freshly cloned client repo still captures and every later one does not; the
+systemMessage says so.
