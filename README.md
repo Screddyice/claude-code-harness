@@ -833,26 +833,16 @@ local Ollama diff reviewer. Thin Stop-hook adapters preserve each tool's JSON co
 | Push branches and open draft PRs | `auto-pr-push.sh` | `auto-pr-push.sh` |
 | Enforce one PR per work branch | `enforce-pr-claude.sh` | `enforce-pr-codex.sh` |
 | Review the current diff with Ollama | `local-diff-review.sh` | `local-diff-review-codex.sh` |
-| Distil session left-off into HyperSwarm | Claude settings | `codex-hyperswarm-leftoff.sh` |
 | Sample OAuth login expiry | `oauth-expiry-monitor.sh` | n/a |
-| Write a session memory to Mem0 | plugin hooks | plugin hooks |
+| Write a session memory | claude-mem plugin hooks | claude-mem plugin hooks |
 
-`codex-hyperswarm-leftoff.sh` runs on Codex `SessionEnd` and gives Codex parity
-with Claude Code's HyperSwarm feed: it hands the ending session's id to
-`hyperswarm capture --runtime mem0_session` (significance-gated, with the
-left-off fallback) and pushes the store to the canonical host, so remote
-Hermes/Telegram agents can see where Codex coding left off. The hook returns
-immediately and a detached worker sleeps 5s so Mem0 lands the session's
-memories before the distiller reads them. `Mem0SessionSource` matches on
-`metadata.session_id` and writes nothing when Mem0 holds no memories for the
-session, so no local gate decides whether capture is worth running. Recursion
-stops at the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
-own `codex exec` child, plus a skip for sessions whose prompt is the gate
-preamble. Logs to `/tmp/hs-codex-push.log`.
-
-The shared PR hook writes its log to `~/.cache/claude-code-harness/auto-pr-push.log`.
-Set `HARNESS_PR_OWNERS` to a space-separated allowlist in both tool configs; an empty
-allowlist disables automatic pushes.
+**`codex-hyperswarm-leftoff.sh` was removed on 2026-09-05.** It distilled a Codex session's
+left-off state into HyperSwarm through `hyperswarm capture --runtime mem0_session`. HyperSwarm was
+decommissioned on 2026-08-27 and Mem0 on 2026-09-04, so both its store and its capture backend
+were gone, but the hook stayed registered in `~/.codex/hooks.json` and fired at the end of every
+Codex session — logging `FATAL: venv python missing` to `/tmp/hs-codex-push.log` and capturing
+nothing. claude-mem's own Codex hooks cover this now. The registration was removed with the
+script.
 
 #### Login-expiry monitor
 
@@ -1115,3 +1105,74 @@ follow-up commit leaves the exposed value reachable in prior commits.
 ## License
 
 [MIT](LICENSE)
+
+## Hermes plugins (`hermes/`)
+
+`hermes/plugins/cmem` is the claude-mem memory provider deployed to `~/.hermes/plugins/cmem/`
+on all three Hermes boxes. It was hand-deployed and lived nowhere else; a rebuilt box now has a
+source to copy from. One memory project per box, and no writes until something is actually
+remembered. Details and the deploy command: `hermes/README.md`.
+## Publishing credentials into the macOS GUI domain (`scripts/set-gui-env.sh`)
+
+A Dock-launched app inherits launchd's environment, not a shell's. Nothing in `~/.zshrc` and
+nothing in `~/projects/.env` reaches Codex Desktop, so its `cmem` MCP server — which declares
+`bearer_token_env_var = "CMEM_PRO_TOKEN"` — starts with no bearer and its tools simply never
+appear. That failure reads as a missing feature rather than a missing credential, which is why it
+went unnoticed.
+
+`launchctl setenv` fixes it for the session and is lost at logout. This script reads the named
+keys out of `~/projects/.env` and publishes them, and
+`examples/com.screddy.gui-env.plist` runs it at every login so a reboot cannot quietly
+un-configure the app.
+
+```bash
+cp examples/com.screddy.gui-env.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.screddy.gui-env.plist
+launchctl getenv CMEM_PRO_TOKEN >/dev/null && echo published
+```
+
+`GUI_ENV_KEYS` selects which keys to publish (default `CMEM_PRO_TOKEN`) and `GUI_ENV_SOURCE` the
+file to read. **The secret value stays in `~/projects/.env`**: it is never written into the plist,
+and the log records only the key name and a character count. A missing file or a missing key exits
+0 with a message rather than failing login.
+
+The Hermes boxes deliberately do not use this. Each keeps its own mode-600 `~/.hermes/cmem.env`
+and the provider reads the environment then that file, so there is no launchd or GUI session to
+lose. Verified on `src`, `reddy2help` and `neb-ops-gcp` with `CMEM_PRO_TOKEN` explicitly unset.
+
+Tests: `scripts/test-set-gui-env.sh` (9 assertions, stubs `launchctl` so it never touches the real
+domain, and asserts the value is never printed).
+
+## Auditing instructions for retired components (`scripts/audit-stale-instructions.sh`)
+
+Instruction files are read by every agent on every session and are never executed, so a component
+can be deleted from the machine while every agent is still told it is canonical. Nothing fails; the
+agents simply act on a world that no longer exists.
+
+That happened on 2026-09-04. Cognee was removed from the whole fleet, and afterwards
+`~/.codex/AGENTS.md` still opened with "Memory = Cognee", naming a plugin that no longer existed
+and a port with nothing behind it. Codex read its own instructions and reported the drift; no
+check would have. Worse, all four Hermes `SOUL.md` files still told those agents that memory was
+Cognee, reached through an SSH tunnel on `127.0.0.1:8001`.
+
+```bash
+scripts/audit-stale-instructions.sh                 # the usual set
+scripts/audit-stale-instructions.sh path/to/file    # or specific files
+STALE_PATTERN='widgetron|old-thing' scripts/audit-stale-instructions.sh
+```
+
+It judges **paragraphs**, not lines, because these files are prose: a retirement is announced once
+and discussed for several lines, and line matching reports every continuation of a note that is
+already correct. A paragraph naming something retired passes when it also reads as history
+("deleted", "retired", "no longer", a date). It fails when it reads as live guidance. Exit 1 lists
+one line per offending paragraph.
+
+Default set: `~/.claude/CLAUDE.md`, `~/CLAUDE.md`, `~/projects/CLAUDE.md`, `~/projects/AGENTS.md`,
+`~/.codex/AGENTS.md`, `~/.hermes/SOUL.md`. Default terms: cognee, mem0, hyperswarm, and the dead
+`8001` port.
+
+Tests: `scripts/test-audit-stale-instructions.sh` (8 assertions). The first one asserts the audit
+can **fail**, because an audit that always passes is the same silent success it exists to catch —
+the first version of this script had a stray `next` that skipped every match, and reported a clean
+sweep across six files that were not clean.
+
