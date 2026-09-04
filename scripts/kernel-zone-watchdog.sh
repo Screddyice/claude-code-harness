@@ -74,6 +74,13 @@ take_snapshot() {
   vm_stat > "$dir/vm_stat.txt" 2>&1
   netstat -m > "$dir/netstat-m.txt" 2>&1
   ps -Ao rss,pid,ppid,%cpu,lstart,command -m 2>/dev/null | head -60 > "$dir/ps-by-rss.txt"
+  # RSS alone misses the shape that mattered in the 2026-09-04 panic: the two processes
+  # driving it held 0.1 MB resident while burning 4.5 h of KERNEL cpu and 4.15 billion
+  # page faults. Rank by cumulative CPU time and by wall-clock age too, or the snapshot
+  # will show every big app and none of the actual culprits.
+  ps -Ao time,pid,ppid,%cpu,etime,lstart,command 2>/dev/null | sort -k1 -r | head -40 > "$dir/ps-by-cputime.txt"
+  ps -Ao etime,time,pid,%cpu,command 2>/dev/null | sort -r | head -40 > "$dir/ps-by-age.txt"
+  top -l 1 -n 30 -o cpu -stats pid,command,cpu,time,mem,pageins 2>/dev/null > "$dir/top.txt"
   ps -Ao pid,ppid,command 2>/dev/null | wc -l > "$dir/process-count.txt"
   ps -Ao command 2>/dev/null | sed 's/ .*//' | sort | uniq -c | sort -rn | head -40 > "$dir/process-histogram.txt"
   launchctl list > "$dir/launchctl.txt" 2>&1

@@ -56,7 +56,7 @@ fi
 
 # 6. The snapshot carries the evidence needed to attribute a leak
 missing=""
-for f in summary.txt zprint.txt vm_stat.txt ps-by-rss.txt process-histogram.txt launchctl.txt; do
+for f in summary.txt zprint.txt vm_stat.txt ps-by-rss.txt ps-by-cputime.txt ps-by-age.txt process-histogram.txt launchctl.txt; do
   [ -s "$snap/$f" ] || missing="$missing $f"
 done
 [ -z "$missing" ] && ok "snapshot contains all evidence files" \

@@ -765,9 +765,15 @@ Override with `KERNEL_ZONE_WARN_BYTES` / `KERNEL_ZONE_CRIT_BYTES`.
 
 Crossing a threshold writes a snapshot under
 `~/.local/state/kernel-zone-watchdog/snapshots/` holding the full zone table, `vm_stat`,
-`netstat -m`, processes by RSS, a process-name histogram, and `launchctl list` — the
-set needed to tell a runaway VM from a runaway fork loop from a leaking daemon. A
-30-minute cooldown keeps a sustained leak from filling the disk with snapshots.
+`netstat -m`, a process-name histogram, `launchctl list`, and processes ranked three
+ways — by RSS, by cumulative CPU time, and by age. A 30-minute cooldown keeps a
+sustained leak from filling the disk with snapshots.
+
+**Ranking by RSS alone is not enough, and the 2026-09-04 panic is why.** The two
+processes that stood out in that panic report held *0.1 MB resident* while burning 4.5
+hours of kernel CPU and 4.15 billion page faults each — 64× the page faults of any other
+process on the machine. An RSS-sorted list puts them nowhere near the top and shows you
+a browser instead. Cumulative CPU time is what surfaces them.
 
 Install it as a LaunchAgent that samples every minute:
 
