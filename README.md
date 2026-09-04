@@ -37,6 +37,8 @@ codex-harness/
 │   ├── gbrowse                       # headed-browser wrapper that survives a session
 │   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
 │   ├── dns-postflight.sh             # did the cutover land, and did mail survive
+│   ├── kernel-zone-watchdog.sh       # catches a kernel zone-map leak before it panics the Mac
+│   ├── test-kernel-zone-watchdog.sh  # watchdog unit tests (parsing, thresholds, snapshots)
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
     └── example-local/                # Codex local plugin marketplace example
@@ -717,6 +719,74 @@ the three failures that take a domain fully offline:
 
 The `dns-cutover` skill wraps both with the procedure and the DNSSEC-restore ordering
 rule (**sign first, publish the DS second**).
+
+## Kernel Zone Leak Watchdog
+
+macOS can run out of *kernel* memory while every app looks fine. On 2026-09-04 this
+Mac panicked after 35 hours of uptime:
+
+```
+panic(cpu 15): zalloc[3]: zone map exhausted while allocating from zone
+[data.kalloc.1024], likely due to memory leak in zone [data.kalloc.1024]
+(20G, 21218528 elements allocated)
+```
+
+Twenty gigabytes of one-kilobyte kernel allocations, none of them freed. Two
+`JetsamEvent` reports earlier the same day already showed the shape of it: 23.5 GB
+wired against only 4.3 GB of anonymous application memory. Activity Monitor shows
+this as "wired" and attributes it to nothing, because no process owns it — which is
+why it reads as "the machine got slow and then died" rather than as a leak.
+
+The panic log does not say which subsystem leaked. Zone allocation backtraces need
+the `zlog=<zone>` boot-arg, set before the fact. So this watchdog samples the zone
+table on an interval instead, and captures the evidence at the moment a zone crosses
+a threshold — turning the next occurrence into an attribution instead of another panic.
+
+```bash
+scripts/kernel-zone-watchdog.sh            # one sample; exit 0 quiet / 1 warn / 2 critical
+scripts/kernel-zone-watchdog.sh --status   # ten largest kernel zones right now
+scripts/kernel-zone-watchdog.sh --report   # sample count, latest reading, growth per hour
+scripts/kernel-zone-watchdog.sh --watch    # sample forever, for a foreground session
+```
+
+`--status` on a healthy machine puts the largest zone in the low hundreds of megabytes:
+
+```
+ZONE                                     ELEM        INUSE         SIZE
+APFS_4K_OBJS                             4096        43601     170.3 MB
+APFS_INODES                               432       262396     108.1 MB
+vm.pages.array                             48      2273042     104.1 MB
+```
+
+**Thresholds are set far apart on purpose.** Idle `data.kalloc.1024` on this machine
+sits near 1,500 elements — about 2 MB. Warning fires at 1 GiB and critical at 6 GiB,
+both orders of magnitude above noise and hours ahead of the 20 GB that killed it.
+Override with `KERNEL_ZONE_WARN_BYTES` / `KERNEL_ZONE_CRIT_BYTES`.
+
+Crossing a threshold writes a snapshot under
+`~/.local/state/kernel-zone-watchdog/snapshots/` holding the full zone table, `vm_stat`,
+`netstat -m`, a process-name histogram, `launchctl list`, and processes ranked three
+ways — by RSS, by cumulative CPU time, and by age. A 30-minute cooldown keeps a
+sustained leak from filling the disk with snapshots.
+
+**Ranking by RSS alone is not enough, and the 2026-09-04 panic is why.** The two
+processes that stood out in that panic report held *0.1 MB resident* while burning 4.5
+hours of kernel CPU and 4.15 billion page faults each — 64× the page faults of any other
+process on the machine. An RSS-sorted list puts them nowhere near the top and shows you
+a browser instead. Cumulative CPU time is what surfaces them.
+
+Install it as a LaunchAgent that samples every minute:
+
+```bash
+cp examples/com.screddy.kernel-zone-watchdog.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.screddy.kernel-zone-watchdog.plist
+```
+
+Samples append to `~/.local/state/kernel-zone-watchdog/samples.csv` as
+`epoch,iso,zone,elem_size,inuse,zone_bytes,wired_bytes`, so a leak's growth rate is a
+one-line `awk` away after the fact. Run `scripts/test-kernel-zone-watchdog.sh` to
+verify parsing, both thresholds, snapshot contents, and the cooldown; it touches only
+a temp directory.
 
 ## Per-Repo Harness
 
