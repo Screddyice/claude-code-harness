@@ -63,6 +63,11 @@ RESEND = float(os.environ.get("COGNEE_DURABLE_RESEND", "1200"))
 MAX_ATTEMPTS = int(os.environ.get("COGNEE_DURABLE_MAX_ATTEMPTS", "6"))
 MAX_AGE = float(os.environ.get("COGNEE_DURABLE_MAX_AGE", "21600"))
 HTTP_TIMEOUT = 20
+# The dataset listing is the whole of agent_sessions in one response: 7,486 items
+# and 3.9 MB took 58 s on 2026-09-04, and it grows with every write. At the 20 s
+# used for small calls it always timed out, _landed_hashes returned None, and every
+# write was reported unverifiable forever. Give the listing its own budget.
+LIST_TIMEOUT = float(os.environ.get("COGNEE_DURABLE_LIST_TIMEOUT", "180"))
 
 
 def _remember_bin() -> str:
@@ -76,9 +81,9 @@ def _remember_bin() -> str:
     return found[-1]
 
 
-def _get(path: str):
+def _get(path: str, timeout: float = HTTP_TIMEOUT):
     req = urllib.request.Request(f"{BASE_URL}{path}", headers={"X-Api-Key": API_KEY})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8") or "null")
 
 
@@ -96,7 +101,7 @@ def _dataset_id() -> str | None:
 def _landed_hashes(dataset_id: str) -> set[str] | None:
     """MD5s of every raw text file in the dataset, or None when Cognee is unreachable."""
     try:
-        rows = _get(f"/api/v1/datasets/{dataset_id}/data")
+        rows = _get(f"/api/v1/datasets/{dataset_id}/data", timeout=LIST_TIMEOUT)
     except (urllib.error.URLError, ValueError, OSError):
         return None
     if isinstance(rows, dict):
@@ -110,9 +115,21 @@ def _landed_hashes(dataset_id: str) -> set[str] | None:
 
 
 def content_md5(content: str) -> str:
-    # Cognee hashes the text it stores, which is the submitted text without a
-    # trailing newline; the plugin strips one before upload.
+    """Stable key for the outbox entry. NOT the hash Cognee files the text under."""
     return hashlib.md5(content.rstrip("\n").encode("utf-8")).hexdigest()
+
+
+def cognee_md5(sent_text: str) -> str:
+    """The hash Cognee actually names the raw file with: `text_<md5>.txt` over the
+    bytes it RECEIVES, trailing newline and all.
+
+    The plugin does not strip a trailing newline, contrary to what this module
+    assumed until 2026-09-04. `_send` transmits `content_path.read_text()`, so any
+    content ending in a newline - every `--file` and every heredoc - hashed one way
+    here and another way in Cognee, the expected filename never appeared in the
+    listing, and the write was resent until it was abandoned. The data had landed
+    each time. Hash exactly what `_send` transmits, and nothing else."""
+    return hashlib.md5(sent_text.encode("utf-8")).hexdigest()
 
 
 def _send(content_path: Path, node_set: str) -> tuple[bool, str]:
@@ -170,14 +187,23 @@ def _attempt(md5: str) -> tuple[bool, str]:
 
 
 def _verify(md5: str) -> bool | None:
-    """True landed, False not yet, None Cognee unreachable."""
+    """True landed, False not yet, None Cognee unreachable.
+
+    `md5` keys the outbox entry; what Cognee stores is keyed by the transmitted
+    bytes, so read the journal file back and hash that - it is byte-for-byte what
+    `_send` uploads.
+    """
     ds = _dataset_id()
     if ds is None:
         return None
     hashes = _landed_hashes(ds)
     if hashes is None:
         return None
-    return md5 in hashes
+    try:
+        expected = cognee_md5(_entry_paths(md5)[0].read_text())
+    except OSError:
+        return None
+    return expected in hashes or md5 in hashes
 
 
 def _spawn_drainer() -> None:
@@ -232,7 +258,14 @@ def drain(once: bool = False) -> int:
         hashes = _landed_hashes(ds) if ds else None
         for md5 in pending:
             meta = _load_meta(md5)
-            if hashes is not None and md5 in hashes:
+            # The outbox key hashes the content with any trailing newline stripped;
+            # Cognee files it under the bytes it received. Compare on the sent bytes,
+            # exactly as _verify does - checking the key here was the same bug twice.
+            try:
+                landed_key = cognee_md5(_entry_paths(md5)[0].read_text())
+            except OSError:
+                landed_key = md5
+            if hashes is not None and (landed_key in hashes or md5 in hashes):
                 _clear(md5)
                 print(f"{time.strftime('%FT%TZ', time.gmtime())} landed {md5}", flush=True)
                 continue
