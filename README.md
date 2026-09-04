@@ -1083,3 +1083,30 @@ matches on folder name, because a client repo cloned under any other name would 
 cannot affect the session that writes the file: plugin enablement resolves at startup, so the
 first session in a freshly cloned client repo still captures and every later one does not; the
 systemMessage says so.
+
+## The capture gate has to survive a branch switch (2026-09-04)
+
+`memory-capture-gate.sh` keeps Team Nebula, Reddy2help and Breaking Hits sessions out of
+claude-mem by writing `enabledPlugins["claude-mem@thedotmack"] = false` into the repo's
+`.claude/settings.local.json`, chosen by git **origin remote** rather than folder.
+
+It was registered as a `SessionStart` hook at a fixed path in `~/.claude/scripts/`, and that path
+was a one-line wrapper that `exec`'d this repo's copy. This repo is a working tree that moves
+between branches, and the script only ever existed on its own feature branch — so for weeks the
+hook exec'd a file that was not there, exited non-zero, and the gate never ran. Nothing surfaced
+it: a gate that fails open looks exactly like a gate that found nothing to do. TMN sessions were
+captured the whole time, which is how `nebos-v2` worktrees and a dozen `nebby-eval-*` sandboxes
+reached the memory hub.
+
+The wrapper (`scripts/hooks/memory-capture-gate-wrapper.sh`, installed at
+`~/.claude/scripts/memory-capture-gate.sh`) now prefers this repo's copy, refreshes a fallback at
+`~/.claude/scripts/memory-capture-gate.impl.sh` every time it can reach it, runs the fallback when
+it cannot, and prints a loud `systemMessage` if neither exists. Editing the harness copy is still
+the way to change behaviour; the fallback is only there so a branch switch cannot silently disarm
+the gate.
+
+**BH-Repos was added to the excluded orgs** in the same change. Breaking Hits is the one actual
+client engagement in the tree, and its source has less business in a personal cloud memory service
+than TMN's or R2H's does. RS21 needs no entry: those repos live under `teamnebula-ai`, which the
+org pattern already matches.
+

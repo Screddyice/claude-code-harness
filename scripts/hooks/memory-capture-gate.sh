@@ -1,5 +1,10 @@
 #!/bin/bash
-# Keep Team Nebula and Reddy2help work out of claude-mem.
+# Keep Team Nebula, Reddy2help and Breaking Hits work out of claude-mem.
+#
+# BH-Repos is here because Breaking Hits is the one actual CLIENT in the tree:
+# a Shawn Reddy Consulting engagement whose source has less business reaching a
+# personal cloud memory service than TMN's or R2H's does. RS21 needs no entry —
+# those repos live under teamnebula-ai and the org pattern already covers them.
 #
 # The claude-mem plugin is enabled in ~/.claude/settings.json and captures
 # EVERY session unconditionally — SessionStart, UserPromptSubmit, PostToolUse,
@@ -20,7 +25,7 @@
 # systemMessage says so rather than letting you assume otherwise.
 set -uo pipefail
 
-EXCLUDED_ORG_PATTERN='github\.com[:/]+(teamnebula-ai|Reddy2help)[/]'
+EXCLUDED_ORG_PATTERN='github\.com[:/]+(teamnebula-ai|Reddy2help|BH-Repos)[/]'
 PLUGIN="claude-mem@thedotmack"
 
 cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null || exit 0
