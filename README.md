@@ -1,4 +1,4 @@
-> **claude-mem removed 2026-08-02.** Do not reinstall the thedotmack plugin, host proxy, mcp-search, or Grok mem hooks. Shared observation memory is gone from this harness.
+> **claude-mem is the sole memory system since 2026-09-04.** Do not restore the retired thedotmack host proxy, mcp-search bridge, or Grok memory hooks. Current hosts sync through the claude-mem worker and cmem.ai hub.
 
 # codex-harness
 
@@ -880,7 +880,7 @@ synthetic credential instead of reading the keychain. Run
 path, a forward roll, the regression and expiring alerts, `--quiet`, a malformed
 credential blob, and the shape of the emitted hook JSON.
 
-#### Duplicate-PR guard#### Duplicate-PR guard after a squash merge
+#### Duplicate-PR guard after a squash merge
 
 The hook decided whether a branch still needed a PR by asking `gh pr list --state open`.
 After a **squash** merge the branch's PR is `MERGED`, not open, so that count came back 0
@@ -950,7 +950,7 @@ times in a working session. Two defaults changed on 2026-07-31:
 | `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
 | `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
 
-#### Measure resident size#### Measure resident size, not weights
+#### Measure resident size, not weights
 
 This table originally claimed the small model cost "~3 GB, and loads fast enough to stay
 resident between turns". Both halves of that were wrong, and expensively so.
@@ -1107,4 +1107,3 @@ Tests: `scripts/test-audit-stale-instructions.sh` (8 assertions). The first one 
 can **fail**, because an audit that always passes is the same silent success it exists to catch —
 the first version of this script had a stray `next` that skipped every match, and reported a clean
 sweep across six files that were not clean.
-
