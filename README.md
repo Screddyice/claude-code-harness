@@ -770,6 +770,32 @@ Output is one JSON line: `stored: true` means the row exists on the server now;
 compat wrapper that execs the copy here. `scripts/test-cognee-remember-durable.sh` runs
 both paths against a fake Cognee with no network.
 
+### Verification hashes the bytes that were sent (fixed 2026-09-04)
+
+For weeks every durable write from this Mac reported failure while landing correctly
+every time. A canary sent at `09:30:27Z` was stored by Cognee one second later as
+`text_a2c07b738dc6cdd7a8ab4c1857f662be.txt`, while the writer sat waiting for
+`text_fc74c164b7bcc3bb07de46ecc1cb7b13.txt`. Three separate bugs, each fatal alone:
+
+- `content_md5` stripped a trailing newline before hashing, on the belief that the
+  plugin strips one before upload. **It does not.** `_send` transmits
+  `content_path.read_text()` verbatim and Cognee files the raw text under the bytes it
+  receives, so every `--file` and every heredoc hashed differently on the two sides.
+- `HTTP_TIMEOUT` was 20 s, but verification lists all of `agent_sessions` in one
+  response — 7,486 items and 3.9 MB took **58 s**, and it grows with every write. The
+  call always timed out, so `_verify` could only ever answer "Cognee unreachable".
+  The listing now has its own budget, `COGNEE_DURABLE_LIST_TIMEOUT` (180 s).
+- `drain()` held a *second copy* of the check that compared the outbox key directly,
+  bypassing `_verify`. Fixing `_verify` alone left the drainer still wrong.
+
+The symptom to recognise: `remember` returns `ok`, `--status` shows entries stacking
+up, and `drain.log` fills with `GIVING UP`. Check whether the content is actually in
+the graph with a `recall` before believing any of it — the data may be there already.
+
+Verification remains `O(entire dataset)`: one full listing per check. That is why an
+inline `remember` can legitimately return `stored: false, queued: true` and leave the
+drainer to confirm a minute later.
+
 ## Optional Hooks
 
 Codex supports lifecycle hooks including `SessionStart`, `Stop`, tool hooks, and
