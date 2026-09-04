@@ -1069,3 +1069,10 @@ follow-up commit leaves the exposed value reachable in prior commits.
 ## License
 
 [MIT](LICENSE)
+
+## Hermes plugins (`hermes/`)
+
+`hermes/plugins/cmem` is the claude-mem memory provider deployed to `~/.hermes/plugins/cmem/`
+on all three Hermes boxes. It was hand-deployed and lived nowhere else; a rebuilt box now has a
+source to copy from. One memory project per box, and no writes until something is actually
+remembered. Details and the deploy command: `hermes/README.md`.
