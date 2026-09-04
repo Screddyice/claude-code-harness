@@ -1069,3 +1069,35 @@ follow-up commit leaves the exposed value reachable in prior commits.
 ## License
 
 [MIT](LICENSE)
+
+## Publishing credentials into the macOS GUI domain (`scripts/set-gui-env.sh`)
+
+A Dock-launched app inherits launchd's environment, not a shell's. Nothing in `~/.zshrc` and
+nothing in `~/projects/.env` reaches Codex Desktop, so its `cmem` MCP server — which declares
+`bearer_token_env_var = "CMEM_PRO_TOKEN"` — starts with no bearer and its tools simply never
+appear. That failure reads as a missing feature rather than a missing credential, which is why it
+went unnoticed.
+
+`launchctl setenv` fixes it for the session and is lost at logout. This script reads the named
+keys out of `~/projects/.env` and publishes them, and
+`examples/com.screddy.gui-env.plist` runs it at every login so a reboot cannot quietly
+un-configure the app.
+
+```bash
+cp examples/com.screddy.gui-env.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.screddy.gui-env.plist
+launchctl getenv CMEM_PRO_TOKEN >/dev/null && echo published
+```
+
+`GUI_ENV_KEYS` selects which keys to publish (default `CMEM_PRO_TOKEN`) and `GUI_ENV_SOURCE` the
+file to read. **The secret value stays in `~/projects/.env`**: it is never written into the plist,
+and the log records only the key name and a character count. A missing file or a missing key exits
+0 with a message rather than failing login.
+
+The Hermes boxes deliberately do not use this. Each keeps its own mode-600 `~/.hermes/cmem.env`
+and the provider reads the environment then that file, so there is no launchd or GUI session to
+lose. Verified on `src`, `reddy2help` and `neb-ops-gcp` with `CMEM_PRO_TOKEN` explicitly unset.
+
+Tests: `scripts/test-set-gui-env.sh` (9 assertions, stubs `launchctl` so it never touches the real
+domain, and asserts the value is never printed).
+
