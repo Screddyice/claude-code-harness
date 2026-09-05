@@ -808,37 +808,13 @@ git repository:
 If the target repo does not already have `AGENTS.md`, the script also seeds a small
 project-level starter.
 
-## Durable Cognee writes
+## Durable Cognee writes (retired 2026-09-04)
 
-`scripts/cognee-remember-durable.sh` wraps the Cognee plugin's `cognee-remember.sh` so
-an explicit memory write cannot vanish silently. Cognee returns `ok` the moment a write
-is queued and then holds it in process memory until the cognify pipeline reaches it; a
-restart in that window drops the write with no error anywhere. On 2026-09-03 an evening
-of acknowledged writes was lost exactly that way, to a watchdog that restarted the
-container hourly.
-
-The wrapper journals the content under `~/.cognee/outbox` keyed by its MD5, sends it
-through the plugin, then verifies it landed by listing the dataset: Cognee names every
-raw file `text_<md5(content)>.txt`, so one list call answers without touching the
-pipeline lock. If the row is not there inside `COGNEE_DURABLE_WAIT` (60 s), the entry
-stays in the outbox and a detached drainer re-checks every `COGNEE_DURABLE_POLL` (300 s),
-re-sending after `COGNEE_DURABLE_RESEND` (1200 s) of silence, up to
-`COGNEE_DURABLE_MAX_ATTEMPTS` (6) or `COGNEE_DURABLE_MAX_AGE` (6 h). Cognee de-duplicates
-identical content, so a re-send of something that did land later is harmless.
-
-```bash
-scripts/cognee-remember-durable.sh "fact to keep" --node-set project_docs
-scripts/cognee-remember-durable.sh --file notes.md --node-set user_context
-scripts/cognee-remember-durable.sh --status        # what is still pending
-scripts/cognee-remember-durable.sh --drain --once  # one manual pass over the outbox
-```
-
-Output is one JSON line: `stored: true` means the row exists on the server now;
-`queued: true` means the drainer owns it. Configuration comes from `~/.cognee/.env`
-(`COGNEE_BASE_URL`, `COGNEE_API_KEY`, `COGNEE_PLUGIN_DATASET`), with `COGNEE_OUTBOX` and
-`COGNEE_REMEMBER_BIN` as overrides. `~/.claude/scripts/cognee-remember-durable.sh` is a
-compat wrapper that execs the copy here. `scripts/test-cognee-remember-durable.sh` runs
-both paths against a fake Cognee with no network.
+The outbox, drainer and verification wrapper that lived here existed only because Cognee
+acknowledged a write before persisting it and exposed no point lookup. Memory moved to
+claude-mem on 2026-09-04, whose worker queues every write durably before any AI work, so the
+whole subsystem is gone. The last copies are in git history at the commit before this section
+was rewritten, and the operational post-mortem is in `~/.claude/CLAUDE.md` § Memory.
 
 ## Optional Hooks
 
@@ -904,24 +880,7 @@ synthetic credential instead of reading the keychain. Run
 path, a forward roll, the regression and expiring alerts, `--quiet`, a malformed
 credential blob, and the shape of the emitted hook JSON.
 
-#### Session memories
-
-Every host contributes memories to **Cognee** (migrated from Mem0 on 2026-08-20):
-Claude Code runs the `cognee-memory@cognee` plugin, Codex runs `cognee@cognee`, and
-Hermes writes through a native Python provider at `~/.hermes/plugins/cognee/`. All three
-share one dataset, `agent_sessions`, tagged by node set (`user_context`, `project_docs`,
-`agent_actions`).
-
-Mem0 was retired because its Starter plan capped **retrievals** at 5,000/month and a
-single `user_id` shared across every host exhausted that quota, after which the API
-returned HTTP 402 on every call. The lesson generalises: one shared memory account
-across many hosts is a quota single point of failure, so watch the retrieval ceiling
-rather than the add ceiling.
-
-HyperSwarm's `mem0_session` distiller matches on `metadata.session_id`, so any
-host that wants a corpus entry has to tag its session write with that key.
-
-#### Duplicate-PR guard after a squash merge
+#### Duplicate-PR guard#### Duplicate-PR guard after a squash merge
 
 The hook decided whether a branch still needed a PR by asking `gh pr list --state open`.
 After a **squash** merge the branch's PR is `MERGED`, not open, so that count came back 0
@@ -991,58 +950,7 @@ times in a working session. Two defaults changed on 2026-07-31:
 | `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
 | `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
 
-#### Durable memory for the reviewer
-
-The reviewer reads prior-work notes for the changed files out of the offline Mem0
-mirror (`~/.mem0-local/cache.db`) and prepends them to its system prompt, so it reviews
-a diff knowing what was decided about those files before.
-
-> **Post-migration note (2026-08-20).** This path still reads the Mem0 mirror, which is
-> now a **frozen archive** — it holds 16,127 memories and keeps working offline, but it
-> no longer receives new writes, so the reviewer's context ages from here. Repointing
-> `local-diff-review.sh` at Cognee is tracked separately; the hook was deliberately left
-> alone during the migration because the mirror is local-only and never touched the
-> quota that forced the cutover.
-
-Every other local brain gets this at the proxy: `src/proxy/memory.py` in
-`Screddyice/backdoor` injects recall into anything routed through `:8083`, which covers
-`qwen` lean/fast, `qwen full`, `/model qwen`, and cloud→local failover. This hook calls
-Ollama directly, so none of that reached it, and it was the last local model in the
-stack running with no memory at all.
-
-Sending the review through the router would have fixed it in one line and cost two
-things the hook cannot give up. `keep_alive` becomes the router's to choose when the
-hook needs `30s` — holding 7.5 GB between turns is the behaviour that panicked this host
-twice. And a `qwen*` model name maps onto the heavy tier, so every Stop would load 17 GB
-instead of the 4B's 7.5 GB. Reviews would also start depending on the router being up,
-when today they only need Ollama. So recall is read here from the same mirror, under the
-same rules the proxy follows: local SQLite only (no Mem0 API call, so no quota and it
-works offline), budgeted, and fail-open.
-
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `LOCAL_REVIEW_MEMORY` | `1` | Set to `0` to review without durable memory |
-| `LOCAL_REVIEW_MEMORY_CHARS` | `1500` | Character budget for the whole injected block |
-| `LOCAL_REVIEW_MEMORY_MAX_FILES` | `5` | Cap on how many changed files get a recall call |
-| `LOCAL_REVIEW_MEM0_BIN` | `~/.local/bin/mem0-local` | Path to the mirror CLI |
-| `LOCAL_REVIEW_DUMP_PROMPT` | `0` | Print the assembled system prompt and stop before inference |
-
-Memory is deliberately a footnote to the diff, not a competitor for it: `num_ctx` is
-24576 and the diff can run to 60 KB. `mem0-local filectx` only returns memories that
-name the file in question, so reviewing one script does not drag in the rest of the
-corpus. Every failure degrades to a plain review rather than blocking one — a missing
-binary, a locked database, a recall that hangs (3s per file), or a budget too small for
-one block all just drop the memory and review anyway.
-
-`LOCAL_REVIEW_DUMP_PROMPT=1` prints the prompt and exits before touching Ollama, which
-is how to inspect the wiring without loading a model onto a host that may already be
-holding one.
-
-Run `scripts/test-local-diff-review-memory.sh` after changing anything above. It stubs
-`mem0-local` and asserts on the assembled prompt, so it needs neither Ollama nor the real
-corpus.
-
-#### Measure resident size, not weights
+#### Measure resident size#### Measure resident size, not weights
 
 This table originally claimed the small model cost "~3 GB, and loads fast enough to stay
 resident between turns". Both halves of that were wrong, and expensively so.
@@ -1129,6 +1037,13 @@ follow-up commit leaves the exposed value reachable in prior commits.
 ## License
 
 [MIT](LICENSE)
+
+## Hermes plugins (`hermes/`)
+
+`hermes/plugins/cmem` is the claude-mem memory provider deployed to `~/.hermes/plugins/cmem/`
+on all three Hermes boxes. It was hand-deployed and lived nowhere else; a rebuilt box now has a
+source to copy from. One memory project per box, and no writes until something is actually
+remembered. Details and the deploy command: `hermes/README.md`.
 
 ## Memory capture gate (claude-mem)
 
