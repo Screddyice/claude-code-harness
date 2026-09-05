@@ -1115,6 +1115,31 @@ lose. Verified on `src`, `reddy2help` and `neb-ops-gcp` with `CMEM_PRO_TOKEN` ex
 Tests: `scripts/test-set-gui-env.sh` (9 assertions, stubs `launchctl` so it never touches the real
 domain, and asserts the value is never printed).
 
+## Creating agent worktrees safely (`scripts/agent-worktree.sh`)
+
+On 2026-09-05 an agent ran this shape against a branch that was already checked out
+somewhere else:
+
+    git worktree add -q "$W" -B "$branch" "origin/$branch" || true
+    cd "$W"
+    git merge origin/main
+
+`worktree add` refused, `|| true` swallowed the refusal, `cd` failed, and the shell stayed where it
+was — the user's **main checkout**. The merge ran there. It was clean and on the intended branch so
+nothing was lost, but the next such slip lands a write in whatever repo the shell was last in.
+
+Two things made that possible, and the script fixes both. A create that fails is never ignored: a
+branch checked out elsewhere is reported by name with the path that holds it, and the script exits
+3 rather than guessing. And the command runs in a subshell whose `cd` is checked, so a failure
+cannot fall through to the caller's directory.
+
+    scripts/agent-worktree.sh <repo> <branch> <start-point> [--] <command...>
+
+With no command it creates the worktree, prints the path and leaves it. With one it runs the
+command inside and removes the worktree afterwards. Tests: `scripts/test-agent-worktree.sh`. The
+first test reproduces the incident, and the suite was run against the original broken pattern to
+confirm it fails there (4 of 5, including the command executing in the caller's directory).
+
 ## Auditing instructions for retired components (`scripts/audit-stale-instructions.sh`)
 
 Instruction files are read by every agent on every session and are never executed, so a component
