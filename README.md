@@ -1148,3 +1148,29 @@ can **fail**, because an audit that always passes is the same silent success it 
 the first version of this script had a stray `next` that skipped every match, and reported a clean
 sweep across six files that were not clean.
 
+## Working in this repo
+
+Bash and Python. There is no `package.json` and no build step.
+
+**This repo holds the hook implementations both hosts run.**
+`~/.claude/settings.json` and `~/.codex/hooks.json` register these paths directly,
+and the same-named files under `~/.claude/scripts/` are one-line compat wrappers
+that `exec` into here. Edit the implementation in this repo, never the wrapper.
+
+| Hook | Event | Behavior |
+|---|---|---|
+| `scripts/hooks/auto-pr-push.sh` | PostToolUse, both hosts | Pushes and opens a draft PR on the first commit, for owned orgs only |
+| `scripts/hooks/enforce-pr-claude.sh` | Stop, Claude | Blocks the stop once when a branch has commits but no PR |
+| `scripts/hooks/enforce-pr-codex.sh` | Stop, Codex | Same rule, emitting Codex's `{continue,stopReason,systemMessage}` contract |
+| `scripts/hooks/local-diff-review.sh` | Stop, Claude | Local qwen diff review, gated on `LOCAL_REVIEW` (currently `0` in settings, so it exits immediately) |
+| `scripts/hooks/local-diff-review-codex.sh` | Stop, Codex | The Codex copy of the reviewer |
+
+```bash
+bash -n scripts/hooks/<hook>.sh          # syntax check before registering
+./scripts/test-auto-pr-push-base.sh
+./scripts/test-auto-pr-push-merged-guard.sh
+./scripts/test-auto-pr-push-elsewhere-guard.sh
+```
+
+A hook that exits non-zero blocks the tool call that triggered it, so run the syntax
+check before registering anything. Agent instructions live in `CLAUDE.md`.
