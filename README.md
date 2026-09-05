@@ -37,6 +37,8 @@ codex-harness/
 │   ├── gbrowse                       # headed-browser wrapper that survives a session
 │   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
 │   ├── dns-postflight.sh             # did the cutover land, and did mail survive
+│   ├── kernel-zone-watchdog.sh       # catches a kernel zone-map leak before it panics the Mac
+│   ├── test-kernel-zone-watchdog.sh  # watchdog unit tests (parsing, thresholds, snapshots)
 │   └── codex-workspace-summary.sh    # quick local sanity summary
 └── marketplace/
     └── example-local/                # Codex local plugin marketplace example
@@ -718,6 +720,74 @@ the three failures that take a domain fully offline:
 The `dns-cutover` skill wraps both with the procedure and the DNSSEC-restore ordering
 rule (**sign first, publish the DS second**).
 
+## Kernel Zone Leak Watchdog
+
+macOS can run out of *kernel* memory while every app looks fine. On 2026-09-04 this
+Mac panicked after 35 hours of uptime:
+
+```
+panic(cpu 15): zalloc[3]: zone map exhausted while allocating from zone
+[data.kalloc.1024], likely due to memory leak in zone [data.kalloc.1024]
+(20G, 21218528 elements allocated)
+```
+
+Twenty gigabytes of one-kilobyte kernel allocations, none of them freed. Two
+`JetsamEvent` reports earlier the same day already showed the shape of it: 23.5 GB
+wired against only 4.3 GB of anonymous application memory. Activity Monitor shows
+this as "wired" and attributes it to nothing, because no process owns it — which is
+why it reads as "the machine got slow and then died" rather than as a leak.
+
+The panic log does not say which subsystem leaked. Zone allocation backtraces need
+the `zlog=<zone>` boot-arg, set before the fact. So this watchdog samples the zone
+table on an interval instead, and captures the evidence at the moment a zone crosses
+a threshold — turning the next occurrence into an attribution instead of another panic.
+
+```bash
+scripts/kernel-zone-watchdog.sh            # one sample; exit 0 quiet / 1 warn / 2 critical
+scripts/kernel-zone-watchdog.sh --status   # ten largest kernel zones right now
+scripts/kernel-zone-watchdog.sh --report   # sample count, latest reading, growth per hour
+scripts/kernel-zone-watchdog.sh --watch    # sample forever, for a foreground session
+```
+
+`--status` on a healthy machine puts the largest zone in the low hundreds of megabytes:
+
+```
+ZONE                                     ELEM        INUSE         SIZE
+APFS_4K_OBJS                             4096        43601     170.3 MB
+APFS_INODES                               432       262396     108.1 MB
+vm.pages.array                             48      2273042     104.1 MB
+```
+
+**Thresholds are set far apart on purpose.** Idle `data.kalloc.1024` on this machine
+sits near 1,500 elements — about 2 MB. Warning fires at 1 GiB and critical at 6 GiB,
+both orders of magnitude above noise and hours ahead of the 20 GB that killed it.
+Override with `KERNEL_ZONE_WARN_BYTES` / `KERNEL_ZONE_CRIT_BYTES`.
+
+Crossing a threshold writes a snapshot under
+`~/.local/state/kernel-zone-watchdog/snapshots/` holding the full zone table, `vm_stat`,
+`netstat -m`, a process-name histogram, `launchctl list`, and processes ranked three
+ways — by RSS, by cumulative CPU time, and by age. A 30-minute cooldown keeps a
+sustained leak from filling the disk with snapshots.
+
+**Ranking by RSS alone is not enough, and the 2026-09-04 panic is why.** The two
+processes that stood out in that panic report held *0.1 MB resident* while burning 4.5
+hours of kernel CPU and 4.15 billion page faults each — 64× the page faults of any other
+process on the machine. An RSS-sorted list puts them nowhere near the top and shows you
+a browser instead. Cumulative CPU time is what surfaces them.
+
+Install it as a LaunchAgent that samples every minute:
+
+```bash
+cp examples/com.screddy.kernel-zone-watchdog.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.screddy.kernel-zone-watchdog.plist
+```
+
+Samples append to `~/.local/state/kernel-zone-watchdog/samples.csv` as
+`epoch,iso,zone,elem_size,inuse,zone_bytes,wired_bytes`, so a leak's growth rate is a
+one-line `awk` away after the fact. Run `scripts/test-kernel-zone-watchdog.sh` to
+verify parsing, both thresholds, snapshot contents, and the cooldown; it touches only
+a temp directory.
+
 ## Per-Repo Harness
 
 `scripts/init-codex-harness.sh` creates an idempotent `.codex-harness/` directory in a
@@ -738,6 +808,14 @@ git repository:
 If the target repo does not already have `AGENTS.md`, the script also seeds a small
 project-level starter.
 
+## Durable Cognee writes (retired 2026-09-04)
+
+The outbox, drainer and verification wrapper that lived here existed only because Cognee
+acknowledged a write before persisting it and exposed no point lookup. Memory moved to
+claude-mem on 2026-09-04, whose worker queues every write durably before any AI work, so the
+whole subsystem is gone. The last copies are in git history at the commit before this section
+was rewritten, and the operational post-mortem is in `~/.claude/CLAUDE.md` § Memory.
+
 ## Optional Hooks
 
 Codex supports lifecycle hooks including `SessionStart`, `Stop`, tool hooks, and
@@ -755,26 +833,16 @@ local Ollama diff reviewer. Thin Stop-hook adapters preserve each tool's JSON co
 | Push branches and open draft PRs | `auto-pr-push.sh` | `auto-pr-push.sh` |
 | Enforce one PR per work branch | `enforce-pr-claude.sh` | `enforce-pr-codex.sh` |
 | Review the current diff with Ollama | `local-diff-review.sh` | `local-diff-review-codex.sh` |
-| Distil session left-off into HyperSwarm | Claude settings | `codex-hyperswarm-leftoff.sh` |
 | Sample OAuth login expiry | `oauth-expiry-monitor.sh` | n/a |
-| Write a session memory to Mem0 | plugin hooks | plugin hooks |
+| Write a session memory | claude-mem plugin hooks | claude-mem plugin hooks |
 
-`codex-hyperswarm-leftoff.sh` runs on Codex `SessionEnd` and gives Codex parity
-with Claude Code's HyperSwarm feed: it hands the ending session's id to
-`hyperswarm capture --runtime mem0_session` (significance-gated, with the
-left-off fallback) and pushes the store to the canonical host, so remote
-Hermes/Telegram agents can see where Codex coding left off. The hook returns
-immediately and a detached worker sleeps 5s so Mem0 lands the session's
-memories before the distiller reads them. `Mem0SessionSource` matches on
-`metadata.session_id` and writes nothing when Mem0 holds no memories for the
-session, so no local gate decides whether capture is worth running. Recursion
-stops at the inherited `CODEX_NO_INTERACTIVE` marker set by the gate's
-own `codex exec` child, plus a skip for sessions whose prompt is the gate
-preamble. Logs to `/tmp/hs-codex-push.log`.
-
-The shared PR hook writes its log to `~/.cache/claude-code-harness/auto-pr-push.log`.
-Set `HARNESS_PR_OWNERS` to a space-separated allowlist in both tool configs; an empty
-allowlist disables automatic pushes.
+**`codex-hyperswarm-leftoff.sh` was removed on 2026-09-05.** It distilled a Codex session's
+left-off state into HyperSwarm through `hyperswarm capture --runtime mem0_session`. HyperSwarm was
+decommissioned on 2026-08-27 and Mem0 on 2026-09-04, so both its store and its capture backend
+were gone, but the hook stayed registered in `~/.codex/hooks.json` and fired at the end of every
+Codex session — logging `FATAL: venv python missing` to `/tmp/hs-codex-push.log` and capturing
+nothing. claude-mem's own Codex hooks cover this now. The registration was removed with the
+script.
 
 #### Login-expiry monitor
 
@@ -812,24 +880,7 @@ synthetic credential instead of reading the keychain. Run
 path, a forward roll, the regression and expiring alerts, `--quiet`, a malformed
 credential blob, and the shape of the emitted hook JSON.
 
-#### Session memories
-
-Every host contributes memories to **Cognee** (migrated from Mem0 on 2026-08-20):
-Claude Code runs the `cognee-memory@cognee` plugin, Codex runs `cognee@cognee`, and
-Hermes writes through a native Python provider at `~/.hermes/plugins/cognee/`. All three
-share one dataset, `agent_sessions`, tagged by node set (`user_context`, `project_docs`,
-`agent_actions`).
-
-Mem0 was retired because its Starter plan capped **retrievals** at 5,000/month and a
-single `user_id` shared across every host exhausted that quota, after which the API
-returned HTTP 402 on every call. The lesson generalises: one shared memory account
-across many hosts is a quota single point of failure, so watch the retrieval ceiling
-rather than the add ceiling.
-
-HyperSwarm's `mem0_session` distiller matches on `metadata.session_id`, so any
-host that wants a corpus entry has to tag its session write with that key.
-
-#### Duplicate-PR guard after a squash merge
+#### Duplicate-PR guard#### Duplicate-PR guard after a squash merge
 
 The hook decided whether a branch still needed a PR by asking `gh pr list --state open`.
 After a **squash** merge the branch's PR is `MERGED`, not open, so that count came back 0
@@ -899,58 +950,7 @@ times in a working session. Two defaults changed on 2026-07-31:
 | `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
 | `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
 
-#### Durable memory for the reviewer
-
-The reviewer reads prior-work notes for the changed files out of the offline Mem0
-mirror (`~/.mem0-local/cache.db`) and prepends them to its system prompt, so it reviews
-a diff knowing what was decided about those files before.
-
-> **Post-migration note (2026-08-20).** This path still reads the Mem0 mirror, which is
-> now a **frozen archive** — it holds 16,127 memories and keeps working offline, but it
-> no longer receives new writes, so the reviewer's context ages from here. Repointing
-> `local-diff-review.sh` at Cognee is tracked separately; the hook was deliberately left
-> alone during the migration because the mirror is local-only and never touched the
-> quota that forced the cutover.
-
-Every other local brain gets this at the proxy: `src/proxy/memory.py` in
-`Screddyice/backdoor` injects recall into anything routed through `:8083`, which covers
-`qwen` lean/fast, `qwen full`, `/model qwen`, and cloud→local failover. This hook calls
-Ollama directly, so none of that reached it, and it was the last local model in the
-stack running with no memory at all.
-
-Sending the review through the router would have fixed it in one line and cost two
-things the hook cannot give up. `keep_alive` becomes the router's to choose when the
-hook needs `30s` — holding 7.5 GB between turns is the behaviour that panicked this host
-twice. And a `qwen*` model name maps onto the heavy tier, so every Stop would load 17 GB
-instead of the 4B's 7.5 GB. Reviews would also start depending on the router being up,
-when today they only need Ollama. So recall is read here from the same mirror, under the
-same rules the proxy follows: local SQLite only (no Mem0 API call, so no quota and it
-works offline), budgeted, and fail-open.
-
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `LOCAL_REVIEW_MEMORY` | `1` | Set to `0` to review without durable memory |
-| `LOCAL_REVIEW_MEMORY_CHARS` | `1500` | Character budget for the whole injected block |
-| `LOCAL_REVIEW_MEMORY_MAX_FILES` | `5` | Cap on how many changed files get a recall call |
-| `LOCAL_REVIEW_MEM0_BIN` | `~/.local/bin/mem0-local` | Path to the mirror CLI |
-| `LOCAL_REVIEW_DUMP_PROMPT` | `0` | Print the assembled system prompt and stop before inference |
-
-Memory is deliberately a footnote to the diff, not a competitor for it: `num_ctx` is
-24576 and the diff can run to 60 KB. `mem0-local filectx` only returns memories that
-name the file in question, so reviewing one script does not drag in the rest of the
-corpus. Every failure degrades to a plain review rather than blocking one — a missing
-binary, a locked database, a recall that hangs (3s per file), or a budget too small for
-one block all just drop the memory and review anyway.
-
-`LOCAL_REVIEW_DUMP_PROMPT=1` prints the prompt and exits before touching Ollama, which
-is how to inspect the wiring without loading a model onto a host that may already be
-holding one.
-
-Run `scripts/test-local-diff-review-memory.sh` after changing anything above. It stubs
-`mem0-local` and asserts on the assembled prompt, so it needs neither Ollama nor the real
-corpus.
-
-#### Measure resident size, not weights
+#### Measure resident size#### Measure resident size, not weights
 
 This table originally claimed the small model cost "~3 GB, and loads fast enough to stay
 resident between turns". Both halves of that were wrong, and expensively so.
@@ -1037,6 +1037,76 @@ follow-up commit leaves the exposed value reachable in prior commits.
 ## License
 
 [MIT](LICENSE)
+
+## Hermes plugins (`hermes/`)
+
+`hermes/plugins/cmem` is the claude-mem memory provider deployed to `~/.hermes/plugins/cmem/`
+on all three Hermes boxes. It was hand-deployed and lived nowhere else; a rebuilt box now has a
+source to copy from. One memory project per box, and no writes until something is actually
+remembered. Details and the deploy command: `hermes/README.md`.
+## Publishing credentials into the macOS GUI domain (`scripts/set-gui-env.sh`)
+
+A Dock-launched app inherits launchd's environment, not a shell's. Nothing in `~/.zshrc` and
+nothing in `~/projects/.env` reaches Codex Desktop, so its `cmem` MCP server — which declares
+`bearer_token_env_var = "CMEM_PRO_TOKEN"` — starts with no bearer and its tools simply never
+appear. That failure reads as a missing feature rather than a missing credential, which is why it
+went unnoticed.
+
+`launchctl setenv` fixes it for the session and is lost at logout. This script reads the named
+keys out of `~/projects/.env` and publishes them, and
+`examples/com.screddy.gui-env.plist` runs it at every login so a reboot cannot quietly
+un-configure the app.
+
+```bash
+cp examples/com.screddy.gui-env.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.screddy.gui-env.plist
+launchctl getenv CMEM_PRO_TOKEN >/dev/null && echo published
+```
+
+`GUI_ENV_KEYS` selects which keys to publish (default `CMEM_PRO_TOKEN`) and `GUI_ENV_SOURCE` the
+file to read. **The secret value stays in `~/projects/.env`**: it is never written into the plist,
+and the log records only the key name and a character count. A missing file or a missing key exits
+0 with a message rather than failing login.
+
+The Hermes boxes deliberately do not use this. Each keeps its own mode-600 `~/.hermes/cmem.env`
+and the provider reads the environment then that file, so there is no launchd or GUI session to
+lose. Verified on `src`, `reddy2help` and `neb-ops-gcp` with `CMEM_PRO_TOKEN` explicitly unset.
+
+Tests: `scripts/test-set-gui-env.sh` (9 assertions, stubs `launchctl` so it never touches the real
+domain, and asserts the value is never printed).
+
+## Auditing instructions for retired components (`scripts/audit-stale-instructions.sh`)
+
+Instruction files are read by every agent on every session and are never executed, so a component
+can be deleted from the machine while every agent is still told it is canonical. Nothing fails; the
+agents simply act on a world that no longer exists.
+
+That happened on 2026-09-04. Cognee was removed from the whole fleet, and afterwards
+`~/.codex/AGENTS.md` still opened with "Memory = Cognee", naming a plugin that no longer existed
+and a port with nothing behind it. Codex read its own instructions and reported the drift; no
+check would have. Worse, all four Hermes `SOUL.md` files still told those agents that memory was
+Cognee, reached through an SSH tunnel on `127.0.0.1:8001`.
+
+```bash
+scripts/audit-stale-instructions.sh                 # the usual set
+scripts/audit-stale-instructions.sh path/to/file    # or specific files
+STALE_PATTERN='widgetron|old-thing' scripts/audit-stale-instructions.sh
+```
+
+It judges **paragraphs**, not lines, because these files are prose: a retirement is announced once
+and discussed for several lines, and line matching reports every continuation of a note that is
+already correct. A paragraph naming something retired passes when it also reads as history
+("deleted", "retired", "no longer", a date). It fails when it reads as live guidance. Exit 1 lists
+one line per offending paragraph.
+
+Default set: `~/.claude/CLAUDE.md`, `~/CLAUDE.md`, `~/projects/CLAUDE.md`, `~/projects/AGENTS.md`,
+`~/.codex/AGENTS.md`, `~/.hermes/SOUL.md`. Default terms: cognee, mem0, hyperswarm, and the dead
+`8001` port.
+
+Tests: `scripts/test-audit-stale-instructions.sh` (8 assertions). The first one asserts the audit
+can **fail**, because an audit that always passes is the same silent success it exists to catch —
+the first version of this script had a stray `next` that skipped every match, and reported a clean
+sweep across six files that were not clean.
 
 ## Working in this repo
 
