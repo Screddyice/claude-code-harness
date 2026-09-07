@@ -3,6 +3,17 @@
 # Wire via "statusLine.command" in ~/.claude/settings.json.
 
 input=$(cat)
+
+# jq parses this payload and validates the breaker state file. Without it the
+# script used to print a bare " . shells: 0" and exit 0, which reads as a healthy
+# routed session: no model, and a BACKDOOR ON badge that could never appear no
+# matter what the router was doing. A status line that cannot tell you the truth
+# has to say so.
+if ! command -v jq >/dev/null 2>&1; then
+  printf 'STATUSLINE BLIND · jq not found on PATH · no model or Backdoor badge\n'
+  exit 0
+fi
+
 session_id=$(printf '%s' "$input" | jq -r '.session_id // empty')
 model=$(printf '%s' "$input" | jq -r '.model.display_name // empty')
 cwd=$(printf '%s' "$input" | jq -r '.cwd // empty')

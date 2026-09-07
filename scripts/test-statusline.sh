@@ -31,6 +31,16 @@ exec /bin/ps "$@"
 MOCK
 chmod +x "$MOCK_BIN/ps"
 
+# A PATH that holds everything the script calls except jq. Symlinking the real
+# binaries keeps this honest: the only thing missing is the one dependency.
+NOJQ_BIN="$FIXTURE/nojq-bin"
+mkdir -p "$NOJQ_BIN"
+for tool in cat basename xargs tr; do
+  tool_path=$(command -v "$tool") || continue
+  ln -s "$tool_path" "$NOJQ_BIN/$tool"
+done
+cp "$MOCK_BIN/ps" "$NOJQ_BIN/ps"
+
 failures=0
 
 run_statusline() {
@@ -47,6 +57,14 @@ run_statusline() {
     ANTHROPIC_BASE_URL="$base_url" \
     HTTPS_PROXY="$proxy_url" \
     "$STATUSLINE"
+}
+
+run_statusline_without_jq() {
+  printf '{"session_id":"fixture","model":{"display_name":"Opus 5"},"cwd":"/tmp"}' |
+    env -i PATH="$NOJQ_BIN" HOME="$HOME" \
+      HTTPS_PROXY="http://127.0.0.1:8084" \
+      BACKDOOR_STATE_FILE="$1" \
+      /bin/bash "$STATUSLINE"
 }
 
 expect_contains() {
@@ -114,6 +132,13 @@ expect_absent "wrong process" "$out" "BACKDOOR ON"
 
 out=$(run_statusline "Opus 5" "" "http://127.0.0.1:8084" "$ACTIVE" "lookalike")
 expect_absent "lookalike process" "$out" "BACKDOOR ON"
+
+# Without jq the script can neither read the model nor validate the breaker
+# state. It must say that out loud: the old version printed an empty line and
+# exited 0, which is indistinguishable from a healthy routed session.
+out=$(run_statusline_without_jq "$ACTIVE")
+expect_contains "missing jq announces itself" "$out" "STATUSLINE BLIND"
+expect_absent "missing jq claims no failover" "$out" "BACKDOOR ON"
 
 after_active=$(shasum -a 256 "$ACTIVE" | awk '{print $1}')
 if [ "$before_active" != "$after_active" ]; then
