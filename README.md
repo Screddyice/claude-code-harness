@@ -1194,3 +1194,25 @@ Tests: `scripts/test-audit-stale-instructions.sh` (8 assertions). The first one 
 can **fail**, because an audit that always passes is the same silent success it exists to catch —
 the first version of this script had a stray `next` that skipped every match, and reported a clean
 sweep across six files that were not clean.
+## Working in this repo
+
+Bash and Python. No `package.json`, no build step, nothing to compile.
+
+Claude Code and Codex both run the hook implementations that live here.
+`~/.claude/settings.json` and `~/.codex/hooks.json` point at these paths, and the
+same-named files under `~/.claude/scripts/` are one-line compat wrappers that `exec`
+into this repo. Edit the implementation here. A change to a wrapper gets overwritten
+the next time someone reinstalls it.
+
+Run the syntax check before you register anything, because a hook that exits non-zero
+blocks the tool call that triggered it:
+
+```bash
+bash -n scripts/hooks/<hook>.sh
+./scripts/test-auto-pr-push-base.sh
+./scripts/test-auto-pr-push-merged-guard.sh
+./scripts/test-auto-pr-push-elsewhere-guard.sh
+```
+
+`CLAUDE.md` carries the agent instructions. The hook-by-hook table lives under
+Optional Hooks above.
