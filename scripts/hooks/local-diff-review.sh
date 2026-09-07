@@ -27,6 +27,10 @@ cooldown="${LOCAL_REVIEW_COOLDOWN_SECONDS:-1200}"
 # a 20 minute cooldown the next review is far away, so lingering only holds GB that
 # a council or another session needs. Trades a few seconds of reload for ~6 GB back.
 keep_alive="${LOCAL_REVIEW_KEEP_ALIVE:-30s}"
+preflight="${LOCAL_REVIEW_PREFLIGHT:-llmjury}"
+if [ "$preflight" = llmjury ] && ! command -v llmjury >/dev/null 2>&1; then
+  preflight="$HOME/.local/bin/llmjury"
+fi
 
 top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 origin="$(git -C "$top" remote get-url origin 2>/dev/null || true)"
@@ -62,18 +66,18 @@ last="$(cat "$stamp" 2>/dev/null || true)"
 case "$last" in ''|*[!0-9]*) last=0 ;; esac
 [ "$(( now - last ))" -lt "$cooldown" ] && exit 0
 
-printf %s "$diff_hash" > "$marker"
-printf %s "$now" > "$stamp"
-
 # LOCAL_REVIEW_DUMP_PROMPT prints the assembled system prompt and stops before
 # any inference, so the memory wiring can be checked without loading a model onto
 # a host that may already be holding one.
 [ "${LOCAL_REVIEW_DUMP_PROMPT:-0}" = "1" ] || curl -sf -m 5 "$ollama/api/tags" >/dev/null 2>&1 || exit 0
 
 review="$(DIFF="$diff" MODEL="$model" OLLAMA="$ollama" KEEP_ALIVE="$keep_alive" \
+  REVIEW_PREFLIGHT="$preflight" \
   DUMP_PROMPT="${LOCAL_REVIEW_DUMP_PROMPT:-0}" python3 - <<'PY' 2>/dev/null
+import fcntl
 import json
 import os
+import subprocess
 import urllib.request
 
 
@@ -89,6 +93,26 @@ system = (
 if os.environ.get("DUMP_PROMPT") == "1":
     print(system)
     raise SystemExit(0)
+
+# One background review across repositories at a time. The kernel releases this
+# lock on exit, including a killed process; there is no stale PID directory.
+lock_path = os.environ.get("LLMJURY_LOCAL_LOCK") or os.path.expanduser("~/.cache/llmjury/local-compute.lock")
+os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+lock = open(lock_path, "a")
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(1)
+
+# This read-only probe shares council ownership and pressure policy.
+# A missing/old CLI, failed probe, or refusal skips without consuming the diff.
+probe = subprocess.run(
+    [os.environ["REVIEW_PREFLIGHT"], "preflight", "--models", os.environ["MODEL"],
+     "--num-ctx", "24576", "--host", os.environ["OLLAMA"]],
+    capture_output=True, text=True, timeout=45,
+)
+if probe.returncode != 0:
+    raise SystemExit(1)
 
 payload = {
     "model": os.environ["MODEL"],
@@ -118,6 +142,8 @@ if [ "${LOCAL_REVIEW_DUMP_PROMPT:-0}" = "1" ]; then
 fi
 
 [ -n "$review" ] || exit 0
+printf %s "$diff_hash" > "$marker"
+date +%s > "$stamp"
 case "$review" in LGTM*|lgtm*) exit 0 ;; esac
 
 repo_name="$(basename "$top")"
