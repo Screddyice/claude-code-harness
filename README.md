@@ -950,7 +950,27 @@ times in a working session. Two defaults changed on 2026-07-31:
 | `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
 | `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
 
-#### Measure resident size#### Measure resident size, not weights
+#### Admission before background inference
+
+The reviewer runs `llmjury preflight --models <review-model> --num-ctx 24576`
+before asking Ollama for a completion. Install a LLM-Jury version with the
+`preflight` command first; a missing/older CLI, failed probe, exclusive Qwen
+ownership, or insufficient memory skips the review. `LOCAL_REVIEW_PREFLIGHT`
+can point to the CLI executable when it is not on PATH.
+
+The reviewer and cooperating councils hold the same nonblocking kernel lock,
+`~/.cache/llmjury/local-compute.lock`, through admission and inference. Set
+`LLMJURY_LOCAL_LOCK` consistently across clients to override it. Direct Ollama
+callers outside this protocol can still compete for memory.
+
+A skipped or failed review does not consume the diff hash or start its cooldown.
+Only a nonempty successful response records those markers, so the next turn can
+retry after memory pressure clears. `LOCAL_REVIEW_DUMP_PROMPT=1` remains an
+inference-free prompt inspection path. Run
+`scripts/test-local-diff-review-cooldown.sh` for fake-HTTP coverage of admission,
+locking, cooldown and retry behavior; it never loads a model.
+
+#### Measure the whole runner footprint
 
 This table originally claimed the small model cost "~3 GB, and loads fast enough to stay
 resident between turns". Both halves of that were wrong, and expensively so.
@@ -969,9 +989,11 @@ several GB held hostage. And the default tag dropped the `-64k` suffix — same 
 but the plain tag cannot silently fall back to a 64k context if `num_ctx` is ever
 dropped from the request.
 
-When changing the model or context here, measure with `ollama ps` rather than reading
-`ollama list`; the first reports resident size, the second reports bytes on disk, and on
-a memory-constrained host the gap between them is the whole problem.
+Measure both `ollama ps` and the runner's OS memory footprint when changing the
+model or context. The former excludes the llama-server host prompt cache, which
+can add up to 8 GiB per runner by default. The shared LLM-Jury preflight reserves
+that bound and checks desktop memory pressure. Lower its client estimate only
+after verifying the active Ollama server uses a smaller cache limit.
 
 The cooldown collapses a burst of rapid turns into one review over the
 accumulated diff. It is keyed per repository and checked *before* the diff-hash
@@ -1044,6 +1066,46 @@ follow-up commit leaves the exposed value reachable in prior commits.
 on all three Hermes boxes. It was hand-deployed and lived nowhere else; a rebuilt box now has a
 source to copy from. One memory project per box, and no writes until something is actually
 remembered. Details and the deploy command: `hermes/README.md`.
+
+## Memory capture gate (claude-mem)
+
+`scripts/hooks/memory-capture-gate.sh` runs on SessionStart and keeps client repositories out of
+agent memory. It reads the git **origin remote**, and for `teamnebula-ai` or `Reddy2help` writes
+`.claude/settings.local.json` with `enabledPlugins["claude-mem@thedotmack"] = false`, which beats
+the user-level `true` by settings precedence. It replaces the identical gate that guarded the
+Cognee plugin until 2026-09-04; only the plugin id changed.
+
+Two things it deliberately does not do. It does not use `CLAUDE_MEM_EXCLUDED_PROJECTS`, which
+matches on folder name, because a client repo cloned under any other name would capture. And it
+cannot affect the session that writes the file: plugin enablement resolves at startup, so the
+first session in a freshly cloned client repo still captures and every later one does not; the
+systemMessage says so.
+
+## The capture gate has to survive a branch switch (2026-09-04)
+
+`memory-capture-gate.sh` keeps Team Nebula, Reddy2help and Breaking Hits sessions out of
+claude-mem by writing `enabledPlugins["claude-mem@thedotmack"] = false` into the repo's
+`.claude/settings.local.json`, chosen by git **origin remote** rather than folder.
+
+It was registered as a `SessionStart` hook at a fixed path in `~/.claude/scripts/`, and that path
+was a one-line wrapper that `exec`'d this repo's copy. This repo is a working tree that moves
+between branches, and the script only ever existed on its own feature branch — so for weeks the
+hook exec'd a file that was not there, exited non-zero, and the gate never ran. Nothing surfaced
+it: a gate that fails open looks exactly like a gate that found nothing to do. TMN sessions were
+captured the whole time, which is how `nebos-v2` worktrees and a dozen `nebby-eval-*` sandboxes
+reached the memory hub.
+
+The wrapper (`scripts/hooks/memory-capture-gate-wrapper.sh`, installed at
+`~/.claude/scripts/memory-capture-gate.sh`) now prefers this repo's copy, refreshes a fallback at
+`~/.claude/scripts/memory-capture-gate.impl.sh` every time it can reach it, runs the fallback when
+it cannot, and prints a loud `systemMessage` if neither exists. Editing the harness copy is still
+the way to change behaviour; the fallback is only there so a branch switch cannot silently disarm
+the gate.
+
+**BH-Repos was added to the excluded orgs** in the same change. Breaking Hits is the one actual
+client engagement in the tree, and its source has less business in a personal cloud memory service
+than TMN's or R2H's does. RS21 needs no entry: those repos live under `teamnebula-ai`, which the
+org pattern already matches.
 ## Publishing credentials into the macOS GUI domain (`scripts/set-gui-env.sh`)
 
 A Dock-launched app inherits launchd's environment, not a shell's. Nothing in `~/.zshrc` and
@@ -1074,6 +1136,31 @@ lose. Verified on `src`, `reddy2help` and `neb-ops-gcp` with `CMEM_PRO_TOKEN` ex
 
 Tests: `scripts/test-set-gui-env.sh` (9 assertions, stubs `launchctl` so it never touches the real
 domain, and asserts the value is never printed).
+
+## Creating agent worktrees safely (`scripts/agent-worktree.sh`)
+
+On 2026-09-05 an agent ran this shape against a branch that was already checked out
+somewhere else:
+
+    git worktree add -q "$W" -B "$branch" "origin/$branch" || true
+    cd "$W"
+    git merge origin/main
+
+`worktree add` refused, `|| true` swallowed the refusal, `cd` failed, and the shell stayed where it
+was — the user's **main checkout**. The merge ran there. It was clean and on the intended branch so
+nothing was lost, but the next such slip lands a write in whatever repo the shell was last in.
+
+Two things made that possible, and the script fixes both. A create that fails is never ignored: a
+branch checked out elsewhere is reported by name with the path that holds it, and the script exits
+3 rather than guessing. And the command runs in a subshell whose `cd` is checked, so a failure
+cannot fall through to the caller's directory.
+
+    scripts/agent-worktree.sh <repo> <branch> <start-point> [--] <command...>
+
+With no command it creates the worktree, prints the path and leaves it. With one it runs the
+command inside and removes the worktree afterwards. Tests: `scripts/test-agent-worktree.sh`. The
+first test reproduces the incident, and the suite was run against the original broken pattern to
+confirm it fails there (4 of 5, including the command executing in the caller's directory).
 
 ## Auditing instructions for retired components (`scripts/audit-stale-instructions.sh`)
 
@@ -1107,30 +1194,25 @@ Tests: `scripts/test-audit-stale-instructions.sh` (8 assertions). The first one 
 can **fail**, because an audit that always passes is the same silent success it exists to catch —
 the first version of this script had a stray `next` that skipped every match, and reported a clean
 sweep across six files that were not clean.
-
 ## Working in this repo
 
-Bash and Python. There is no `package.json` and no build step.
+Bash and Python. No `package.json`, no build step, nothing to compile.
 
-**This repo holds the hook implementations both hosts run.**
-`~/.claude/settings.json` and `~/.codex/hooks.json` register these paths directly,
-and the same-named files under `~/.claude/scripts/` are one-line compat wrappers
-that `exec` into here. Edit the implementation in this repo, never the wrapper.
+Claude Code and Codex both run the hook implementations that live here.
+`~/.claude/settings.json` and `~/.codex/hooks.json` point at these paths, and the
+same-named files under `~/.claude/scripts/` are one-line compat wrappers that `exec`
+into this repo. Edit the implementation here. A change to a wrapper gets overwritten
+the next time someone reinstalls it.
 
-| Hook | Event | Behavior |
-|---|---|---|
-| `scripts/hooks/auto-pr-push.sh` | PostToolUse, both hosts | Pushes and opens a draft PR on the first commit, for owned orgs only |
-| `scripts/hooks/enforce-pr-claude.sh` | Stop, Claude | Blocks the stop once when a branch has commits but no PR |
-| `scripts/hooks/enforce-pr-codex.sh` | Stop, Codex | Same rule, emitting Codex's `{continue,stopReason,systemMessage}` contract |
-| `scripts/hooks/local-diff-review.sh` | Stop, Claude | Local qwen diff review, gated on `LOCAL_REVIEW` (currently `0` in settings, so it exits immediately) |
-| `scripts/hooks/local-diff-review-codex.sh` | Stop, Codex | The Codex copy of the reviewer |
+Run the syntax check before you register anything, because a hook that exits non-zero
+blocks the tool call that triggered it:
 
 ```bash
-bash -n scripts/hooks/<hook>.sh          # syntax check before registering
+bash -n scripts/hooks/<hook>.sh
 ./scripts/test-auto-pr-push-base.sh
 ./scripts/test-auto-pr-push-merged-guard.sh
 ./scripts/test-auto-pr-push-elsewhere-guard.sh
 ```
 
-A hook that exits non-zero blocks the tool call that triggered it, so run the syntax
-check before registering anything. Agent instructions live in `CLAUDE.md`.
+`CLAUDE.md` carries the agent instructions. The hook-by-hook table lives under
+Optional Hooks above.

@@ -36,7 +36,7 @@ watching a run.
 Harness-wide rules are in `../CLAUDE.md` and `../AGENTS.md`. Machine hard rules:
 `~/.claude/CLAUDE.md`.
 
-Durable facts go to **Cognee**, the only memory on this machine. The
-`.claude-harness/memory/` tree is scaffolding, not a live memory layer.
+Durable facts go to **claude-mem** (cmem.ai), the only memory on this machine since
+2026-09-04. The `.claude-harness/memory/` tree is scaffolding, not a live memory layer.
 
 Every branch gets a PR, and every PR updates the repo README.
