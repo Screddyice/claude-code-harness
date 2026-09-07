@@ -150,11 +150,22 @@ live publisher PID, and a process command that identifies `src.proxy.serve` or t
 router. Missing JSON, a dead PID, an unrelated process, and Codex-only state all hide
 `BACKDOOR ON`.
 
+`jq` is a hard dependency, and a missing one used to be invisible. The script parses the session
+payload and validates the breaker state with `jq`, so a host without it printed a bare
+` · shells: 0` and exited 0: no model name, and a `BACKDOOR ON` badge that could never appear no
+matter what the router did. That reads exactly like a healthy routed session. The script now
+checks for `jq` first and prints `STATUSLINE BLIND · jq not found on PATH · no model or Backdoor
+badge` instead of a comfortable blank.
+
 Run the fixture gate with:
 
 ```bash
 scripts/test-statusline.sh
 ```
+
+Nineteen checks run: the five display states, five fail-closed state errors sharing one loop, a
+wrong process, a lookalike process, the missing-`jq` announcement, and a comparison proving the
+run left the breaker fixture byte-identical.
 
 Repository changes do not install the script into `~/.claude`. Installation needs a separate
 decision, a backup of the current script, a passing fixture run, `bash -n`, and an atomic rename.
