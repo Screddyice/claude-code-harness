@@ -950,7 +950,27 @@ times in a working session. Two defaults changed on 2026-07-31:
 | `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
 | `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
 
-#### Measure resident size#### Measure resident size, not weights
+#### Admission before background inference
+
+The reviewer runs `llmjury preflight --models <review-model> --num-ctx 24576`
+before asking Ollama for a completion. Install a LLM-Jury version with the
+`preflight` command first; a missing/older CLI, failed probe, exclusive Qwen
+ownership, or insufficient memory skips the review. `LOCAL_REVIEW_PREFLIGHT`
+can point to the CLI executable when it is not on PATH.
+
+The reviewer and cooperating councils hold the same nonblocking kernel lock,
+`~/.cache/llmjury/local-compute.lock`, through admission and inference. Set
+`LLMJURY_LOCAL_LOCK` consistently across clients to override it. Direct Ollama
+callers outside this protocol can still compete for memory.
+
+A skipped or failed review does not consume the diff hash or start its cooldown.
+Only a nonempty successful response records those markers, so the next turn can
+retry after memory pressure clears. `LOCAL_REVIEW_DUMP_PROMPT=1` remains an
+inference-free prompt inspection path. Run
+`scripts/test-local-diff-review-cooldown.sh` for fake-HTTP coverage of admission,
+locking, cooldown and retry behavior; it never loads a model.
+
+#### Measure the whole runner footprint
 
 This table originally claimed the small model cost "~3 GB, and loads fast enough to stay
 resident between turns". Both halves of that were wrong, and expensively so.
@@ -969,9 +989,11 @@ several GB held hostage. And the default tag dropped the `-64k` suffix — same 
 but the plain tag cannot silently fall back to a 64k context if `num_ctx` is ever
 dropped from the request.
 
-When changing the model or context here, measure with `ollama ps` rather than reading
-`ollama list`; the first reports resident size, the second reports bytes on disk, and on
-a memory-constrained host the gap between them is the whole problem.
+Measure both `ollama ps` and the runner's OS memory footprint when changing the
+model or context. The former excludes the llama-server host prompt cache, which
+can add up to 8 GiB per runner by default. The shared LLM-Jury preflight reserves
+that bound and checks desktop memory pressure. Lower its client estimate only
+after verifying the active Ollama server uses a smaller cache limit.
 
 The cooldown collapses a burst of rapid turns into one review over the
 accumulated diff. It is keyed per repository and checked *before* the diff-hash
@@ -1172,4 +1194,3 @@ Tests: `scripts/test-audit-stale-instructions.sh` (8 assertions). The first one 
 can **fail**, because an audit that always passes is the same silent success it exists to catch —
 the first version of this script had a stray `next` that skipped every match, and reported a clean
 sweep across six files that were not clean.
-
