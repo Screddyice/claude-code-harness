@@ -29,8 +29,8 @@ codex-harness/
 │   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
 │   ├── install-claude-resilient-updater.sh # resumable Claude native updates on macOS
 │   ├── claude-manual-update             # checksum-verified update worker
-│   ├── statusline.sh                     # Claude model and failover status source
-│   ├── test-statusline.sh                # failover badge fixture tests
+│   ├── statusline.sh                     # Claude model and session status source
+│   ├── test-statusline.sh                # status-line fixture tests
 │   ├── hooks/                           # shared hook logic and runtime adapters
 │   ├── test-shared-hooks.sh          # hook unit tests (PR base resolution, enforcement)
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
@@ -137,25 +137,21 @@ while sharing one Codex setup.
 | Claude plugin marketplace | `.agents/plugins/marketplace.json` and `codex plugin marketplace add` |
 | Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
 
-## Claude failover status line
+## Claude status line
 
-`scripts/statusline.sh` is the canonical source for Claude's optional status line. Routing and
-failover have separate meanings. A routed cloud session shows no Backdoor badge. A direct cloud
-session shows `BACKDOOR OFF`, and a deliberate local model shows `QWEN LOCAL`. During confirmed
-Anthropic failover, a routed Claude session shows `QWEN LOCAL · BACKDOOR ON`.
+`scripts/statusline.sh` is the canonical source for Claude's optional status line. It prints the
+session model, the working directory, and the shell and legion worker counts. A model served
+locally shows as `QWEN LOCAL`; every other model shows its own name.
 
-The script reads `${BACKDOOR_STATE_FILE:-$HOME/.backdoor/failover-state.json}` and never writes
-it. The active badge requires `failover_active=true`, an `anthropic` entry in `active_sources`, a
-live publisher PID, and a process command that identifies `src.proxy.serve` or the Backdoor
-router. Missing JSON, a dead PID, an unrelated process, and Codex-only state all hide
-`BACKDOOR ON`.
+Backdoor was removed from this machine on 2026-09-10, and the routing badges went with it. The
+script no longer reads `$HOME/.backdoor/failover-state.json`, no longer inspects
+`ANTHROPIC_BASE_URL` or `HTTPS_PROXY`, and can no longer print `BACKDOOR ON` or `BACKDOOR OFF`.
+A stale proxy variable left over from the router changes nothing about what it renders.
 
 `jq` is a hard dependency, and a missing one used to be invisible. The script parses the session
-payload and validates the breaker state with `jq`, so a host without it printed a bare
-` · shells: 0` and exited 0: no model name, and a `BACKDOOR ON` badge that could never appear no
-matter what the router did. That reads exactly like a healthy routed session. The script now
-checks for `jq` first and prints `STATUSLINE BLIND · jq not found on PATH · no model or Backdoor
-badge` instead of a comfortable blank.
+payload with `jq`, so a host without it printed a bare ` . shells: 0` and exited 0: no model name
+and no way to tell that was a failure. The script now checks for `jq` first and prints
+`STATUSLINE BLIND . jq not found on PATH . no model` instead of a comfortable blank.
 
 Run the fixture gate with:
 
@@ -163,9 +159,8 @@ Run the fixture gate with:
 scripts/test-statusline.sh
 ```
 
-Nineteen checks run: the five display states, five fail-closed state errors sharing one loop, a
-wrong process, a lookalike process, the missing-`jq` announcement, and a comparison proving the
-run left the breaker fixture byte-identical.
+Six checks run: the cloud model name, three stale routing environments that must not revive a
+badge, the local-model label, and the missing-`jq` announcement.
 
 Repository changes do not install the script into `~/.claude`. Installation needs a separate
 decision, a backup of the current script, a passing fixture run, `bash -n`, and an atomic rename.
