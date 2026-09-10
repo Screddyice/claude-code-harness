@@ -14,8 +14,9 @@
 #       tool call was refused before a byte was written, which is how this was
 #       found: a script that deleted nothing could not even be created.
 #
-#   The replacement anchors the command to command position (start of a line, or
-#   after a separator, sudo or xargs) and adds the one case that anchoring loses:
+#   The replacement anchors the command to command position (start of a line,
+#   after a separator or shell keyword, or behind sudo/xargs) and adds the one
+#   case that anchoring loses:
 #   `git rm` without `--cached`, which does delete from the working tree.
 #
 #   It is reapplied here because the plugin is a clone of

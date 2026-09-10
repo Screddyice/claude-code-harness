@@ -55,6 +55,9 @@ CLAUDE_PLUGIN_ROOT_DIR="$FIXTURE/plugins" bash "$PATCHER" >/dev/null 2>&1
 check deny  'rm -rf .claude-harness'                         'a bare recursive delete'
 check deny  'cd /tmp && rm -rf .claude-harness'              'a recursive delete after a separator'
 check deny  'sudo rm -rf ~/.claude-harness'                  'a recursive delete via sudo'
+check deny  'if rm -rf .claude-harness; then echo gone; fi'  'a recursive delete after a shell keyword'
+check deny  'sudo -u root rm -rf .claude-harness'            'a recursive delete via sudo with options'
+check deny  'xargs -0 rm -rf .claude-harness'                'a recursive delete via xargs with options'
 check deny  'rm -r .claude-harness/memory'                   'a recursive delete of a subdirectory'
 # Anchoring the rule to command position loses `git rm`, so it gets its own rule.
 check deny  'git rm -r .claude-harness'                      'git rm without --cached, which deletes from the tree'
