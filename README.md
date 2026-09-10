@@ -1167,8 +1167,11 @@ both other outcomes are wrong: a real Claude id 404s against Ollama, and a secon
 local tag loads a second 17 GB runner, which is the co-residency that panics this
 Mac. Codex needs none of this; it has no allowlist and takes the real tag.
 
-The wrapper also treats the alias and the canonical tag as one model, so nothing
-unloads the alias "to make room" and evicts the session using it.
+The wrapper treats the alias and the canonical tag as one model throughout. Nothing
+unloads the alias "to make room" and evicts the session using it, `qwen status`
+reports it as this model resident rather than a foreign one, and `qwen stop`
+unloads both tags. Reporting the alias as "not loaded" is how you end up holding
+17 GB you believe is free.
 
 #### Keeping 32k tokens usable
 
@@ -1203,7 +1206,7 @@ Codex settings are all `-c` overrides, so `~/.codex/config.toml` is never edited
 a session that dies leaves nothing pointing at a local model.
 
 Run `scripts/test-qwen.sh` after changing admission, locking, lease handling, or
-either agent command. Its 26 checks stub Ollama, launchd, both memory probes and
+either agent command. Its 30 checks stub Ollama, launchd, both memory probes and
 both agent binaries, so no case loads a model or starts a session.
 
 ## Migration Audit

@@ -300,15 +300,22 @@ admit() {
 
 cmd_status() {
   start_server || die "Ollama is not answering on $API"
-  local size
+  local size under
   size=$(resident_bytes || true)
+  under="$MODEL"
+  if [ -z "${size:-}" ]; then
+    # An agent session loads the same blobs under the catalog-id alias, which is
+    # this model resident, not some other model.
+    size=$(tag_resident_bytes "$CLAUDE_MODEL_ID" || true)
+    under="$CLAUDE_MODEL_ID"
+  fi
   if [ -n "${size:-}" ]; then
-    printf '%-28s resident, %s GB\n' "$MODEL" "$(gb "$size")"
+    printf '%-28s resident, %s GB (as %s)\n' "$MODEL" "$(gb "$size")" "$under"
   else
     printf '%-28s not loaded\n' "$MODEL"
   fi
   local others leases
-  others=$(resident_names | grep -v -e "^$MODEL$" -e "^$MODEL:latest$" || true)
+  others=$(other_resident_names || true)
   if [ -n "$others" ]; then
     printf 'also resident: %s\n' "$(printf '%s' "$others" | tr '\n' ' ')"
   fi
@@ -322,10 +329,13 @@ cmd_status() {
   return 0
 }
 
+# Both tags, always. `qwen stop` that leaves the alias resident holds 17 GB while
+# reporting the model unloaded, which is the worst of both.
 cmd_stop() {
   server_up || { note "Ollama is not running; nothing to unload"; return 0; }
   ollama stop "$MODEL" >/dev/null 2>&1 || true
-  note "unloaded $MODEL"
+  ollama stop "$CLAUDE_MODEL_ID" >/dev/null 2>&1 || true
+  note "unloaded $MODEL (and its $CLAUDE_MODEL_ID alias)"
 }
 
 # Shared setup for an agent session (Claude Code or Codex) on the local model.

@@ -384,6 +384,24 @@ else
   pass "the alias is never unloaded as a foreign model"
 fi
 
+# An agent session loads the blobs under the alias. Reporting that as "not loaded"
+# plus a foreign resident model is how you end up holding 17 GB you think is free.
+reset_world
+printf '{"models":[{"name":"%s:latest","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
+out=$(run_qwen status)
+case "$out" in
+  *"resident, 16.3 GB (as $ALIAS)"*) pass "status reports the alias as this model, not a foreign one" ;;
+  *) fail "status reports the alias as this model" "$out" ;;
+esac
+
+reset_world
+run_qwen stop >/dev/null
+if grep -qx "stop $MODEL" "$FIXTURE/ollama.log" && grep -qx "stop $ALIAS" "$FIXTURE/ollama.log"; then
+  pass "stop unloads both the canonical tag and the alias"
+else
+  fail "stop unloads both tags" "$(cat "$FIXTURE/ollama.log" | tr '\n' ' ')"
+fi
+
 # Codex has no model-id allowlist, so it takes the real tag over Ollama's OpenAI
 # wire, and every setting is a -c override rather than an edit to config.toml.
 reset_world
