@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# qwen — run the obliterated Qwen 3.8 27B locally by typing one word.
+#
+# WHY THIS EXISTS
+#   Backdoor was removed on 2026-09-10 and took `~/.local/bin/qwen` with it. Losing
+#   the wrapper is not the problem; losing what it did before the load is. Roughly
+#   20 GB of *wired* Metal memory lands on a 36 GB host, and wired allocations
+#   cannot be paged out — so when this model shares the machine with an llm-jury
+#   council or a background diff review, the host compresses and swaps everything
+#   else until the kernel watchdog starves and panics. That happened twice on
+#   2026-07-31. There is no catchable OOM to react to, which is why every guard
+#   here runs before the first byte is loaded.
+#
+#   LLM-Jury's memguard already knows this model by name: EXCLUSIVE_MODELS in
+#   llmjury/memguard.py is exactly {"qwen3.8:27b-obliterated"}, and every
+#   cooperating local job — the Stop-hook diff reviewer, llm-jury councils — stands
+#   down while it owns compute. memguard learns that two ways: a lease file under
+#   ~/.backdoor/compute-leases, or the model appearing in Ollama's /api/ps. This
+#   wrapper publishes the lease, because the gap between "start loading" and "ps
+#   shows it" is tens of seconds and a Stop hook fires in far less than that. It
+#   also holds the same nonblocking kernel lock the reviewer uses,
+#   ~/.cache/llmjury/local-compute.lock, so the two cannot race at all.
+#
+#   The lease directory keeps Backdoor's name because memguard's default path is
+#   what its other readers resolve; renaming it here would silently stop gating
+#   them. Override both sides together with LLMJURY_COMPUTE_LEASE_DIR if it moves.
+#
+# WHY NOT JUST GATE ON `llmjury preflight`
+#   Because it refuses this model on this host, always, and it is right to for its
+#   own callers. estimate_resident() is `disk * 1.35 + cells * 85_000`, fitted on
+#   2-9 GB models at f16 KV, so it projects 27.5 GB against a 23.4 GiB budget. This
+#   server runs OLLAMA_KV_CACHE_TYPE=q8_0 and LLAMA_ARG_CACHE_RAM=1024 — verified
+#   on the running process, not the saved plist — so the real figure is far lower.
+#   Erring high is correct when the question is "may a council pile on top". It is
+#   useless when the question is "may the exclusive owner run at all". So this
+#   wrapper does its own arithmetic, and replaces the estimate with the number
+#   `ollama ps` reports after the first successful load rather than guessing
+#   forever.
+#
+# USAGE
+#   qwen                       interactive session (Qwen/QWEN work too on APFS)
+#   qwen "explain this diff"   one-shot answer
+#   git diff | qwen -          read the prompt from stdin
+#   qwen status                what is resident, who owns compute
+#   qwen stop                  unload it now instead of waiting for keep_alive
+#
+#   --force         load even if the memory guard objects (it is advisory, not law)
+#   --keep-others   leave other resident Ollama models alone (default: unload them)
+#   --keepalive D   how long Ollama holds the model after the session (e.g. 30s, 1h)
+#   Ollama's own --think, --verbose, --hidethinking, --nowordwrap, --format pass
+#   straight through.
+set -euo pipefail
+
+MODEL="${QWEN_MODEL:-qwen3.8:27b-obliterated}"
+GB=$((1024 ** 3))
+DESKTOP_RESERVE=$((2 * GB))     # matches memguard's headroom reserve
+PROMPT_CACHE_MIB="${QWEN_PROMPT_CACHE_MIB:-1024}"   # LLAMA_ARG_CACHE_RAM on this host
+LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.backdoor/compute-leases}"
+LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
+MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen-27b}/resident-bytes"
+AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
+
+host="${OLLAMA_HOST:-127.0.0.1:11434}"
+case "$host" in http://*|https://*) API="$host" ;; *) API="http://$host" ;; esac
+
+die() { printf 'qwen: %s\n' "$*" >&2; exit 1; }
+note() { [ "${QWEN_QUIET:-0}" = 1 ] || printf 'qwen: %s\n' "$*" >&2; }
+gb() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
+
+# Probes, not assertions: `set -o pipefail` would otherwise turn an unreachable
+# server into a fatal exit inside a plain assignment, so every caller of these
+# either guards with `|| true` or tests the captured value.
+api() { curl -fsS --max-time "${2:-10}" "$API$1" 2>/dev/null; }
+
+# --- Ollama -----------------------------------------------------------------
+
+server_up() { api /api/version 1 >/dev/null 2>&1; }
+
+start_server() {
+  server_up && return 0
+  launchctl kickstart "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    server_up && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Tag -> on-disk bytes, from /api/tags. Ollama answers ":latest" for a bare tag.
+disk_bytes() {
+  api /api/tags 30 | jq -r --arg m "$MODEL" \
+    '[.models[] | select(.name == $m or .name == ($m + ":latest")) | .size][0] // empty'
+}
+
+resident_names() { api /api/ps | jq -r '.models[]?.name // empty'; }
+
+resident_bytes() {
+  api /api/ps | jq -r --arg m "$MODEL" \
+    '[.models[]? | select(.name == $m or .name == ($m + ":latest")) | .size][0] // empty'
+}
+
+is_resident() { [ -n "$(resident_bytes)" ]; }
+
+# --- memory -----------------------------------------------------------------
+
+# Darwin's level 1 is normal, 2 warning, 4 critical. `memory_pressure` without -Q
+# can deliberately *create* pressure, so -Q is not optional.
+pressure_level() { sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null; }
+
+available_bytes() {
+  local total pct
+  total=$(sysctl -n hw.memsize 2>/dev/null) || return 1
+  pct=$(memory_pressure -Q 2>/dev/null |
+    sed -n 's/.*System-wide memory free percentage: *\([0-9]\{1,3\}\)%.*/\1/p')
+  [ -n "$total" ] && [ -n "$pct" ] || return 1
+  printf '%s\n' $(( total * pct / 100 ))
+}
+
+simulator_booted() {
+  [ "${LLMJURY_ALLOW_SIMULATOR:-0}" != 0 ] && return 1
+  pgrep -qf 'CoreSimulator/Devices/.*/data' 2>/dev/null
+}
+
+# What this load will cost. A measurement from a previous run beats any formula;
+# until there is one, over-estimate — refusing a run that would have fit is an
+# annoyance, allowing one that does not takes the machine down.
+need_bytes() {
+  local measured disk slots ctx cells
+  measured=$(cat "$MEASURED" 2>/dev/null || true)
+  case "$measured" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s\n' $(( measured + PROMPT_CACHE_MIB * 1024 * 1024 )); return 0 ;;
+  esac
+  disk=$(disk_bytes) || true
+  [ -n "${disk:-}" ] || return 1
+  slots="${LLMJURY_OLLAMA_PARALLEL:-${OLLAMA_NUM_PARALLEL:-2}}"
+  ctx="${OLLAMA_CONTEXT_LENGTH:-32768}"
+  cells=$(( ctx * slots ))
+  # weights ~ disk * 1.15, and ~45 KB per KV cell at q8_0 (about half of f16).
+  printf '%s\n' $(( disk * 115 / 100 + cells * 45000 + PROMPT_CACHE_MIB * 1024 * 1024 ))
+}
+
+# Record what it actually cost, so the next run stops guessing. Runs detached,
+# because the model is still loading when the session starts — and with fd 9
+# closed, because inheriting the compute lock would leave this poller holding it
+# for two minutes after the user has already quit.
+record_resident() {
+  ( for _ in $(seq 1 60); do
+      size=$(resident_bytes 2>/dev/null || true)
+      case "$size" in
+        ''|*[!0-9]*) sleep 2 ;;
+        *) mkdir -p "$(dirname "$MEASURED")" && printf '%s\n' "$size" > "$MEASURED"; exit 0 ;;
+      esac
+    done ) >/dev/null 2>&1 9>&- &
+}
+
+# --- exclusive ownership ----------------------------------------------------
+
+lease_file=""
+lease_open() {
+  mkdir -p "$LEASE_DIR"
+  lease_file="$LEASE_DIR/qwen-$$.json"
+  printf '{"active":true,"model":"%s","pid":%d,"source":"qwen","expires_at":%d}\n' \
+    "$MODEL" "$$" "$(( $(date +%s) + 14400 ))" > "$lease_file"
+}
+lease_close() { if [ -n "$lease_file" ]; then rm -f "$lease_file"; fi; lease_file=""; }
+
+# This process execs into `ollama run`, which keeps the pid and so keeps the lease
+# accurate for exactly as long as the session lives — but skips the EXIT trap, so
+# the file outlives it. memguard already ignores a lease whose pid is gone; this
+# just stops the directory filling up with proof of that.
+lease_prune() {
+  local file pid expires now
+  now=$(date +%s)
+  for file in "$LEASE_DIR"/*.json; do
+    [ -e "$file" ] || continue
+    pid=$(jq -r '.pid // empty' "$file" 2>/dev/null || true)
+    expires=$(jq -r '.expires_at // 0' "$file" 2>/dev/null || echo 0)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "${expires%%.*}" -gt "$now" ] 2>/dev/null; then
+      continue
+    fi
+    rm -f "$file"
+  done
+}
+
+# The reviewer and cooperating councils take this same lock nonblocking, so
+# holding it for the session is what makes them skip rather than collide. The
+# kernel releases it if this process is killed; there is no stale state to clean.
+take_lock() {
+  mkdir -p "$(dirname "$LOCK_PATH")"
+  exec 9>>"$LOCK_PATH"
+  python3 - <<'PY' || return 1
+import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (BlockingIOError, OSError):
+    sys.exit(1)
+PY
+}
+
+cleanup() { lease_close; }
+trap cleanup EXIT INT TERM
+
+# --- admission --------------------------------------------------------------
+
+stop_other_models() {
+  local name stopped=0
+  while read -r name; do
+    [ -n "$name" ] || continue
+    case "$name" in "$MODEL"|"$MODEL:latest") continue ;; esac
+    note "unloading $name to make room (--keep-others keeps it)"
+    ollama stop "$name" >/dev/null 2>&1 || true
+    stopped=1
+  done < <(resident_names)
+  if [ "$stopped" = 1 ]; then sleep 2; fi
+  return 0
+}
+
+admit() {
+  local level avail need
+  if simulator_booted; then
+    die "an iOS Simulator is booted (~17.6 GB resident); quit it, or set LLMJURY_ALLOW_SIMULATOR=1"
+  fi
+  level=$(pressure_level || true)
+  if [ -n "$level" ] && [ "$level" != 1 ]; then
+    die "host memory pressure is elevated (level $level); free memory first, or pass --force"
+  fi
+  [ "$keep_others" = 1 ] || stop_other_models
+  need=$(need_bytes) || die "cannot read the model's size from Ollama; is $MODEL pulled?"
+  avail=$(available_bytes) || die "cannot read host memory; pass --force to load anyway"
+  if [ "$(( avail - DESKTOP_RESERVE ))" -lt "$need" ]; then
+    die "$MODEL needs ~$(gb "$need") GB and only $(gb $(( avail - DESKTOP_RESERVE ))) GB is free
+     after the 2 GiB desktop reserve. Close something, or pass --force.
+     A wired over-commit does not fail cleanly here — it panics the host."
+  fi
+  note "loading $MODEL (~$(gb "$need") GB, $(gb "$avail") GB free)"
+}
+
+# --- subcommands ------------------------------------------------------------
+
+cmd_status() {
+  start_server || die "Ollama is not answering on $API"
+  local size
+  size=$(resident_bytes || true)
+  if [ -n "${size:-}" ]; then
+    printf '%-28s resident, %s GB\n' "$MODEL" "$(gb "$size")"
+  else
+    printf '%-28s not loaded\n' "$MODEL"
+  fi
+  local others leases
+  others=$(resident_names | grep -v -e "^$MODEL$" -e "^$MODEL:latest$" || true)
+  if [ -n "$others" ]; then
+    printf 'also resident: %s\n' "$(printf '%s' "$others" | tr '\n' ' ')"
+  fi
+  leases=$(find "$LEASE_DIR" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ' || true)
+  printf 'compute leases: %s in %s\n' "$leases" "$LEASE_DIR"
+  if [ -s "$MEASURED" ]; then
+    printf 'measured resident: %s GB (from a previous run)\n' "$(gb "$(cat "$MEASURED")")"
+  else
+    printf 'measured resident: none yet; the first load records it\n'
+  fi
+  return 0
+}
+
+cmd_stop() {
+  server_up || { note "Ollama is not running; nothing to unload"; return 0; }
+  ollama stop "$MODEL" >/dev/null 2>&1 || true
+  note "unloaded $MODEL"
+}
+
+# --- argument parsing -------------------------------------------------------
+
+case "${1:-}" in
+  -h|--help) sed -n '/^# USAGE/,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0 ;;
+esac
+
+command -v ollama >/dev/null 2>&1 || die "ollama is not on PATH"
+command -v jq >/dev/null 2>&1 || die "jq is required to read Ollama's API"
+lease_prune
+
+force=0
+keep_others=0
+run_args=()
+prompt=""
+
+case "${1:-}" in
+  status) cmd_status; exit 0 ;;
+  stop)   cmd_stop;   exit 0 ;;
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)       force=1; shift ;;
+    --keep-others) keep_others=1; shift ;;
+    --keepalive|--format)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      run_args+=("$1" "$2"); shift 2 ;;
+    --think|--think=*|--verbose|--hidethinking|--nowordwrap)
+      run_args+=("$1"); shift ;;
+    --) shift; prompt="$*"; break ;;
+    -)  prompt="$(cat)"; shift ;;
+    -*) die "unknown option $1 (Ollama's own flags: --think --verbose --hidethinking --nowordwrap --format --keepalive)" ;;
+    *)  prompt="$*"; break ;;
+  esac
+done
+
+# A prompt on stdin with no explicit `-` is still a prompt.
+if [ -z "$prompt" ] && [ ! -t 0 ]; then prompt="$(cat)"; fi
+
+# --- run --------------------------------------------------------------------
+
+
+start_server || die "Ollama did not come up on $API (launchctl kickstart gui/$(id -u)/$AGENT_LABEL)"
+
+if is_resident; then
+  # Already loaded: this session costs no new memory, so it needs no guard, no
+  # lease (residency is memguard's own second source of truth) and no lock.
+  note "attaching to the resident $MODEL"
+else
+  disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
+  if ! take_lock; then
+    die "another local council or background review owns compute; retry when it finishes"
+  fi
+  lease_open
+  if [ "$force" = 1 ]; then
+    [ "$keep_others" = 1 ] || stop_other_models
+    note "--force: skipping the memory guard"
+  else
+    admit
+  fi
+  record_resident
+fi
+
+if [ -n "$prompt" ]; then
+  exec ollama run "${run_args[@]+"${run_args[@]}"}" "$MODEL" "$prompt"
+fi
+exec ollama run "${run_args[@]+"${run_args[@]}"}" "$MODEL"
