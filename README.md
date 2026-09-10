@@ -1222,6 +1222,66 @@ Run `scripts/test-qwen.sh` after changing admission, locking, lease handling, or
 either agent command. Its 30 checks stub Ollama, launchd, both memory probes and
 both agent binaries, so no case loads a model or starts a session.
 
+## claude-harness guard patch
+
+`scripts/hooks/harness-guard-patch.sh` runs on `SessionStart` and keeps one rule in
+the claude-harness plugin's `PreToolUse` guard from denying safe commands. It is a
+no-op once the patch is in.
+
+### What the upstream rule did
+
+The plugin blocks recursive deletion of a repo's `.claude-harness` state, which is
+right. The pattern was not: it matched the delete command anywhere in the command
+string, after any whitespace. Two things it was never aimed at got denied:
+
+- `git rm -r --cached .claude-harness`, which drops index entries and leaves every
+  file on disk. That is exactly how you stop tracking the scaffold.
+- Any script whose **comment or heredoc** merely contained the phrase. The tool call
+  was refused before a byte was written, so a script that deleted nothing could not
+  even be created. That is how this was found.
+
+### What replaces it
+
+The delete command has to sit in command position: the start of a line, after a
+separator or shell keyword, or behind `sudo`/`xargs` and their common options.
+Anchoring that way loses `git rm`, which does delete from the working tree, so
+that gets its own rule with `--cached` exempted.
+
+| Command | Before | After |
+|---------|--------|-------|
+| a bare recursive delete of the directory | deny | deny |
+| the same after `&&`, `if`, `sudo -u`, or `xargs -0` | deny | deny |
+| `git rm -r` on it, no `--cached` | deny | deny |
+| `git rm -r --cached` on it | deny | **allow** |
+| the phrase inside a comment or heredoc | deny | **allow** |
+| the phrase inside a markdown code span | deny | **allow** |
+
+That last row is its own small lesson. The first version of this patch counted a
+backtick as command position, to catch legacy command substitution. It also counts
+every markdown code span, so the guard blocked any file documenting the rule,
+including this README. `$( )` covers substitution; the backtick is gone.
+
+### Why it is reapplied every session
+
+The plugin is a clone of `panayiotism/claude-harness-marketplace` and a sync
+overwrites the file, the same reason `gstack-browser-shim.sh` runs on `SessionStart`.
+That clone's `hooks/hooks.json` already carries an unrelated local quoting fix, so
+local patching is the existing arrangement rather than a new one.
+
+The patch text lives beside the script as `harness-guard-patch.before` and
+`.after`, matched and replaced literally. If upstream rewrites the rule, the script
+reports it and changes nothing rather than guessing. Upstreaming this is the real fix.
+
+```bash
+scripts/hooks/harness-guard-patch.sh          # patch every installed copy, quietly
+scripts/hooks/harness-guard-patch.sh --check  # report status, exit 1 if stale
+scripts/test-harness-guard.sh                 # 24 checks, no installed plugin touched
+```
+
+Apply mode always exits 0: a guard one release out of date is a smaller problem than
+a hook that fails every new session. `--check` returns the real verdict, which is what
+the tests assert against.
+
 ## Migration Audit
 
 `scripts/audit-codex-migration.sh` checks the workspace without changing it. It reports:

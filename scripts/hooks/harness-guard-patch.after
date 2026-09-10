@@ -1,0 +1,19 @@
+    # Block recursive filesystem deletion of harness state.
+    #
+    # `rm` has to sit in command position: the start of a line, after a
+    # separator or shell keyword, or behind sudo/xargs. The previous rule
+    # accepted any preceding whitespace, so it also fired on the word inside a
+    # comment or a heredoc and denied entire scripts that deleted nothing.
+    if printf '%s' "$COMMAND" | grep -qE '(^|[;&|(]|\$\()[[:space:]]*((if|then|do|else|while|until)[[:space:]]+)?((sudo([[:space:]]+(-[EHknSsv]|-[ugp][[:space:]]+[^[:space:];&|]+|--[^=[:space:];&|]+(=[^[:space:];&|]+)?))*|xargs([[:space:]]+(-[0prt]|-[nPIsd][[:space:]]*[^[:space:];&|]+|--[^=[:space:];&|]+(=[^[:space:];&|]+)?))*)[[:space:]]+)?rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f?[[:space:]][^;&|]*\.claude-harness'; then
+        DENY_REASON="BLOCKED: Deleting .claude-harness would destroy all session state and memory."
+    fi
+
+    # `git rm` does delete from the working tree, and no longer matches the rule
+    # above now that it is anchored to command position. `--cached` is the safe
+    # form: it drops index entries and leaves every file where it is.
+    if printf '%s' "$COMMAND" | grep -qE 'git[[:space:]]+rm[[:space:]][^;&|]*\.claude-harness'; then
+        if ! printf '%s' "$COMMAND" | grep -qE 'git[[:space:]]+rm[^;&|]*--cached'; then
+            DENY_REASON="BLOCKED: git rm would delete .claude-harness from the working tree. Add --cached to untrack it without touching the files."
+        fi
+    fi
+
