@@ -840,6 +840,19 @@ git repository:
 If the target repo does not already have `AGENTS.md`, the script also seeds a small
 project-level starter.
 
+### The scaffold stays out of git
+
+`.gitignore` excludes `.claude-harness/` entirely, and `.claude/settings.local.json`
+with it. The claude-harness plugin writes three narrower rules of its own
+(`sessions/`, `memory/compaction-backups/`, `memory/working/`) on the assumption that
+the rest of the tree is worth sharing. On this repo it is not: the scaffold has sat
+at `"techStack": "Unknown"` with every memory file empty since 2026-08-25, so
+committing it would add 76 KB of empty JSON and a machine-local session id to the
+history. Seventeen of the twenty repos under `~/projects` already track none of it.
+
+Narrow the rule if someone populates the tree. `.claude/settings.local.json` stays
+ignored either way, since it carries hooks that execute local paths.
+
 ## Durable Cognee writes (retired 2026-09-04)
 
 The outbox, drainer and verification wrapper that lived here existed only because Cognee

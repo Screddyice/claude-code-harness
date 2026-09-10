@@ -6,3 +6,15 @@
 **/node_modules/
 **/.venv/
 **/__pycache__/
+# Claude Harness - per-repo state, none of it shared
+# The plugin writes the three narrow rules below. They are not enough: the rest of
+# the tree is a hollow scaffold on this repo (techStack "Unknown", every memory file
+# empty since 2026-08-25), so the blanket rule keeps 76 KB of empty JSON out of the
+# history. Narrow it if someone ever populates the tree.
+.claude-harness/
+.claude-harness/sessions/
+.claude-harness/memory/compaction-backups/
+.claude-harness/memory/working/
+
+# Claude Code - Local settings
+.claude/settings.local.json
