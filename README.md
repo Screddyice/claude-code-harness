@@ -1136,7 +1136,7 @@ the gate.
 client engagement in the tree, and its source has less business in a personal cloud memory service
 than TMN's or R2H's does. RS21 needs no entry: those repos live under `teamnebula-ai`, which the
 org pattern already matches.
-## Publishing credentials into the macOS GUI domain (`scripts/set-gui-env.sh`)
+## Publishing environment into the macOS GUI domain (`scripts/set-gui-env.sh`)
 
 A Dock-launched app inherits launchd's environment, not a shell's. Nothing in `~/.zshrc` and
 nothing in `~/projects/.env` reaches Codex Desktop, so its `cmem` MCP server — which declares
@@ -1160,12 +1160,27 @@ file to read. **The secret value stays in `~/projects/.env`**: it is never writt
 and the log records only the key name and a character count. A missing file or a missing key exits
 0 with a message rather than failing login.
 
+The script also publishes one derived, non-secret value: `LLMJURY_OLLAMA_PARALLEL`, read from
+`OLLAMA_NUM_PARALLEL` in Ollama's own launchd unit (`OLLAMA_PLIST` overrides the path). Ollama
+exports that setting to its server process and nowhere else, and llm-jury's memguard charges KV as
+`num_ctx x` this number, falling back to Ollama's default of 4 when it cannot see the real one. A
+GUI-launched session running the council or the diff reviewer therefore overestimates and refuses
+work without it. An absent, malformed, or zero value unsets the variable instead of publishing a
+wrong one: memguard's conservative default is the safe direction, a bad number is not. The secret
+loop and this block are independent, so a missing env file no longer skips the derived value.
+
+This moved here on 2026-09-10 from `router-gui-env.sh`, which was deleted with the Backdoor
+router. That script also health-gated `ANTHROPIC_BASE_URL` onto the router and published a Mem0
+key; both are retired, so neither came across. The example plist gained `StartInterval 3600` to
+replace its 60-second poll.
+
 The Hermes boxes deliberately do not use this. Each keeps its own mode-600 `~/.hermes/cmem.env`
 and the provider reads the environment then that file, so there is no launchd or GUI session to
 lose. Verified on `src`, `reddy2help` and `neb-ops-gcp` with `CMEM_PRO_TOKEN` explicitly unset.
 
-Tests: `scripts/test-set-gui-env.sh` (9 assertions, stubs `launchctl` so it never touches the real
-domain, and asserts the value is never printed).
+Tests: `scripts/test-set-gui-env.sh` (13 assertions, stubs `launchctl` so it never touches the
+real domain and a fixture plist so the derived value never depends on this host's Ollama setup,
+and asserts the secret value is never printed).
 
 ## Creating agent worktrees safely (`scripts/agent-worktree.sh`)
 
