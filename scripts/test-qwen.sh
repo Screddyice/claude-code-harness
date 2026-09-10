@@ -17,7 +17,7 @@ STUB="$FIXTURE/bin"
 mkdir -p "$STUB"
 # Everything the wrapper shells out to, except the six stubbed below. Linking the
 # real binaries keeps the test honest: only Ollama and the memory probes are fake.
-for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm; do
+for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm mv; do
   path=$(command -v "$tool") || continue
   ln -sf "$path" "$STUB/$tool"
 done
@@ -41,7 +41,15 @@ EOF
 cat > "$STUB/ollama" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "$FIXTURE/ollama.log"
-case "$1" in run) printf 'RAN %s\n' "$*" ;; esac
+case "$1" in
+  run) printf 'RAN %s\n' "$*" ;;
+  stop)
+    [ ! -f "$FIXTURE/stop-fails" ] || exit 42
+    if [ ! -f "$FIXTURE/stop-keeps-resident" ]; then
+      jq --arg name "$2" '.models = [.models[]? | select(.name != $name)]' \
+        "$FIXTURE/ps.json" > "$FIXTURE/ps.next" && mv "$FIXTURE/ps.next" "$FIXTURE/ps.json"
+    fi ;;
+esac
 # The wrapper execs into `ollama run`, so this is where the lease must still be
 # published: a lease that only exists before the exec protects nothing.
 if [ "$1" = run ] && [ -n "$(find "$FIXTURE/leases" -maxdepth 1 -name '*.json' 2>/dev/null)" ]; then
@@ -85,7 +93,7 @@ reset_world() {
   echo '{"models":[]}' > "$FIXTURE/ps.json"
   echo 1 > "$FIXTURE/pressure"
   echo 80 > "$FIXTURE/free_pct"
-  rm -f "$FIXTURE/simulator" "$FIXTURE/ollama.log"
+  rm -f "$FIXTURE/simulator" "$FIXTURE/ollama.log" "$FIXTURE/stop-fails" "$FIXTURE/stop-keeps-resident"
   rm -rf "$FIXTURE/leases" "$FIXTURE/state"
   mkdir -p "$FIXTURE/leases" "$FIXTURE/state"
 }
@@ -94,6 +102,7 @@ run_qwen() {
   env -i PATH="$STUB" HOME="$FIXTURE" FIXTURE="$FIXTURE" \
     OLLAMA_HOST=127.0.0.1:11434 \
     QWEN_STATE_DIR="$FIXTURE/state" \
+    QWEN_EVICTION_TIMEOUT="${QWEN_EVICTION_TIMEOUT:-30}" \
     LLMJURY_COMPUTE_LEASE_DIR="$FIXTURE/leases" \
     LLMJURY_LOCAL_LOCK="$FIXTURE/compute.lock" \
     bash "$QWEN" "$@" 2>&1
@@ -179,6 +188,26 @@ if grep -q '^stop gemma3:12b$' "$FIXTURE/ollama.log"; then
 else
   fail "another resident model is unloaded first" "$(cat "$FIXTURE/ollama.log")"
 fi
+
+reset_world
+printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
+touch "$FIXTURE/stop-fails"
+out=$(run_qwen "hello")
+case "$out" in
+  *"failed to unload gemma3:12b"*"RAN run"*) fail "failed eviction refuses the load" "$out" ;;
+  *"failed to unload gemma3:12b"*) pass "failed eviction refuses the load" ;;
+  *) fail "failed eviction refuses the load" "$out" ;;
+esac
+
+reset_world
+printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
+touch "$FIXTURE/stop-keeps-resident"
+QWEN_EVICTION_TIMEOUT=0 out=$(run_qwen "hello")
+case "$out" in
+  *"timed out waiting for Ollama to unload: gemma3:12b"*"RAN run"*) fail "incomplete eviction refuses the load" "$out" ;;
+  *"timed out waiting for Ollama to unload: gemma3:12b"*) pass "incomplete eviction refuses the load" ;;
+  *) fail "incomplete eviction refuses the load" "$out" ;;
+esac
 
 reset_world
 printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
