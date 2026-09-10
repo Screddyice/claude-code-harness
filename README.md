@@ -37,6 +37,8 @@ codex-harness/
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   ├── gbrowse                       # headed-browser wrapper that survives a session
+│   ├── qwen                          # loads the exclusive 27B without panicking the Mac
+│   ├── test-qwen.sh                  # admission, lock and lease tests (loads no model)
 │   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
 │   ├── dns-postflight.sh             # did the cutover land, and did mail survive
 │   ├── kernel-zone-watchdog.sh       # catches a kernel zone-map leak before it panics the Mac
@@ -991,7 +993,8 @@ can point to the CLI executable when it is not on PATH.
 The reviewer and cooperating councils hold the same nonblocking kernel lock,
 `~/.cache/llmjury/local-compute.lock`, through admission and inference. Set
 `LLMJURY_LOCAL_LOCK` consistently across clients to override it. Direct Ollama
-callers outside this protocol can still compete for memory.
+callers outside this protocol can still compete for memory. `scripts/qwen` joins
+the protocol: while it owns the 27B, this reviewer skips.
 
 A skipped or failed review does not consume the diff hash or start its cooldown.
 Only a nonempty successful response records those markers, so the next turn can
@@ -1038,6 +1041,173 @@ something; moving the reviewer to `SessionEnd` would leave no session to wake.
 
 Run `scripts/test-local-diff-review-cooldown.sh` after changing the cooldown or
 cache-key logic.
+
+## Running the 27B locally (`scripts/qwen`)
+
+Type `qwen` and the obliterated Qwen 3.8 27B answers. `Qwen` and `QWEN` reach the
+same file, because the boot volume is case-insensitive APFS.
+
+```
+qwen                        interactive session
+qwen "explain this diff"    one-shot answer
+git diff | qwen -           prompt from stdin
+qwen status                 what is resident, who owns compute
+qwen stop                   unload now instead of waiting out keep_alive
+```
+
+Install it the way `gbrowse` installs:
+
+```bash
+ln -sfn "$PWD/scripts/qwen" ~/.local/bin/qwen
+```
+
+### Why a wrapper instead of `ollama run`
+
+Backdoor was removed on 2026-09-10 and took `~/.local/bin/qwen` with it. What the
+wrapper did before the load matters more than the wrapper. This tag puts 16.3 GB of
+wired Metal memory on a 36 GB Mac, and wired pages cannot swap out. Put an llm-jury
+council or a background diff review beside it and the host compresses everything
+else until the kernel watchdog starves and panics, which it did twice on
+2026-07-31. Nothing sees a catchable out-of-memory error, so every guard here runs
+before the first byte loads.
+
+LLM-Jury's memguard already names this model: `EXCLUSIVE_MODELS` is exactly
+`{"qwen3.8:27b-obliterated"}`. Cooperating local jobs stand down while it owns
+compute, and they learn that two ways, from a lease file under
+`~/.backdoor/compute-leases` or from the model appearing in Ollama's `/api/ps`.
+`scripts/qwen` publishes the lease, because Ollama needs tens of seconds to load
+this model and a Stop hook fires in far less. It also holds
+`~/.cache/llmjury/local-compute.lock`, the same nonblocking lock the reviewer
+takes, so the two never race.
+
+The lease directory keeps Backdoor's name on purpose. memguard's other readers
+resolve that default path, and renaming it here would quietly stop gating them.
+Move both sides together with `LLMJURY_COMPUTE_LEASE_DIR`.
+
+### Why the guard is not `llmjury preflight`
+
+`llmjury preflight --models qwen3.8:27b-obliterated --num-ctx 32768` refuses on
+this host every time, and it is right to for its own callers. `estimate_resident()`
+is `disk * 1.35 + cells * 85_000`, fitted on 2-9 GB models at f16 KV, so it
+projects 27.5 GB against a 23.4 GiB budget. This server runs
+`OLLAMA_KV_CACHE_TYPE=q8_0` and `LLAMA_ARG_CACHE_RAM=1024`, read off the running
+process rather than the saved plist, so `ollama ps` reports 16.3 GB. Erring high is
+correct when you are asking whether a council may pile on top. It answers nothing
+when you are asking whether the exclusive owner may run at all.
+
+So the wrapper does its own arithmetic. Before a load it checks:
+
+| Condition | Source | Why |
+|-----------|--------|-----|
+| No booted iOS Simulator | `pgrep` | 17.6 GB of CoreSimulator measured on this host |
+| Memory pressure at level 1 | `kern.memorystatus_vm_pressure_level` | memguard's own refusal condition |
+| Free memory covers the load plus 2 GiB | `memory_pressure -Q` | the desktop reserve memguard keeps |
+| Nothing else resident in Ollama | `/api/ps` | co-residency is what panicked the Mac |
+
+Another resident model gets unloaded rather than tolerated. Pass `--keep-others` to
+leave it alone, or `--force` to load past every check above.
+
+The opening estimate is deliberately high, `disk * 1.15 + cells * 45_000` plus the
+1 GiB prompt cache, or about 22.7 GB. Once a load succeeds the wrapper writes what
+`/api/ps` reported into `~/.cache/qwen-27b/resident-bytes` and uses that number
+from then on. Delete the file to re-measure after changing `num_ctx`,
+`OLLAMA_NUM_PARALLEL`, or the KV cache type.
+
+A second `qwen` while the model is already resident costs no new memory, so it
+attaches without taking the lock, publishing a lease, or running the guard.
+
+`ollama run` replaces the wrapper process. That keeps the pid, which keeps the
+lease accurate for exactly as long as the session lives, and it skips the exit
+trap, which leaves the lease file behind. memguard ignores a lease whose pid is
+gone, and the next `qwen` run deletes it.
+
+### Agent sessions: `qwen claude` and `qwen codex`
+
+Both run a full agent session against the local model, with the same guard, lease
+and lock as everything else here. There is no failover in either direction. You
+asked for the local model, so you get the local model until you quit; Backdoor
+swapped tiers under a live session, which is what made it unreliable enough to
+delete.
+
+```
+qwen claude                    Claude Code on the 27B, cmem wired in
+qwen codex                     Codex on the 27B, cmem wired in
+  --mcp cmem|none|all          MCP servers (default: cmem)
+  --tools mcp|lean|all         built-in tools alongside MCP (default: mcp)
+```
+
+Ollama 0.32 serves the Anthropic Messages API at `/v1/messages`: correct envelope,
+`tool_use` blocks, thinking blocks, SSE streaming, and it ignores the auth headers.
+Codex goes over the OpenAI-compatible `/v1` instead. Neither needs the translation
+proxy Backdoor's `:8083` provided, so nothing gets rebuilt.
+
+#### The model id is the catch
+
+Claude Code 2.1.267 validates the session model against its own compiled catalog
+and answers `[claude-code:unrecognized_model]` for anything else, wherever
+`ANTHROPIC_BASE_URL` points. Measured on this host, in order:
+
+| Attempt | Result |
+|---------|--------|
+| `ANTHROPIC_MODEL=qwen3.8:27b-obliterated` | refused |
+| a claude-shaped tag, `claude-qwen-27b` | refused |
+| plus `ANTHROPIC_CUSTOM_MODEL_OPTION` | refused |
+| plus `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | refused |
+| the same blobs under a catalog id | worked first try |
+
+So `qwen claude` runs `ollama cp qwen3.8:27b-obliterated claude-haiku-4-5-20251001`
+once. That copies the manifest, not the weights: the measured delta on this host
+was 0 KB, both tags carry ID `2d93c6242422`, and Ollama keeps one runner for them.
+Override the id with `QWEN_CLAUDE_MODEL_ID`.
+
+Every model slot — `ANTHROPIC_MODEL`, the Opus, Sonnet and Haiku defaults,
+`ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` — points at that one
+alias. Claude Code resolves its background work separately from the main model, and
+both other outcomes are wrong: a real Claude id 404s against Ollama, and a second
+local tag loads a second 17 GB runner, which is the co-residency that panics this
+Mac. Codex needs none of this; it has no allowlist and takes the real tag.
+
+The wrapper treats the alias and the canonical tag as one model throughout. Nothing
+unloads the alias "to make room" and evicts the session using it, `qwen status`
+reports it as this model resident rather than a foreign one, and `qwen stop`
+unloads both tags. Reporting the alias as "not loaded" is how you end up holding
+17 GB you believe is free.
+
+#### Keeping 32k tokens usable
+
+Tool schemas are the largest thing competing with your actual work for this window,
+so both defaults are narrow:
+
+- `--mcp cmem` loads claude-mem's hosted recall and nothing else. `--mcp all` loads
+  every server in `~/.claude.json` (14 of them) or `~/.codex/config.toml` (13), which
+  will crowd the window. `--mcp none` loads nothing.
+- `--tools mcp` drops the built-in tool surface and leaves MCP as the tool layer.
+  `--tools lean` keeps file and shell tools and drops the web and subagent ones.
+  `--tools all` restricts nothing.
+
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is pinned to the model's own context, and
+`CLAUDE_CODE_NO_MODEL_FALLBACK=1` stops Claude Code substituting another model.
+
+#### claude-mem
+
+The capture and injection hooks in `~/.claude/settings.json` fire in a local session
+like any other, so the session is recorded and past context is injected without any
+extra wiring. Recall is the `cmem` MCP server, which both agent commands add by
+default.
+
+Neither command copies the token. Claude Code expands `${VAR}` inside
+`--mcp-config` (verified on this host), so the generated config carries
+`Bearer ${CMEM_PRO_TOKEN}` and never a value; Codex takes `bearer_token_env_var`
+and looks the variable up itself. `CMEM_PRO_TOKEN` comes from the environment, or
+from `~/projects/.env` when it is not exported. `ANTHROPIC_API_KEY` is dropped
+rather than forwarded, since a local server has no use for the real key.
+
+Codex settings are all `-c` overrides, so `~/.codex/config.toml` is never edited and
+a session that dies leaves nothing pointing at a local model.
+
+Run `scripts/test-qwen.sh` after changing admission, locking, lease handling, or
+either agent command. Its 30 checks stub Ollama, launchd, both memory probes and
+both agent binaries, so no case loads a model or starts a session.
 
 ## Migration Audit
 
