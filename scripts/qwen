@@ -43,6 +43,11 @@
 #   git diff | qwen -          read the prompt from stdin
 #   qwen status                what is resident, who owns compute
 #   qwen stop                  unload it now instead of waiting for keep_alive
+#   qwen claude [args]         a Claude Code session running on this model
+#   qwen codex  [args]         a Codex session running on this model
+#
+#   --mcp cmem|none|all        MCP servers for an agent session (default: cmem)
+#   --tools mcp|lean|all       built-in tools alongside MCP (default: mcp)
 #
 #   --force         load even if the memory guard objects (it is advisory, not law)
 #   --keep-others   leave other resident Ollama models alone (default: unload them)
@@ -59,6 +64,11 @@ LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.backdoor/compute-leases}"
 LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
 MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen-27b}/resident-bytes"
 AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
+# Claude Code refuses any model id outside its compiled catalog, whatever
+# ANTHROPIC_BASE_URL points at, so the local weights are served under a catalog id.
+# See cmd_claude for why this is the only way in and why nothing else worked.
+CLAUDE_MODEL_ID="${QWEN_CLAUDE_MODEL_ID:-claude-haiku-4-5-20251001}"
+CMEM_URL="${QWEN_CMEM_URL:-https://cmem.ai/api/mcp}"
 
 host="${OLLAMA_HOST:-127.0.0.1:11434}"
 case "$host" in http://*|https://*) API="$host" ;; *) API="http://$host" ;; esac
@@ -94,13 +104,49 @@ disk_bytes() {
 
 resident_names() { api /api/ps | jq -r '.models[]?.name // empty'; }
 
+# The alias tag and the canonical tag are one model on one set of blobs. Nothing
+# may treat the alias as a foreign model: unloading it "to make room" would evict
+# the very session that is using it.
+same_model() {
+  local name="${1%:latest}"
+  [ "$name" = "${MODEL%:latest}" ] || [ "$name" = "${CLAUDE_MODEL_ID%:latest}" ]
+}
+
 other_resident_names() {
   local name
   while read -r name; do
     [ -n "$name" ] || continue
-    case "$name" in "$MODEL"|"$MODEL:latest") continue ;; esac
+    if same_model "$name"; then continue; fi
     printf '%s\n' "$name"
   done < <(resident_names)
+}
+
+tag_resident_bytes() {
+  api /api/ps | jq -r --arg m "${1%:latest}" \
+    '[.models[]? | select((.name | sub(":latest$";"")) == $m) | .size][0] // empty'
+}
+
+# `ollama cp` copies the manifest, not the weights: measured delta on this host
+# was 0 KB. Both tags share ID 2d93c6242422, and Ollama keeps one runner for them.
+ensure_alias() {
+  if api /api/tags 30 | jq -e --arg a "${CLAUDE_MODEL_ID%:latest}" \
+      '[.models[]? | select((.name | sub(":latest$";"")) == $a)] | length > 0' >/dev/null 2>&1; then
+    return 0
+  fi
+  note "creating the Ollama alias $CLAUDE_MODEL_ID -> $MODEL (manifest copy, no extra disk)"
+  ollama cp "$MODEL" "$CLAUDE_MODEL_ID" >/dev/null 2>&1 ||
+    die "could not create the alias tag $CLAUDE_MODEL_ID"
+}
+
+# claude-mem's hosted recall. The token is referenced, never copied: Claude Code
+# expands ${VAR} inside --mcp-config (verified), and Codex takes an env var name,
+# so no secret value lands in a file, an argv or this repo.
+ensure_cmem_token() {
+  if [ -z "${CMEM_PRO_TOKEN:-}" ] && [ -r "$HOME/projects/.env" ]; then
+    CMEM_PRO_TOKEN=$(sed -n 's/^CMEM_PRO_TOKEN=//p' "$HOME/projects/.env" | head -1 | tr -d "\"'")
+    export CMEM_PRO_TOKEN
+  fi
+  [ -n "${CMEM_PRO_TOKEN:-}" ]
 }
 
 resident_bytes() {
@@ -108,7 +154,7 @@ resident_bytes() {
     '[.models[]? | select(.name == $m or .name == ($m + ":latest")) | .size][0] // empty'
 }
 
-is_resident() { [ -n "$(resident_bytes)" ]; }
+is_resident() { [ -n "$(resident_bytes)" ] || [ -n "$(tag_resident_bytes "$CLAUDE_MODEL_ID")" ]; }
 
 # --- memory -----------------------------------------------------------------
 
@@ -282,6 +328,145 @@ cmd_stop() {
   note "unloaded $MODEL"
 }
 
+# Shared setup for an agent session (Claude Code or Codex) on the local model.
+#
+# NO FAILOVER, BY DESIGN. Backdoor's :8083 proxy watched a circuit breaker and
+# swapped tiers underneath a live session, which is what made it unreliable and got
+# it deleted on 2026-09-10. This does none of that: you ask for the local model,
+# you get the local model for the whole session, and CLAUDE_CODE_NO_MODEL_FALLBACK
+# stops Claude Code substituting another one behind your back. To go back to the
+# cloud, quit and start a plain `claude`.
+mcp_spec="cmem"
+tools_mode="mcp"
+
+parse_agent_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force)       force=1; shift ;;
+      --keep-others) keep_others=1; shift ;;
+      --mcp)   [ $# -ge 2 ] || die "--mcp needs cmem, none or all"; mcp_spec=$2; shift 2 ;;
+      --tools) [ $# -ge 2 ] || die "--tools needs mcp, lean or all"; tools_mode=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  AGENT_ARGS=("$@")
+}
+
+agent_admit() {
+  if is_resident; then
+    note "attaching to the resident $MODEL"
+    return 0
+  fi
+  disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
+  take_lock || die "another local council or background review owns compute; retry when it finishes"
+  lease_open
+  if [ "$force" = 1 ]; then
+    if [ "$keep_others" != 1 ]; then stop_other_models; fi
+    note "--force: skipping the memory guard"
+  else
+    admit
+  fi
+  record_resident
+}
+
+# `qwen claude` — Claude Code with this model behind it.
+#
+# Ollama 0.32 serves the Anthropic Messages API at /v1/messages: correct envelope,
+# tool_use blocks, thinking blocks, SSE streaming, and it ignores the auth headers.
+# That is what Backdoor's proxy existed to translate, so there is no proxy here.
+#
+# The model id is the catch. Claude Code 2.1.267 validates the session model against
+# its own compiled catalog and answers [claude-code:unrecognized_model] for anything
+# else, no matter where ANTHROPIC_BASE_URL points. Measured on this host, in order:
+# the raw tag `qwen3.8:27b-obliterated` was refused; a claude-shaped tag
+# `claude-qwen-27b` was refused; adding ANTHROPIC_CUSTOM_MODEL_OPTION was refused;
+# adding CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY was refused. Serving the same
+# blobs under a catalog id worked on the first try. Hence the alias.
+#
+# Every model slot points at that one alias on purpose. Claude Code resolves its
+# background work — subagents, the small fast model — separately from the main one,
+# and both other outcomes are wrong: a real Claude id 404s against Ollama, and a
+# second local tag loads a second 17 GB runner, which is the co-residency that
+# panics this host.
+cmd_claude() {
+  parse_agent_opts "$@"
+  command -v claude >/dev/null 2>&1 || die "claude is not on PATH"
+  start_server || die "Ollama did not come up on $API"
+  ensure_alias
+  agent_admit
+
+  local ctx="${OLLAMA_CONTEXT_LENGTH:-32768}"
+  local -a extra=()
+
+  case "$mcp_spec" in
+    none) extra+=(--strict-mcp-config --mcp-config '{"mcpServers":{}}') ;;
+    all)  note "loading every MCP server in ~/.claude.json; their tool schemas will crowd a ${ctx}-token window" ;;
+    cmem)
+      ensure_cmem_token || die "CMEM_PRO_TOKEN is not set and not readable from ~/projects/.env; use --mcp none or --mcp all"
+      extra+=(--strict-mcp-config --mcp-config
+        "$(jq -nc --arg u "$CMEM_URL" '{mcpServers:{cmem:{type:"http",url:$u,headers:{Authorization:"Bearer ${CMEM_PRO_TOKEN}"}}}}')") ;;
+    *) die "--mcp takes cmem, none or all (got \"$mcp_spec\")" ;;
+  esac
+
+  # Tool schemas are the largest thing competing with your actual work for these
+  # 32k tokens, so the default keeps MCP and drops the built-in surface.
+  case "$tools_mode" in
+    mcp)  extra+=(--disallowed-tools "Bash Read Write Edit NotebookEdit Glob Grep WebFetch WebSearch Task TodoWrite") ;;
+    lean) extra+=(--disallowed-tools "WebFetch WebSearch Task NotebookEdit") ;;
+    all)  ;;
+    *) die "--tools takes mcp, lean or all (got \"$tools_mode\")" ;;
+  esac
+
+  note "claude on $MODEL as $CLAUDE_MODEL_ID, ${ctx}-token window, mcp=$mcp_spec tools=$tools_mode"
+  note "no failover: this session stays local until you quit it"
+  # ANTHROPIC_API_KEY is dropped rather than forwarded. A local server has no use
+  # for the real key and no reason to see it.
+  exec env -u ANTHROPIC_API_KEY \
+    ANTHROPIC_BASE_URL="$API" \
+    ANTHROPIC_AUTH_TOKEN=ollama-local \
+    ANTHROPIC_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_SMALL_FAST_MODEL="$CLAUDE_MODEL_ID" \
+    CLAUDE_CODE_SUBAGENT_MODEL="$CLAUDE_MODEL_ID" \
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" \
+    CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 \
+    CLAUDE_CODE_NO_MODEL_FALLBACK=1 \
+    claude "${extra[@]+"${extra[@]}"}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+}
+
+# `qwen codex` — Codex against the same server, through Ollama's OpenAI-compatible
+# /v1. Codex has no model-id allowlist, so it uses the real tag and needs no alias.
+# Every override is a -c flag: ~/.codex/config.toml is never edited, so a session
+# that dies leaves nothing pointing at a local model.
+cmd_codex() {
+  parse_agent_opts "$@"
+  local codex_bin
+  codex_bin=$(command -v codex) || die "codex is not on PATH"
+  start_server || die "Ollama did not come up on $API"
+  agent_admit
+
+  local -a extra=(
+    -c "model_providers.qwen.name=Qwen (local Ollama)"
+    -c "model_providers.qwen.base_url=$API/v1"
+    -c "model_providers.qwen.wire_api=chat"
+    -c "model_provider=qwen"
+    -m "$MODEL"
+  )
+  case "$mcp_spec" in
+    none) extra+=(-c 'mcp_servers={}') ;;
+    all)  note "keeping every MCP server in ~/.codex/config.toml; their schemas will crowd the window" ;;
+    cmem)
+      ensure_cmem_token || die "CMEM_PRO_TOKEN is not set and not readable from ~/projects/.env; use --mcp none or --mcp all"
+      extra+=(-c "mcp_servers={\"cmem\":{\"url\":\"$CMEM_URL\",\"bearer_token_env_var\":\"CMEM_PRO_TOKEN\"}}") ;;
+    *) die "--mcp takes cmem, none or all (got \"$mcp_spec\")" ;;
+  esac
+
+  note "codex on $MODEL, mcp=$mcp_spec; no failover, and ~/.codex/config.toml is untouched"
+  exec "$codex_bin" "${extra[@]}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+}
+
 # --- argument parsing -------------------------------------------------------
 
 case "${1:-}" in
@@ -300,6 +485,8 @@ prompt=""
 case "${1:-}" in
   status) cmd_status; exit 0 ;;
   stop)   cmd_stop;   exit 0 ;;
+  claude) shift; cmd_claude "$@" ;;
+  codex)  shift; cmd_codex  "$@" ;;
 esac
 
 while [ $# -gt 0 ]; do

@@ -1121,9 +1121,90 @@ lease accurate for exactly as long as the session lives, and it skips the exit
 trap, which leaves the lease file behind. memguard ignores a lease whose pid is
 gone, and the next `qwen` run deletes it.
 
-Run `scripts/test-qwen.sh` after changing admission, locking, or lease handling.
-Its thirteen checks stub Ollama, launchd and both memory probes, so no case loads a
-model.
+### Agent sessions: `qwen claude` and `qwen codex`
+
+Both run a full agent session against the local model, with the same guard, lease
+and lock as everything else here. There is no failover in either direction. You
+asked for the local model, so you get the local model until you quit; Backdoor
+swapped tiers under a live session, which is what made it unreliable enough to
+delete.
+
+```
+qwen claude                    Claude Code on the 27B, cmem wired in
+qwen codex                     Codex on the 27B, cmem wired in
+  --mcp cmem|none|all          MCP servers (default: cmem)
+  --tools mcp|lean|all         built-in tools alongside MCP (default: mcp)
+```
+
+Ollama 0.32 serves the Anthropic Messages API at `/v1/messages`: correct envelope,
+`tool_use` blocks, thinking blocks, SSE streaming, and it ignores the auth headers.
+Codex goes over the OpenAI-compatible `/v1` instead. Neither needs the translation
+proxy Backdoor's `:8083` provided, so nothing gets rebuilt.
+
+#### The model id is the catch
+
+Claude Code 2.1.267 validates the session model against its own compiled catalog
+and answers `[claude-code:unrecognized_model]` for anything else, wherever
+`ANTHROPIC_BASE_URL` points. Measured on this host, in order:
+
+| Attempt | Result |
+|---------|--------|
+| `ANTHROPIC_MODEL=qwen3.8:27b-obliterated` | refused |
+| a claude-shaped tag, `claude-qwen-27b` | refused |
+| plus `ANTHROPIC_CUSTOM_MODEL_OPTION` | refused |
+| plus `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | refused |
+| the same blobs under a catalog id | worked first try |
+
+So `qwen claude` runs `ollama cp qwen3.8:27b-obliterated claude-haiku-4-5-20251001`
+once. That copies the manifest, not the weights: the measured delta on this host
+was 0 KB, both tags carry ID `2d93c6242422`, and Ollama keeps one runner for them.
+Override the id with `QWEN_CLAUDE_MODEL_ID`.
+
+Every model slot — `ANTHROPIC_MODEL`, the Opus, Sonnet and Haiku defaults,
+`ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` — points at that one
+alias. Claude Code resolves its background work separately from the main model, and
+both other outcomes are wrong: a real Claude id 404s against Ollama, and a second
+local tag loads a second 17 GB runner, which is the co-residency that panics this
+Mac. Codex needs none of this; it has no allowlist and takes the real tag.
+
+The wrapper also treats the alias and the canonical tag as one model, so nothing
+unloads the alias "to make room" and evicts the session using it.
+
+#### Keeping 32k tokens usable
+
+Tool schemas are the largest thing competing with your actual work for this window,
+so both defaults are narrow:
+
+- `--mcp cmem` loads claude-mem's hosted recall and nothing else. `--mcp all` loads
+  every server in `~/.claude.json` (14 of them) or `~/.codex/config.toml` (13), which
+  will crowd the window. `--mcp none` loads nothing.
+- `--tools mcp` drops the built-in tool surface and leaves MCP as the tool layer.
+  `--tools lean` keeps file and shell tools and drops the web and subagent ones.
+  `--tools all` restricts nothing.
+
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is pinned to the model's own context, and
+`CLAUDE_CODE_NO_MODEL_FALLBACK=1` stops Claude Code substituting another model.
+
+#### claude-mem
+
+The capture and injection hooks in `~/.claude/settings.json` fire in a local session
+like any other, so the session is recorded and past context is injected without any
+extra wiring. Recall is the `cmem` MCP server, which both agent commands add by
+default.
+
+Neither command copies the token. Claude Code expands `${VAR}` inside
+`--mcp-config` (verified on this host), so the generated config carries
+`Bearer ${CMEM_PRO_TOKEN}` and never a value; Codex takes `bearer_token_env_var`
+and looks the variable up itself. `CMEM_PRO_TOKEN` comes from the environment, or
+from `~/projects/.env` when it is not exported. `ANTHROPIC_API_KEY` is dropped
+rather than forwarded, since a local server has no use for the real key.
+
+Codex settings are all `-c` overrides, so `~/.codex/config.toml` is never edited and
+a session that dies leaves nothing pointing at a local model.
+
+Run `scripts/test-qwen.sh` after changing admission, locking, lease handling, or
+either agent command. Its 26 checks stub Ollama, launchd, both memory probes and
+both agent binaries, so no case loads a model or starts a session.
 
 ## Migration Audit
 
