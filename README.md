@@ -139,6 +139,33 @@ while sharing one Codex setup.
 | Claude plugin marketplace | `.agents/plugins/marketplace.json` and `codex plugin marketplace add` |
 | Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
 
+## `qwen` agent sessions know what tools they have
+
+`qwen claude` and `qwen codex` now default to `--tools lean`, and append
+`prompts/qwen-tools.md` to the session's system prompt.
+
+Both halves were missing, and together they produced a specific failure: the model
+would answer *"Pulling the latest HyperCrawl from the repo now"* and then nothing
+happened. The old default, `--tools mcp`, disallowed `Bash Read Write Edit Glob Grep`
+— so it had no way to pull anything — and nothing in its context said the tools it did
+have were real rather than a description of what someone else would do. A local model
+with no briefing narrates the action instead of taking it, and that reads exactly like
+work being done.
+
+`lean` keeps `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep` and `TodoWrite`, dropping
+only `WebFetch`, `WebSearch`, `Task` and `NotebookEdit`. The brief costs about **428
+tokens, 1.3% of a 32K window** — cheap against one confidently invented answer.
+
+It states two rules plainly: never claim an action without calling a tool, and read the
+file rather than answering from memory about a specific codebase. Then a short table of
+which tool suits which question, and an explicit list of what the model does *not* have,
+because "I cannot reach that" is a useful answer and a confident guess is not.
+
+Override per session with `--tools mcp` (the old lean-window behaviour) or `--tools all`.
+The brief is skipped under `--tools mcp`, where most of what it describes is unavailable.
+
+---
+
 ## Claude status line
 
 `scripts/statusline.sh` is the canonical source for Claude's optional status line. It prints the
