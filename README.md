@@ -145,15 +145,43 @@ while sharing one Codex setup.
 session model, the working directory, and the shell and legion worker counts. A model served
 locally shows as `QWEN LOCAL`; every other model shows its own name.
 
-Backdoor was removed from this machine on 2026-09-10, and the routing badges went with it. The
-script no longer reads `$HOME/.backdoor/failover-state.json`, no longer inspects
-`ANTHROPIC_BASE_URL` or `HTTPS_PROXY`, and can no longer print `BACKDOOR ON` or `BACKDOOR OFF`.
-A stale proxy variable left over from the router changes nothing about what it renders.
+### The local-tier badge
+
+When the router fails a session over to local weights, the status line shows
+`LOCAL TIER . Anthropic down` in place of the model name.
+
+It replaces the name rather than sitting beside it, because during a failover the name is the one
+thing on the line that is false: Claude Code still believes it is talking to its configured cloud
+model and has no idea the router answered from Ollama. Showing both would print the lie and the
+correction side by side.
+
+This badge exists because the router's notification cannot cover the whole problem. The router
+already notifies on both transitions — into local and back to cloud — but those notices are rate
+limited by `failover_notify_cooldown_seconds` (900s). A second outage inside that window moves the
+session to local and back with **no notification at all**, which is the silent switch people
+actually hit. Notifications report events; this reports state, and state is the half a cooldown
+cannot suppress.
+
+Three independent conditions are required, each closing a different way to lie:
+
+| Condition | What it prevents |
+|---|---|
+| This session is routed through the router (`:8083` base URL or `:8084` proxy, read from the env or walked up the process ancestry) | Breaker state is global to the router, so a session talking directly to Anthropic must not inherit a badge from one that is routed |
+| `failover_active` is true **for `anthropic`** in `$HOME/.backdoor/failover-state.json` | A Codex failover says nothing about a Claude session |
+| The file's `pid` is alive **and is really the router** | A state file outlives the process that wrote it, and a recycled pid would otherwise resurrect a badge for a router that is gone |
+
+Anything invalid, unreadable, or unverifiable fails closed and renders no badge. A stale proxy
+variable left over from a retired router still changes nothing, because the environment alone was
+never sufficient.
+
+There is deliberately **no "off" badge.** The retired `BACKDOOR OFF` printed on every ordinary
+session and told nobody anything; the normal case does not need a label.
 
 `jq` is a hard dependency, and a missing one used to be invisible. The script parses the session
 payload with `jq`, so a host without it printed a bare ` . shells: 0` and exited 0: no model name
 and no way to tell that was a failure. The script now checks for `jq` first and prints
-`STATUSLINE BLIND . jq not found on PATH . no model` instead of a comfortable blank.
+`STATUSLINE BLIND . jq not found on PATH . no model or local-tier badge` instead of a
+comfortable blank.
 
 Run the fixture gate with:
 
