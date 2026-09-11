@@ -428,7 +428,11 @@ cmd_claude() {
   # 32k tokens, so the default keeps MCP and drops the built-in surface.
   case "$tools_mode" in
     mcp)  extra+=(--disallowed-tools "Bash Read Write Edit NotebookEdit Glob Grep WebFetch WebSearch Task TodoWrite") ;;
-    lean) extra+=(--disallowed-tools "WebFetch WebSearch Task NotebookEdit") ;;
+    # WebSearch stays out: it is an Anthropic server-side tool, and this session
+    # talks to Ollama, so offering it would hand the model a tool that can only
+    # error. WebFetch is client-side -- Claude Code retrieves the page and the
+    # LOCAL model reads it -- so it works here and is how the model sees a URL.
+    lean) extra+=(--disallowed-tools "WebSearch Task NotebookEdit") ;;
     all)  ;;
     *) die "--tools takes mcp, lean or all (got \"$tools_mode\")" ;;
   esac
