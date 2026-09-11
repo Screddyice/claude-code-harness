@@ -113,6 +113,43 @@ feat/nebby-verdict-routing  -> hotfix/nebby-slack-backoff  (7 commits, not 16)
 hotfix/nebby-slack-backoff  -> main                        (escape hatch)
 ```
 
+## team-context memory auto-sync
+
+`scripts/hooks/team-context-autosync.sh` is a **Stop** hook that commits and pushes
+`memory/` and `projects-context/` in `~/TeamNebula/team-context` to whatever branch
+that repo is currently on. Register it in `~/.claude/settings.json` with
+`"async": true` so it never delays session end.
+
+```bash
+scripts/hooks/team-context-autosync.sh status   # branch, pause state, pending, recent runs
+scripts/hooks/team-context-autosync.sh now      # sync immediately, ignoring the pause flag
+scripts/hooks/team-context-autosync.sh pause    # stop auto-syncing
+scripts/hooks/team-context-autosync.sh resume
+```
+
+**Why this exists.** It replaces tmn-skills' `memory-autosync.sh`, which stopped
+running on 2026-08-31 when the tree it lived in (`~/moonshot/...`) ceased to exist.
+Nothing noticed for ten days: 22 episodic records piled up uncommitted, and the
+log's final lines were *successes*, so there was no failure to find. Its last run
+had also pushed to a dedicated branch and opened a PR nobody watched — that PR sat
+open for eleven days holding a record that existed nowhere else.
+
+Three design choices follow from that:
+
+- **Pushes to the current branch, never its own.** Records land where the session
+  was already working, so they cannot strand on an orphan branch.
+- **Never opens a PR.** A PR nobody watches is how the record above got stranded.
+- **Refuses to push to `main`/`master`.** Those are protected upstream; a sync must
+  not be the thing that discovers that. Records still commit locally.
+
+**PII guard.** Before committing, the hook scans the staged diff for email
+addresses and aborts if it finds one belonging to a named individual. Role and
+vendor addresses (`support@`, `admin@`, `noreply@`) and org-domain addresses pass.
+This exists because agents append memory records automatically: on 2026-09-10 a
+client contact's address reached `records.jsonl` with nobody looking, and the
+repo's own no-PII rule failed silently. A blocked sync logs the addresses, resets
+the index, and leaves the work uncommitted for a human to scrub.
+
 ## Who This Is For
 
 You operate multiple companies or orgs out of a single workspace directory, each with
