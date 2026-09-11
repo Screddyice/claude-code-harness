@@ -182,8 +182,19 @@ have were real rather than a description of what someone else would do. A local 
 with no briefing narrates the action instead of taking it, and that reads exactly like
 work being done.
 
-`lean` keeps `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep` and `TodoWrite`, dropping
-only `WebFetch`, `WebSearch`, `Task` and `NotebookEdit`. The brief costs about **428
+`lean` keeps `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `TodoWrite` and `WebFetch`,
+dropping only `WebSearch`, `Task` and `NotebookEdit`.
+
+**`WebSearch` is excluded on purpose, not by oversight.** It is an Anthropic *server-side*
+tool, and these sessions talk to Ollama — offering it would hand the model a tool that can
+only ever error. `WebFetch` is client-side (Claude Code retrieves the page, the local model
+reads it), so it works and is enabled.
+
+For anything on GitHub the model uses `Bash`: `gh` is installed and already authenticated,
+so `gh repo clone` and `gh api` work with no credential prompt. The brief says so explicitly,
+because "pull the latest X and evaluate it" is a task the model can actually complete —
+clone it, then read what you cloned — and the failure being fixed here was describing that
+instead of doing it. The brief costs about **428
 tokens, 1.3% of a 32K window** — cheap against one confidently invented answer.
 
 It states two rules plainly: never claim an action without calling a tool, and read the
