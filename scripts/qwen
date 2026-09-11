@@ -38,8 +38,9 @@
 #   forever.
 #
 # USAGE
-#   qwen                       interactive session (Qwen/QWEN work too on APFS)
-#   qwen "explain this diff"   one-shot answer
+#   qwen                       agent session with working tools
+#   qwen "explain this diff"   one-shot answer, same tools
+#   qwen raw                   the plain `ollama run` REPL — NO tools execute
 #   git diff | qwen -          read the prompt from stdin
 #   qwen status                what is resident, who owns compute
 #   qwen stop                  unload it now instead of waiting for keep_alive
@@ -47,7 +48,7 @@
 #   qwen codex  [args]         a Codex session running on this model
 #
 #   --mcp cmem|none|all        MCP servers for an agent session (default: cmem)
-#   --tools mcp|lean|all       built-in tools alongside MCP (default: mcp)
+#   --tools mcp|lean|all       built-in tools alongside MCP (default: lean)
 #
 #   --force         load even if the memory guard objects (it is advisory, not law)
 #   --keep-others   leave other resident Ollama models alone (default: unload them)
@@ -512,6 +513,39 @@ case "${1:-}" in
   stop)   cmd_stop;   exit 0 ;;
   claude) shift; cmd_claude "$@" ;;
   codex)  shift; cmd_codex  "$@" ;;
+  raw)    shift; set -- "$@" ;;   # the plain `ollama run` REPL, no tool runtime
+  *)
+    # Everything else is an agent session. `ollama run` is a chat REPL with no
+    # tool runtime at all: Ollama can emit a tool call and nothing executes it,
+    # so the model answers "pulling the repo now" and nothing happens. Tools
+    # that actually run require an agent, so that is what the bare command now
+    # starts. `parse_agent_opts` accepts the same --force/--keep-others this
+    # path used to, plus --mcp/--tools.
+    #
+    # A quoted prompt stays a ONE-SHOT, as documented: `claude "..."` would open
+    # an interactive session seeded with it, so -p is added to keep the old
+    # contract of "answer and exit".
+    _bare=()
+    _want_value=0
+    _seen_prompt=0
+    for _a in "$@"; do
+      if [ "$_want_value" = 1 ]; then      # this is --mcp's / --tools' argument
+        _bare+=("$_a"); _want_value=0; continue
+      fi
+      case "$_a" in
+        --mcp|--tools)          _bare+=("$_a"); _want_value=1 ;;
+        --force|--keep-others)  _bare+=("$_a") ;;
+        -)                      # prompt arrives on stdin; -p already reads it
+                                [ "$_seen_prompt" = 0 ] && _bare+=(-p)
+                                _seen_prompt=1 ;;
+        -*)                     _bare+=("$_a") ;;
+        *)
+          [ "$_seen_prompt" = 0 ] && _bare+=(-p)
+          _seen_prompt=1
+          _bare+=("$_a") ;;
+      esac
+    done
+    exec "$0" claude ${_bare[@]+"${_bare[@]}"} ;;
 esac
 
 while [ $# -gt 0 ]; do
