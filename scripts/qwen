@@ -347,7 +347,12 @@ cmd_stop() {
 # stops Claude Code substituting another one behind your back. To go back to the
 # cloud, quit and start a plain `claude`.
 mcp_spec="cmem"
-tools_mode="mcp"
+tools_mode="lean"
+
+# Where this script lives, following the symlink `~/.local/bin/qwen` uses, so
+# the prompt below is found however it was invoked.
+QWEN_SOURCE_DIR="$(cd -- "$(dirname -- "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")/.." && pwd -P)"
+
 
 parse_agent_opts() {
   while [ $# -gt 0 ]; do
@@ -426,6 +431,16 @@ cmd_claude() {
     all)  ;;
     *) die "--tools takes mcp, lean or all (got \"$tools_mode\")" ;;
   esac
+
+  # Tell the model what it actually has. A local model with tools and no
+  # briefing narrates actions it never took -- "pulling the repo now" with no
+  # tool call behind it -- because nothing in its context says the tools
+  # execute. Roughly 400 tokens against a 32K window, which is cheap next to a
+  # confidently invented answer.
+  local tools_brief="$QWEN_SOURCE_DIR/prompts/qwen-tools.md"
+  if [ "$tools_mode" != "mcp" ] && [ -r "$tools_brief" ]; then
+    extra+=(--append-system-prompt "$(cat "$tools_brief")")
+  fi
 
   note "claude on $MODEL as $CLAUDE_MODEL_ID, ${ctx}-token window, mcp=$mcp_spec tools=$tools_mode"
   note "no failover: this session stays local until you quit it"
