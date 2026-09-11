@@ -139,6 +139,36 @@ while sharing one Codex setup.
 | Claude plugin marketplace | `.agents/plugins/marketplace.json` and `codex plugin marketplace add` |
 | Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
 
+## Bare `qwen` starts an agent, not a chat REPL
+
+`qwen` used to exec `ollama run`, which has **no tool runtime at all**. Ollama can emit a
+tool call; nothing executes it. So the model would answer *"Pulling the latest HyperCrawl
+from the repo now"* and nothing happened — it was narrating an action it had no machinery
+to take, and the reply reads exactly like work being done.
+
+Typing `qwen` now starts an agent session with working tools. The same flags still apply
+(`--force`, `--keep-others`, `--mcp`, `--tools`), and a quoted prompt is still a one-shot:
+it maps to `claude -p`, because a bare `claude "..."` would open an interactive session
+instead of answering and exiting. `qwen -` still takes its prompt from stdin.
+
+| You type | You get |
+|---|---|
+| `qwen` | agent session, tools that execute |
+| `qwen "explain this diff"` | one-shot answer, same tools |
+| `qwen -` | prompt from stdin |
+| **`qwen raw`** | the old `ollama run` REPL — **no tools execute** |
+
+`qwen raw` is kept deliberately. There are real reasons to want the weights with no harness
+in front of them: a quick question, or reading what the model itself does without Claude
+Code's system prompt shaping it. It is the honest name for what it is.
+
+**The trade:** an agent session spends part of a 32K window on harness prompt and tool
+schemas, where `ollama run` spent none. That is why `--tools` defaults to `lean` rather than
+`all`, and why `--mcp` defaults to `cmem` rather than every server. A model that can read a
+file is worth more than one with a slightly longer window and no way to check anything.
+
+---
+
 ## `qwen` agent sessions know what tools they have
 
 `qwen claude` and `qwen codex` now default to `--tools lean`, and append
