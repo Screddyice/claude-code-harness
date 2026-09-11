@@ -75,7 +75,11 @@ done
 #                   pid would otherwise resurrect a badge for a dead router.
 base_url="${ANTHROPIC_BASE_URL:-}"
 proxy_url="${HTTPS_PROXY:-}"
-if [ -z "$base_url" ] && [ -z "$proxy_url" ]; then
+# `qwen claude` exports this. It is the only thing in the session that knows the
+# truth: the model id is a borrowed catalog entry, so .model.display_name above
+# says "Haiku 4.5" while Ollama answers every token.
+local_model="${QWEN_SESSION_MODEL:-}"
+if [ -z "$base_url" ] && [ -z "$proxy_url" ] && [ -z "$local_model" ]; then
   ancestor=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
   for _ in 1 2 3 4; do
     if [ -z "$ancestor" ] || [ "$ancestor" = "0" ] || [ "$ancestor" = "1" ]; then
@@ -86,10 +90,20 @@ if [ -z "$base_url" ] && [ -z "$proxy_url" ]; then
       env_dump=$(ps -E -o command= -p "$ancestor" 2>/dev/null | tr ' ' '\n')
       base_url=$(printf '%s\n' "$env_dump" | grep -m1 '^ANTHROPIC_BASE_URL=' | cut -d= -f2-)
       proxy_url=$(printf '%s\n' "$env_dump" | grep -m1 '^HTTPS_PROXY=' | cut -d= -f2-)
+      local_model=$(printf '%s\n' "$env_dump" | grep -m1 '^QWEN_SESSION_MODEL=' | cut -d= -f2-)
       break
     fi
     ancestor=$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ')
   done
+fi
+
+# A session pointed at Ollama is local whether or not the wrapper labelled it —
+# someone can set ANTHROPIC_BASE_URL by hand. Fall back to naming the server.
+if [ -z "$local_model" ]; then
+  case "$base_url" in
+    *:11434|*:11434/|"${OLLAMA_HOST:-127.0.0.1:11434}"|http://"${OLLAMA_HOST:-127.0.0.1:11434}"*)
+      local_model="ollama" ;;
+  esac
 fi
 
 routed=0
@@ -130,6 +144,16 @@ case "$model_lc" in
   *)
     model_part="$model" ;;
 esac
+
+# Replaces the name rather than appending to it, for the same reason the failover
+# badge below does: during a local session the payload's name is the lie, and
+# printing "Haiku 4.5 · QWEN LOCAL" would show both halves as equals.
+if [ -n "$local_model" ]; then
+  case "$(printf '%s' "$local_model" | tr '[:upper:]' '[:lower:]')" in
+    *qwen*) model_part="QWEN LOCAL" ;;
+    *)      model_part="LOCAL · $local_model" ;;
+  esac
+fi
 
 # Replaces the model name rather than appending to it. During a failover the
 # name is actively misleading — the session says Opus and a local model is
