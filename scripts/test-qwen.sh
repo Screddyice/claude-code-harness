@@ -17,7 +17,7 @@ STUB="$FIXTURE/bin"
 mkdir -p "$STUB"
 # Everything the wrapper shells out to, except the six stubbed below. Linking the
 # real binaries keeps the test honest: only Ollama and the memory probes are fake.
-for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm mv env cut; do
+for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm mv env cut ls sort ps; do
   path=$(command -v "$tool") || continue
   ln -sf "$path" "$STUB/$tool"
 done
@@ -34,6 +34,10 @@ case "$url" in
   */api/version) echo '{"version":"0.0.0-test"}' ;;
   */api/tags)    cat "$FIXTURE/tags.json" ;;
   */api/ps)      cat "$FIXTURE/ps.json" ;;
+  # claude-mem's worker, on its own port. Up only when the fixture says so.
+  */api/health)
+    [ -f "$FIXTURE/mem-up" ] || exit 1
+    printf '{"status":"ok","pid":%d}\n' "$$" ;;
   *)             exit 1 ;;
 esac
 EOF
@@ -83,6 +87,16 @@ cat > "$STUB/launchctl" <<'EOF'
 exit 0
 EOF
 
+# claude-mem starts its worker through node. The stub records that it was called
+# and brings the fake worker up, so the wrapper's readiness poll can succeed.
+cat > "$STUB/node" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$FIXTURE/node.log"
+env > "$FIXTURE/node.env"
+: > "$FIXTURE/mem-up"
+exit 0
+EOF
+
 # Both agent stubs dump argv and the environment they were handed, which is the
 # only thing worth asserting: the wrapper's whole job is to exec them correctly.
 cat > "$STUB/claude" <<'EOF'
@@ -112,7 +126,19 @@ reset_world() {
   rm -f "$FIXTURE/simulator" "$FIXTURE/ollama.log" \
         "$FIXTURE/stop-fails" "$FIXTURE/stop-keeps-resident" \
         "$FIXTURE/claude.argv" "$FIXTURE/claude.env" \
-        "$FIXTURE/codex.argv" "$FIXTURE/codex.env"
+        "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
+        "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up"
+  # A claude-mem install the wrapper can find: newest version wins, and an
+  # orphaned one is skipped even when it sorts higher.
+  rm -rf "$FIXTURE/mem-cache"
+  mkdir -p "$FIXTURE/mem-cache/13.24.5/scripts" \
+           "$FIXTURE/mem-cache/13.24.23/scripts" \
+           "$FIXTURE/mem-cache/13.24.99/scripts"
+  for v in 13.24.5 13.24.23 13.24.99; do
+    : > "$FIXTURE/mem-cache/$v/scripts/worker-service.cjs"
+    : > "$FIXTURE/mem-cache/$v/scripts/bun-runner.js"
+  done
+  : > "$FIXTURE/mem-cache/13.24.99/.orphaned_at"
   rm -rf "$FIXTURE/leases" "$FIXTURE/state"
   mkdir -p "$FIXTURE/leases" "$FIXTURE/state"
 }
@@ -125,7 +151,10 @@ run_qwen() {
     LLMJURY_COMPUTE_LEASE_DIR="$FIXTURE/leases" \
     LLMJURY_LOCAL_LOCK="$FIXTURE/compute.lock" \
     CMEM_PRO_TOKEN=test-token-not-real \
-    bash "$QWEN" "$@" 2>&1
+    QWEN_CLAUDE_MEM_CACHE="$FIXTURE/mem-cache" \
+    CLAUDE_MEM_WORKER_PORT=37799 \
+    QWEN_MEMORY="${QWEN_MEMORY:-1}" \
+    bash "$QWEN" "$@" 2>&1 </dev/null
 }
 
 claude_env() { grep -m1 "^$1=" "$FIXTURE/claude.env" | cut -d= -f2-; }
@@ -422,6 +451,119 @@ if printf '%s' "$cmem_arg" | grep -q 'bearer_token_env_var' &&
   pass "codex gets cmem by env-var name, with no token value in the argv"
 else
   fail "codex gets cmem by env-var name" "$cmem_arg"
+fi
+
+# --- typing `qwen` opens Qwen ------------------------------------------------
+
+# The whole point of the command: no agent, no harness, no wrapper in front of
+# the model. A release where bare `qwen` started Claude Code is what this guards.
+reset_world
+out=$(run_qwen)
+case "$out" in
+  *"RAN run $MODEL"*) pass "bare qwen opens the model itself" ;;
+  *) fail "bare qwen opens the model itself" "$out" ;;
+esac
+if [ -f "$FIXTURE/claude.argv" ]; then
+  fail "bare qwen does not start an agent" "claude was executed"
+else
+  pass "bare qwen does not start an agent"
+fi
+
+reset_world
+out=$(run_qwen raw)
+case "$out" in
+  *"RAN run $MODEL"*) pass "raw stays an alias for bare qwen" ;;
+  *) fail "raw stays an alias for bare qwen" "$out" ;;
+esac
+
+reset_world
+run_qwen agent >/dev/null
+if [ -f "$FIXTURE/claude.argv" ] && [ "$(claude_env ANTHROPIC_BASE_URL)" = "http://127.0.0.1:11434" ]; then
+  pass "agent is an alias for the claude session"
+else
+  fail "agent is an alias for the claude session" "claude was not executed"
+fi
+
+# --- the session says what is answering --------------------------------------
+
+# Claude Code names every surface from the model id, and the id is a borrowed
+# catalog entry, so without these the session calls itself Haiku 4.5 throughout.
+reset_world
+run_qwen claude >/dev/null
+if [ "$(claude_env QWEN_SESSION_MODEL)" = "$MODEL" ] &&
+   [ "$(claude_env ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME)" = "$MODEL (local)" ] &&
+   [ "$(claude_env ANTHROPIC_DEFAULT_OPUS_MODEL_NAME)" = "$MODEL (local)" ]; then
+  pass "the session is labelled with the local model, not the catalog id"
+else
+  fail "the session is labelled with the local model" \
+       "$(grep -E '^(QWEN_SESSION_MODEL|ANTHROPIC_DEFAULT_.*_NAME)' "$FIXTURE/claude.env" | tr '\n' ' ')"
+fi
+
+# A slot left on a real Claude id 404s against Ollama the moment it is selected.
+reset_world
+run_qwen claude >/dev/null
+if [ "$(claude_env ANTHROPIC_DEFAULT_FABLE_MODEL)" = "$ALIAS" ]; then
+  pass "the fable slot points at the alias like every other slot"
+else
+  fail "the fable slot points at the alias" "$(claude_env ANTHROPIC_DEFAULT_FABLE_MODEL)"
+fi
+
+# --- claude-mem ---------------------------------------------------------------
+
+# claude-mem's worker is one daemon for the machine, and its observer spawns the
+# claude CLI with the DAEMON's environment. Started from inside this session it
+# would inherit ANTHROPIC_BASE_URL and answer every session's memory compression
+# from Ollama, so the wrapper starts it before that environment exists.
+reset_world
+run_qwen claude >/dev/null
+if grep -q 'worker-service.cjs start' "$FIXTURE/node.log" 2>/dev/null; then
+  pass "the claude-mem worker is started for a session that has none"
+else
+  fail "the claude-mem worker is started" "$(cat "$FIXTURE/node.log" 2>/dev/null)"
+fi
+
+reset_world
+run_qwen claude >/dev/null
+if grep -q '^ANTHROPIC_BASE_URL=' "$FIXTURE/node.env" 2>/dev/null; then
+  fail "the worker never inherits the local base url" "ANTHROPIC_BASE_URL reached the worker"
+else
+  pass "the worker never inherits the local base url"
+fi
+
+# Newest non-orphaned install, version-sorted: 13.24.5 must not beat 13.24.23,
+# and an orphaned 13.24.99 must not beat either.
+reset_world
+run_qwen claude >/dev/null
+if grep -q '13\.24\.23/scripts/worker-service.cjs start' "$FIXTURE/node.log" 2>/dev/null; then
+  pass "the newest non-orphaned claude-mem version is the one started"
+else
+  fail "the newest non-orphaned claude-mem version is started" "$(cat "$FIXTURE/node.log" 2>/dev/null)"
+fi
+
+reset_world
+touch "$FIXTURE/mem-up"
+run_qwen claude >/dev/null
+if [ -f "$FIXTURE/node.log" ]; then
+  fail "a healthy worker is left alone" "$(cat "$FIXTURE/node.log")"
+else
+  pass "a healthy worker is left alone"
+fi
+
+reset_world
+out=$(QWEN_MEMORY=0 run_qwen claude)
+if [ ! -f "$FIXTURE/node.log" ] && grep -q '{"mcpServers":{}}' "$FIXTURE/claude.argv"; then
+  pass "QWEN_MEMORY=0 is offline: no recall server and no worker"
+else
+  fail "QWEN_MEMORY=0 is offline" "$out"
+fi
+
+# An explicit --mcp is a decision, and outranks the blanket switch.
+reset_world
+QWEN_MEMORY=0 run_qwen claude --mcp all >/dev/null
+if claude_argv_has "--strict-mcp-config"; then
+  fail "an explicit --mcp outranks QWEN_MEMORY=0" "still passed --strict-mcp-config"
+else
+  pass "an explicit --mcp outranks QWEN_MEMORY=0"
 fi
 
 reset_world

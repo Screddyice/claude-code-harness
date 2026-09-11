@@ -28,10 +28,12 @@ run_statusline() {
   local base_url=${2:-}
   local proxy_url=${3:-}
   local state_file=${4:-$FIXTURE/absent-state.json}
+  local session_model=${5:-}
   printf '{"session_id":"fixture","model":{"display_name":"%s"},"cwd":"/tmp"}' "$model" |
     ANTHROPIC_BASE_URL="$base_url" \
     HTTPS_PROXY="$proxy_url" \
     BACKDOOR_STATE_FILE="$state_file" \
+    QWEN_SESSION_MODEL="$session_model" \
     "$STATUSLINE"
 }
 
@@ -147,6 +149,28 @@ expect_contains "malformed state still reports the model" "$out" "Opus 5"
 out=$(run_statusline "qwen")
 expect_contains "local model" "$out" "QWEN LOCAL"
 expect_absent "local model is not a failover claim" "$out" "LOCAL TIER"
+
+# `qwen claude` serves the session from Ollama under a borrowed catalog id, so
+# the payload says "Haiku 4.5" for a model Anthropic never saw. The name is the
+# one thing on the line that is false, so the line must not repeat it.
+out=$(run_statusline "Haiku 4.5" "http://127.0.0.1:11434" "" "" "qwen3.8:27b-obliterated")
+expect_contains "local session names the local model" "$out" "QWEN LOCAL"
+expect_absent "local session drops the borrowed catalog name" "$out" "Haiku 4.5"
+expect_absent "a local session is not a failover claim" "$out" "LOCAL TIER"
+
+# Someone can point a session at Ollama by hand, with no wrapper to label it.
+out=$(run_statusline "Haiku 4.5" "http://127.0.0.1:11434")
+expect_contains "an unlabelled ollama session is still named local" "$out" "LOCAL"
+expect_absent "an unlabelled ollama session drops the catalog name" "$out" "Haiku 4.5"
+
+# Any other local tag is named rather than called Qwen.
+out=$(run_statusline "Haiku 4.5" "" "" "" "gemma3:12b")
+expect_contains "a non-qwen local model is named" "$out" "LOCAL · gemma3:12b"
+
+# The ordinary cloud session is the common case and must stay untouched.
+out=$(run_statusline "Haiku 4.5" "https://api.anthropic.com")
+expect_contains "a cloud session keeps its model name" "$out" "Haiku 4.5"
+expect_absent "a cloud session gets no local badge" "$out" "LOCAL"
 
 # Without jq the script cannot read the model. It must say that out loud: the
 # old version printed an empty line and exited 0, which is indistinguishable
