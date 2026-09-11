@@ -28,6 +28,22 @@ log() {
   tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
 }
 pending() { git -C "$TC" status --porcelain -- "${PATHS[@]}" 2>/dev/null; }
+ahead_of_upstream() {
+  local upstream
+  upstream="$(git -C "$TC" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || {
+    printf '0'
+    return 0
+  }
+  git -C "$TC" rev-list --count "$upstream..HEAD" 2>/dev/null || printf '0'
+}
+push_branch() {
+  local branch="$1"
+  if git -C "$TC" push -q origin "$branch" 2>/dev/null; then
+    log "pushed $(git -C "$TC" rev-parse --short HEAD) -> $branch"
+  else
+    log "fail: push (offline or non-fast-forward) — committed locally, retries next run"
+  fi
+}
 
 # Named-individual email addresses must never be auto-committed. The README
 # rule already existed and failed silently on 2026-09-10 — a client contact's
@@ -49,7 +65,6 @@ sync() {
   if [ -f "$PAUSE" ] && [ "$forced" != "force" ]; then
     log "skipped: paused"; return 0
   fi
-  [ -n "$(pending)" ] || return 0
 
   mkdir "$LOCK" 2>/dev/null || { log "skipped: lock held"; return 0; }
   trap 'rmdir "$LOCK" 2>/dev/null' EXIT
@@ -65,6 +80,11 @@ sync() {
       log "skipped: on $branch (protected) — stage a memory/ branch to resume syncing"
       return 0 ;;
   esac
+
+  if [ -z "$(pending)" ]; then
+    [ "$(ahead_of_upstream)" -gt 0 ] && push_branch "$branch"
+    return 0
+  fi
 
   local p
   for p in "${PATHS[@]}"; do
@@ -86,11 +106,7 @@ sync() {
   msg="memory(auto): sync from $(hostname -s) $(date '+%F %H:%M') (${n} file(s))"
   git -C "$TC" commit -q -m "$msg" 2>/dev/null || { log "fail: commit"; return 0; }
 
-  if git -C "$TC" push -q origin "$branch" 2>/dev/null; then
-    log "pushed $(git -C "$TC" rev-parse --short HEAD) -> $branch"
-  else
-    log "fail: push (offline or non-fast-forward) — committed locally, retries next run"
-  fi
+  push_branch "$branch"
   return 0
 }
 
