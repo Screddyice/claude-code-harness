@@ -530,7 +530,7 @@ cmd_claude() {
   ensure_memory_worker
 
   # Tool schemas are the largest thing competing with your actual work for these
-  # 32k tokens, so the default keeps MCP and drops the built-in surface.
+  # 32k tokens, so the Claude default keeps file/shell tools and MCP.
   case "$tools_mode" in
     mcp)  extra+=(--disallowed-tools "Bash Read Write Edit NotebookEdit Glob Grep WebFetch WebSearch Task TodoWrite") ;;
     # WebSearch stays out: it is an Anthropic server-side tool, and this session

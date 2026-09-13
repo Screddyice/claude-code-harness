@@ -177,6 +177,9 @@ Qwen Code reads `AGENTS.md` and `QWEN.md` for project instructions and uses its 
 Claude-specific hooks and memory integration below apply only to `qwen claude`.
 Normal approval prompts remain enabled. Use Qwen Code's native MCP commands to
 add integrations; `--mcp cmem` and `--tools lean` are alternate-client options.
+File, shell, search, skill and fetch tools load at startup. Qwen Code can discover
+other registered tools through `tool_search`, keeping their schemas out of the
+initial 32K context without removing their capabilities.
 
 Run `bash scripts/test-qwen.sh` to check routing and admission without loading a
 model. Verify real tool execution with a small disposable project before relying

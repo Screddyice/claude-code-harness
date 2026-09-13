@@ -18,6 +18,10 @@
     }]
   },
   "context": { "fileName": ["AGENTS.md", "QWEN.md"] },
+  "tools": {
+    "approvalMode": "default",
+    "eager": ["read_file", "grep_search", "glob", "edit", "write_file", "run_shell_command", "skill", "web_fetch"]
+  },
   "telemetry": { "enabled": false, "logPrompts": false },
   "privacy": { "usageStatisticsEnabled": false }
 }

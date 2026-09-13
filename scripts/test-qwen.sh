@@ -134,6 +134,7 @@ reset_world() {
         "$FIXTURE/stop-fails" "$FIXTURE/stop-keeps-resident" \
         "$FIXTURE/claude.argv" "$FIXTURE/claude.env" \
         "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
+        "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" \
         "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up"
   # A claude-mem install the wrapper can find: newest version wins, and an
   # orphaned one is skipped even when it sorts higher.
@@ -397,9 +398,9 @@ fi
 reset_world
 run_qwen claude >/dev/null
 if claude_argv_has "--disallowed-tools"; then
-  pass "the default session drops the built-in tools and keeps MCP"
+  pass "the Claude default applies its lean tool restrictions"
 else
-  fail "the default session drops the built-in tools" "$(cat "$FIXTURE/claude.argv" | tr '\n' ' ')"
+  fail "the Claude default applies its lean tool restrictions" "$(cat "$FIXTURE/claude.argv" | tr '\n' ' ')"
 fi
 
 reset_world
@@ -493,6 +494,17 @@ if grep -qxF 'build the app' "$FIXTURE/qwen-code.argv"; then
 else
   fail "agent prompt remains one argument"
 fi
+reset_world
+mv "$STUB/qwen-code" "$STUB/qwen-code.saved"
+if out=$(run_qwen code); then
+  fail "missing Qwen Code fails with installation guidance" "$out"
+elif [[ "$out" == *"install-qwen-code.sh"* ]] && [ ! -s "$FIXTURE/ollama.log" ]; then
+  pass "missing Qwen Code fails before loading a model"
+else
+  fail "missing Qwen Code fails before loading a model" "$out"
+fi
+mv "$STUB/qwen-code.saved" "$STUB/qwen-code"
+
 reset_world
 out=$(run_qwen raw)
 case "$out" in
