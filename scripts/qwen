@@ -38,24 +38,19 @@
 #   forever.
 #
 # USAGE
-#   qwen                       standalone Qwen Code agent on the local model
-#   qwen "build this project"  one-shot agent task, then exit
-#   git diff | qwen            read the prompt from stdin
+#   qwen                       agent session with working tools
+#   qwen "explain this diff"   one-shot answer, same tools
+#   qwen raw                   the plain `ollama run` REPL — NO tools execute
+#   git diff | qwen -          read the prompt from stdin
 #   qwen status                what is resident, who owns compute
 #   qwen stop                  unload it now instead of waiting for keep_alive
 #   qwen claude [args]         a Claude Code session running on this model
-#   qwen agent  [args]         standalone Qwen Code (same as bare qwen)
-#   qwen code   [args]         standalone Qwen Code (same as bare qwen)
+#   qwen agent  [args]         alias for qwen claude
+#   qwen code   [args]         alias for qwen claude
 #   qwen codex  [args]         a Codex session running on this model
-#   qwen raw [prompt]          plain Ollama chat, without execution tools
 #
-#   Qwen Code supplies file editing, shell commands, builds and session history.
-#   It connects directly to Ollama and does not launch Claude Code or Codex.
-#   Only `qwen raw` is chat-only: its descriptions of actions do not execute.
-#
-#   --mcp cmem|none|all        MCP servers for claude/codex (default: cmem)
-#   --tools mcp|lean|all       built-in tools for claude/codex (default: lean)
-#   qwen code --help           Qwen Code options, including MCP and approvals
+#   --mcp cmem|none|all        MCP servers for an agent session (default: cmem)
+#   --tools mcp|lean|all       built-in tools alongside MCP (default: lean)
 #   QWEN_MEMORY=0              disable claude-client memory integration
 #
 #   --force         load even if the memory guard objects (it is advisory, not law)
@@ -624,30 +619,20 @@ cmd_codex() {
   exec "$codex_bin" "${extra[@]}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 }
 
-# Standalone Qwen Code uses its own tool loop and configuration. The private
-# npm prefix avoids replacing this guard with the package's own `qwen` binary.
-cmd_code() {
-  local code_bin="${QWEN_CODE_BIN:-$HOME/.local/share/qwen-code/node_modules/.bin/qwen}"
-  [ -x "$code_bin" ] || die "Qwen Code is missing; run scripts/install-qwen-code.sh from $QWEN_SOURCE_DIR"
-  case "${1:-}" in
-    --help|-h|--version|-v) exec "$code_bin" "$@" ;;
-  esac
+cmd_agent() {
+  local -a opts=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --force) force=1; shift ;;
-      --keep-others) keep_others=1; shift ;;
-      *) break ;;
+      --force|--keep-others) opts+=("$1"); shift ;;
+      --mcp|--tools) [ $# -ge 2 ] || die "$1 needs a value"; opts+=("$1" "$2"); shift 2 ;;
+      --) shift; cmd_claude "${opts[@]}" -p "$*" ;;
+      -) shift; cmd_claude "${opts[@]}" -p "$(cat)" "$@" ;;
+      -*) cmd_claude "${opts[@]}" "$@" ;;
+      *) cmd_claude "${opts[@]}" -p "$*" ;;
     esac
+    return
   done
-  start_server || die "Ollama did not come up on $API"
-  agent_admit
-  note "Qwen Code on $MODEL at $API; file and shell tools enabled"
-  # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
-  exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
-    OPENAI_API_KEY=ollama-local OPENAI_BASE_URL="$API/v1" OPENAI_MODEL="$MODEL" \
-    QWEN_SESSION_MODEL="$MODEL" QWEN_LOCAL_BASE_URL="$API/v1" \
-    QWEN_CODE_SYSTEM_DEFAULTS_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
-    "$code_bin" --auth-type openai --model "$MODEL" --openai-base-url "$API/v1" "$@"
+  cmd_claude "${opts[@]}"
 }
 
 # --- argument parsing -------------------------------------------------------
@@ -665,16 +650,16 @@ keep_others=0
 run_args=()
 prompt=""
 
-# Normal invocation is the standalone coding agent. Plain chat is explicit.
+# Normal invocation is the governed Claude Code agent. Plain chat is explicit.
 case "${1:-}" in
   status)       cmd_status; exit 0 ;;
   stop)         cmd_stop;   exit 0 ;;
   claude)       shift; cmd_claude "$@" ;;
-  agent|code)   shift; cmd_code "$@" ;;
-  -)            shift; cmd_code "$@" ;;
+  agent|code)   shift; cmd_agent "$@" ;;
+  -)            shift; cmd_agent - "$@" ;;
   codex)        shift; cmd_codex  "$@" ;;
   raw)          shift; set -- "$@" ;;
-  *)            cmd_code "$@" ;;
+  *)            cmd_agent "$@" ;;
 esac
 
 while [ $# -gt 0 ]; do

@@ -113,14 +113,9 @@ env > "$FIXTURE/codex.env"
 exit 0
 EOF
 
-cat > "$STUB/qwen-code" <<'EOF'
-#!/bin/bash
-printf '%s\n' "$@" > "$FIXTURE/qwen-code.argv"
-env > "$FIXTURE/qwen-code.env"
-exit 0
-EOF
-
-chmod +x "$STUB"/*
+chmod +x "$STUB"/curl "$STUB"/ollama "$STUB"/memory_pressure \
+  "$STUB"/sysctl "$STUB"/pgrep "$STUB"/launchctl \
+  "$STUB"/node "$STUB"/claude "$STUB"/codex
 
 MODEL=qwen3.8:27b-obliterated
 # 16.5 GB on disk, which is what this tag actually reports.
@@ -134,7 +129,6 @@ reset_world() {
         "$FIXTURE/stop-fails" "$FIXTURE/stop-keeps-resident" \
         "$FIXTURE/claude.argv" "$FIXTURE/claude.env" \
         "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
-        "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" \
         "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up"
   # A claude-mem install the wrapper can find: newest version wins, and an
   # orphaned one is skipped even when it sorts higher.
@@ -162,7 +156,6 @@ run_qwen() {
     QWEN_CLAUDE_MEM_CACHE="$FIXTURE/mem-cache" \
     CLAUDE_MEM_WORKER_PORT=37799 \
     QWEN_MEMORY="${QWEN_MEMORY:-1}" \
-    QWEN_CODE_BIN="$STUB/qwen-code" \
     bash "$QWEN" "$@" 2>&1 </dev/null
 }
 
@@ -462,48 +455,47 @@ else
   fail "codex gets cmem by env-var name" "$cmem_arg"
 fi
 
-# --- standalone Qwen Code ----------------------------------------------------
+# --- governed default agent route -------------------------------------------
 for entry in "" agent code; do
   reset_world
   run_qwen $entry >/dev/null
-  if [ -f "$FIXTURE/qwen-code.argv" ] && [ ! -f "$FIXTURE/claude.argv" ] && [ ! -f "$FIXTURE/codex.argv" ]; then
-    pass "${entry:-default} launches standalone Qwen Code"
+  if [ -f "$FIXTURE/claude.argv" ] && [ ! -f "$FIXTURE/codex.argv" ]; then
+    pass "${entry:-default} launches the governed Claude agent"
   else
-    fail "${entry:-default} launches standalone Qwen Code"
+    fail "${entry:-default} launches the governed Claude agent"
   fi
-  if grep -qxF "$MODEL" "$FIXTURE/qwen-code.argv" &&
-     grep -qxF 'http://127.0.0.1:11434/v1' "$FIXTURE/qwen-code.argv" &&
-     grep -qxF 'OPENAI_API_KEY=ollama-local' "$FIXTURE/qwen-code.env" &&
-     grep -qxF "QWEN_CODE_SYSTEM_DEFAULTS_PATH=$ROOT/config/qwen-code-local.json" "$FIXTURE/qwen-code.env"; then
-    pass "${entry:-default} pins local provider and context defaults"
+  if [ "$(claude_env ANTHROPIC_MODEL)" = "$ALIAS" ] &&
+     [ "$(claude_env ANTHROPIC_BASE_URL)" = 'http://127.0.0.1:11434' ] &&
+     [ "$(claude_env QWEN_SESSION_MODEL)" = "$MODEL" ]; then
+    pass "${entry:-default} uses the guarded Ollama Claude path"
   else
-    fail "${entry:-default} pins local provider and context defaults"
+    fail "${entry:-default} uses the guarded Ollama Claude path"
   fi
 done
 reset_world
-run_qwen code --help >/dev/null
-if [ ! -s "$FIXTURE/ollama.log" ]; then
-  pass "code help does not load a model"
-else
-  fail "code help does not load a model"
-fi
-reset_world
 run_qwen 'build the app' >/dev/null
-if grep -qxF 'build the app' "$FIXTURE/qwen-code.argv"; then
-  pass "agent prompt remains one argument"
+if grep -qxF -- '-p' "$FIXTURE/claude.argv" && grep -qxF 'build the app' "$FIXTURE/claude.argv"; then
+  pass "default prompt is sent through claude -p"
 else
-  fail "agent prompt remains one argument"
+  fail "default prompt is sent through claude -p" "$(cat "$FIXTURE/claude.argv" | tr '\n' ' ')"
 fi
 reset_world
-mv "$STUB/qwen-code" "$STUB/qwen-code.saved"
-if out=$(run_qwen code); then
-  fail "missing Qwen Code fails with installation guidance" "$out"
-elif [[ "$out" == *"install-qwen-code.sh"* ]] && [ ! -s "$FIXTURE/ollama.log" ]; then
-  pass "missing Qwen Code fails before loading a model"
+printf 'from stdin' | env -i PATH="$STUB" HOME="$FIXTURE" FIXTURE="$FIXTURE" \
+  OLLAMA_HOST=127.0.0.1:11434 \
+  QWEN_STATE_DIR="$FIXTURE/state" \
+  QWEN_EVICTION_TIMEOUT="${QWEN_EVICTION_TIMEOUT:-30}" \
+  LLMJURY_COMPUTE_LEASE_DIR="$FIXTURE/leases" \
+  LLMJURY_LOCAL_LOCK="$FIXTURE/compute.lock" \
+  CMEM_PRO_TOKEN=test-token-not-real \
+  QWEN_CLAUDE_MEM_CACHE="$FIXTURE/mem-cache" \
+  CLAUDE_MEM_WORKER_PORT=37799 \
+  QWEN_MEMORY="${QWEN_MEMORY:-1}" \
+  bash "$QWEN" - >/dev/null 2>&1
+if grep -qxF -- '-p' "$FIXTURE/claude.argv" && grep -qxF 'from stdin' "$FIXTURE/claude.argv"; then
+  pass "stdin prompt is sent through claude -p"
 else
-  fail "missing Qwen Code fails before loading a model" "$out"
+  fail "stdin prompt is sent through claude -p" "$(cat "$FIXTURE/claude.argv" | tr '\n' ' ')"
 fi
-mv "$STUB/qwen-code.saved" "$STUB/qwen-code"
 
 reset_world
 out=$(run_qwen raw)
