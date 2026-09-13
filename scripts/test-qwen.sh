@@ -113,6 +113,13 @@ env > "$FIXTURE/codex.env"
 exit 0
 EOF
 
+cat > "$STUB/qwen-code" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$FIXTURE/qwen-code.argv"
+env > "$FIXTURE/qwen-code.env"
+exit 0
+EOF
+
 chmod +x "$STUB"/*
 
 MODEL=qwen3.8:27b-obliterated
@@ -154,6 +161,7 @@ run_qwen() {
     QWEN_CLAUDE_MEM_CACHE="$FIXTURE/mem-cache" \
     CLAUDE_MEM_WORKER_PORT=37799 \
     QWEN_MEMORY="${QWEN_MEMORY:-1}" \
+    QWEN_CODE_BIN="$STUB/qwen-code" \
     bash "$QWEN" "$@" 2>&1 </dev/null
 }
 
@@ -188,7 +196,7 @@ esac
 # over-commit panics the host rather than failing, so this must not be a warning.
 reset_world
 echo 2 > "$FIXTURE/pressure"
-out=$(run_qwen "hello")
+out=$(run_qwen raw "hello")
 status=$?
 case "$status:$out" in
   0:*) fail "elevated memory pressure refuses the load" "exited 0: $out" ;;
@@ -198,7 +206,7 @@ esac
 
 reset_world
 echo 20 > "$FIXTURE/free_pct"
-out=$(run_qwen "hello")
+out=$(run_qwen raw "hello")
 case "$out" in
   *"needs ~"*) pass "too little free memory refuses the load" ;;
   *) fail "too little free memory refuses the load" "$out" ;;
@@ -208,7 +216,7 @@ esac
 reset_world
 echo 20 > "$FIXTURE/free_pct"
 echo 4 > "$FIXTURE/pressure"
-out=$(run_qwen --force "hello")
+out=$(run_qwen raw --force "hello")
 case "$out" in
   *"RAN run $MODEL hello"*) pass "--force loads past the guard" ;;
   *) fail "--force loads past the guard" "$out" ;;
@@ -216,14 +224,14 @@ esac
 
 reset_world
 touch "$FIXTURE/simulator"
-out=$(run_qwen "hello")
+out=$(run_qwen raw "hello")
 case "$out" in
   *"iOS Simulator is booted"*) pass "a booted Simulator refuses the load" ;;
   *) fail "a booted Simulator refuses the load" "$out" ;;
 esac
 
 reset_world
-run_qwen "hello" >/dev/null
+run_qwen raw "hello" >/dev/null
 if grep -q '^LEASE_PRESENT$' "$FIXTURE/ollama.log"; then
   pass "the compute lease is published before the exec, not after"
 else
@@ -234,7 +242,7 @@ fi
 # model already on the GPU is unloaded rather than tolerated.
 reset_world
 printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
-run_qwen "hello" >/dev/null
+run_qwen raw "hello" >/dev/null
 if grep -q '^stop gemma3:12b$' "$FIXTURE/ollama.log"; then
   pass "another resident model is unloaded first"
 else
@@ -244,7 +252,7 @@ fi
 reset_world
 printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
 touch "$FIXTURE/stop-fails"
-out=$(run_qwen "hello")
+out=$(run_qwen raw "hello")
 case "$out" in
   *"failed to unload gemma3:12b"*"RAN run"*) fail "failed eviction refuses the load" "$out" ;;
   *"failed to unload gemma3:12b"*) pass "failed eviction refuses the load" ;;
@@ -254,7 +262,7 @@ esac
 reset_world
 printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
 touch "$FIXTURE/stop-keeps-resident"
-QWEN_EVICTION_TIMEOUT=0 out=$(run_qwen "hello")
+QWEN_EVICTION_TIMEOUT=0 out=$(run_qwen raw "hello")
 case "$out" in
   *"timed out waiting for Ollama to unload: gemma3:12b"*"RAN run"*) fail "incomplete eviction refuses the load" "$out" ;;
   *"timed out waiting for Ollama to unload: gemma3:12b"*) pass "incomplete eviction refuses the load" ;;
@@ -263,7 +271,7 @@ esac
 
 reset_world
 printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
-run_qwen --keep-others "hello" >/dev/null
+run_qwen raw --keep-others "hello" >/dev/null
 if grep -q '^stop gemma3:12b$' "$FIXTURE/ollama.log"; then
   fail "--keep-others leaves other models alone" "$(cat "$FIXTURE/ollama.log")"
 else
@@ -275,7 +283,7 @@ fi
 reset_world
 echo 20 > "$FIXTURE/free_pct"
 printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
-out=$(run_qwen "hello")
+out=$(run_qwen raw "hello")
 case "$out" in
   *"attaching to the resident"*) pass "attaching to a resident model skips the guard" ;;
   *) fail "attaching to a resident model skips the guard" "$out" ;;
@@ -291,7 +299,7 @@ time.sleep(10)
 PY
 holder=$!
 sleep 1
-out=$(run_qwen "hello")
+out=$(run_qwen raw "hello")
 kill "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
 case "$out" in
@@ -453,36 +461,44 @@ else
   fail "codex gets cmem by env-var name" "$cmem_arg"
 fi
 
-# --- typing `qwen` opens Qwen ------------------------------------------------
-
-# The whole point of the command: no agent, no harness, no wrapper in front of
-# the model. A release where bare `qwen` started Claude Code is what this guards.
+# --- standalone Qwen Code ----------------------------------------------------
+for entry in "" agent code; do
+  reset_world
+  run_qwen $entry >/dev/null
+  if [ -f "$FIXTURE/qwen-code.argv" ] && [ ! -f "$FIXTURE/claude.argv" ] && [ ! -f "$FIXTURE/codex.argv" ]; then
+    pass "${entry:-default} launches standalone Qwen Code"
+  else
+    fail "${entry:-default} launches standalone Qwen Code"
+  fi
+  if grep -qxF "$MODEL" "$FIXTURE/qwen-code.argv" &&
+     grep -qxF 'http://127.0.0.1:11434/v1' "$FIXTURE/qwen-code.argv" &&
+     grep -qxF 'OPENAI_API_KEY=ollama-local' "$FIXTURE/qwen-code.env" &&
+     grep -qxF "QWEN_CODE_SYSTEM_DEFAULTS_PATH=$ROOT/config/qwen-code-local.json" "$FIXTURE/qwen-code.env"; then
+    pass "${entry:-default} pins local provider and context defaults"
+  else
+    fail "${entry:-default} pins local provider and context defaults"
+  fi
+done
 reset_world
-out=$(run_qwen)
-case "$out" in
-  *"RAN run $MODEL"*) pass "bare qwen opens the model itself" ;;
-  *) fail "bare qwen opens the model itself" "$out" ;;
-esac
-if [ -f "$FIXTURE/claude.argv" ]; then
-  fail "bare qwen does not start an agent" "claude was executed"
+run_qwen code --help >/dev/null
+if [ ! -s "$FIXTURE/ollama.log" ]; then
+  pass "code help does not load a model"
 else
-  pass "bare qwen does not start an agent"
+  fail "code help does not load a model"
 fi
-
+reset_world
+run_qwen 'build the app' >/dev/null
+if grep -qxF 'build the app' "$FIXTURE/qwen-code.argv"; then
+  pass "agent prompt remains one argument"
+else
+  fail "agent prompt remains one argument"
+fi
 reset_world
 out=$(run_qwen raw)
 case "$out" in
-  *"RAN run $MODEL"*) pass "raw stays an alias for bare qwen" ;;
-  *) fail "raw stays an alias for bare qwen" "$out" ;;
+  *"RAN run $MODEL"*) pass "raw opens chat without execution tools" ;;
+  *) fail "raw opens chat without execution tools" "$out" ;;
 esac
-
-reset_world
-run_qwen agent >/dev/null
-if [ -f "$FIXTURE/claude.argv" ] && [ "$(claude_env ANTHROPIC_BASE_URL)" = "http://127.0.0.1:11434" ]; then
-  pass "agent is an alias for the claude session"
-else
-  fail "agent is an alias for the claude session" "claude was not executed"
-fi
 
 # --- the session says what is answering --------------------------------------
 
