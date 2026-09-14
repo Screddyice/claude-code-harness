@@ -1,0 +1,5 @@
+    # Block rm -rf of harness state
+    if printf '%s' "$COMMAND" | grep -qE 'rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+.*\.claude-harness'; then
+        DENY_REASON="BLOCKED: Deleting .claude-harness would destroy all session state and memory."
+    fi
+

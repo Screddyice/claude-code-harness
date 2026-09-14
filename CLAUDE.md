@@ -30,6 +30,7 @@ which exist.
 | `scripts/hooks/enforce-pr-codex.sh` | Stop (Codex) | Same rule, emitting Codex's `{continue,stopReason,systemMessage}` contract |
 | `scripts/hooks/local-diff-review.sh` | Stop (Claude) | Local qwen review of the branch diff. Gated on `LOCAL_REVIEW`, which defaults to `1`. Shawn dropped the `0` override from `~/.claude/settings.json` on 2026-09-07, so the reviewer runs again |
 | `scripts/hooks/local-diff-review-codex.sh` | Stop (Codex) | The Codex copy of the same reviewer |
+| `scripts/hooks/harness-guard-patch.sh` | SessionStart (Claude) | Reapplies a fix to the claude-harness plugin's PreToolUse guard, which denied `git rm --cached` and any file merely mentioning the delete phrase. No-op once patched |
 
 ## Commands
 
