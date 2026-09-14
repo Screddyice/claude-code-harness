@@ -1458,13 +1458,12 @@ that gets its own rule with `--cached` exempted.
 | the same after `&&`, `if`, `sudo -u`, or `xargs -0` | deny | deny |
 | `git rm -r` on it, no `--cached` | deny | deny |
 | `git rm -r --cached` on it | deny | **allow** |
-| the phrase inside a comment or heredoc | deny | **allow** |
-| the phrase inside a markdown code span | deny | **allow** |
+| the phrase inside a comment, heredoc, or quoted text | deny | **allow** |
+| a backtick command substitution deleting the directory | deny | deny |
 
-That last row is its own small lesson. The first version of this patch counted a
-backtick as command position, to catch legacy command substitution. It also counts
-every markdown code span, so the guard blocked any file documenting the rule,
-including this README. `$( )` covers substitution; the backtick is gone.
+That last row is its own small lesson. Backtick command substitution is still active
+inside double quotes, so the guard treats a backtick before the delete command the
+same way it treats `$(`.
 
 ### Why it is reapplied every session
 
@@ -1480,7 +1479,7 @@ reports it and changes nothing rather than guessing. Upstreaming this is the rea
 ```bash
 scripts/hooks/harness-guard-patch.sh          # patch every installed copy, quietly
 scripts/hooks/harness-guard-patch.sh --check  # report status, exit 1 if stale
-scripts/test-harness-guard.sh                 # 24 checks, no installed plugin touched
+scripts/test-harness-guard.sh                 # 26 checks, no installed plugin touched
 ```
 
 Apply mode always exits 0: a guard one release out of date is a smaller problem than

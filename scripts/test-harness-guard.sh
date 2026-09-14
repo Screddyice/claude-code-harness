@@ -59,6 +59,8 @@ check deny  'if rm -rf .claude-harness; then echo gone; fi'  'a recursive delete
 check deny  'sudo -u root rm -rf .claude-harness'            'a recursive delete via sudo with options'
 check deny  'xargs -0 rm -rf .claude-harness'                'a recursive delete via xargs with options'
 check deny  'rm -r .claude-harness/memory'                   'a recursive delete of a subdirectory'
+check deny  'x=`rm -rf .claude-harness`'                     'a recursive delete inside legacy command substitution'
+check deny  'echo "$(:) `rm -rf .claude-harness`"'          'a recursive delete inside double-quoted legacy command substitution'
 # Anchoring the rule to command position loses `git rm`, so it gets its own rule.
 check deny  'git rm -r .claude-harness'                      'git rm without --cached, which deletes from the tree'
 
@@ -67,9 +69,9 @@ check deny  'git rm -r .claude-harness'                      'git rm without --c
 check allow 'git rm -r --cached .claude-harness'             'git rm --cached, which only drops index entries'
 check allow 'git rm -q --cached .claude-harness/config.json' 'git rm --cached on a single path'
 check allow '# guard against rm -rf .claude-harness'         'the phrase inside a comment'
-# A markdown code span is not command position. Treating it as one blocked every
-# file that documented this rule, including this repo's README.
-check allow 'echo "| `rm -rf .claude-harness` | deny |" >> README.md' 'the phrase inside a markdown code span'
+# Documentation text remains allowed when it is not written with executable
+# command substitution.
+check allow 'echo "rm -rf .claude-harness" >> README.md'     'the phrase inside quoted documentation text'
 check allow "cat > /tmp/s.sh <<'EOF'
 # blocks rm -rf .claude-harness
 EOF"                                                         'the phrase inside a heredoc'
