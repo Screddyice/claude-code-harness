@@ -1,4 +1,7 @@
-> **claude-mem removed 2026-08-02.** Do not reinstall the thedotmack plugin, host proxy, mcp-search, or Grok mem hooks. Shared observation memory is gone from this harness.
+> **claude-mem is back as of 2026-09-04**, and it is the only memory layer on this
+> machine. The 2026-08-02 removal notice that stood here objected to the local worker
+> hijacking a session, which the cloud-sync design does not do. Cognee and Mem0 were
+> retired the same day. See "Memory" below.
 
 # codex-harness
 
@@ -176,21 +179,218 @@ while sharing one Codex setup.
 | Claude plugin marketplace | `.agents/plugins/marketplace.json` and `codex plugin marketplace add` |
 | Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
 
+## Standalone local Qwen agent
+
+`qwen` starts **Qwen Code**, an independent coding agent connected to the local
+Ollama model. It can read and edit files, execute terminal commands, run builds,
+and retain sessions without launching Claude Code or Codex. Run it from the
+project directory. `qwen raw` provides plain chat without execution tools.
+
+Install Node.js 22+ and run `bash scripts/install-qwen-code.sh` once. The installer
+pins Qwen Code 0.23.3 in `~/.local/share/qwen-code`; its npm binary does not replace
+the guarded `~/.local/bin/qwen` launcher.
+
+| You type | You get |
+|---|---|
+| `qwen` | interactive standalone Qwen Code |
+| `qwen agent` or `qwen code` | the same standalone agent |
+| `qwen "build this project"` | one-shot agent task |
+| `git diff | qwen` | an agent task using stdin |
+| `qwen --continue` | the latest agent session for this project |
+| `qwen code --help` | Qwen Code options, approvals and MCP configuration |
+| `qwen raw` | plain Ollama chat |
+| `qwen claude` / `qwen codex` | explicit alternate agent clients |
+
+The launcher reuses the existing model admission guard and compute lease. It
+sets the local OpenAI-compatible endpoint and a placeholder key. The checked-in
+`config/qwen-code-local.json` supplies 32,768-token context accounting, a
+4,096-token response cap, local-provider timeouts and disabled telemetry. These
+are system defaults: Qwen Code user/project settings can override them. No
+cloud fallback is configured. `QWEN_MODEL` selects the local model;
+`QWEN_CODE_BIN` overrides the installed executable path.
+
+The provider label Qwen Code prints in its banner and footer is the model tag
+itself, `qwen3.8:27b-obliterated (Ollama)`, expanded from `QWEN_SESSION_MODEL`
+at startup. It used to read `Qwen local (Ollama)`, which said nothing about
+which weights were loaded, and asking the model does not help: Qwen Code's
+system prompt tells it it is Qwen Code, so it denies being the obliterated
+build even when `ollama ps` and the process arguments show that it is. Read
+the footer, or `ollama ps`, never the model's own answer.
+
+Qwen Code reads `AGENTS.md` and `QWEN.md` for project instructions and uses its own
+`~/.qwen` settings, skills, MCP servers, approvals and session history. The
+Claude-specific hooks and memory integration below apply only to `qwen claude`.
+Normal approval prompts remain enabled. Use Qwen Code's native MCP commands to
+add integrations; `--mcp cmem` and `--tools lean` are alternate-client options.
+File, shell, search, skill and fetch tools load at startup. Qwen Code can discover
+other registered tools through `tool_search`, keeping their schemas out of the
+initial 32K context without removing their capabilities.
+
+Run `bash scripts/test-qwen.sh` to check routing and admission without loading a
+model. Verify real tool execution with a small disposable project before relying
+on a model for larger builds; a textual claim alone does not prove an edit or build.
+
+---
+
+## A `qwen claude` session says Qwen, not Haiku
+
+Claude Code refuses any model id outside its compiled catalog, so the local weights are
+served under one: `claude-haiku-4-5-20251001`, an `ollama cp` manifest copy that shares
+its blobs and its runner with `qwen3.8:27b-obliterated`. Every surface that derives a
+name from the id then calls the session Haiku 4.5, which is the one thing on screen that
+is false.
+
+Two places now say otherwise:
+
+- **The status line.** `qwen claude` exports `QWEN_SESSION_MODEL`, and
+  `scripts/statusline.sh` prints `QWEN LOCAL` in place of the payload's display name.
+  It reads the variable from its own environment, or off the parent `claude` process,
+  the same walk the failover badge uses. A session pointed at port 11434 with no
+  wrapper to label it still reads as local.
+- **`/model`.** The picker builds its labels from
+  `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL_NAME` when they are set, so all
+  four now read `qwen3.8:27b-obliterated (local)`. Override with `QWEN_MODEL_LABEL`.
+
+The fable slot joined the other three in pointing at the alias. A slot left on a real
+Claude id is a 404 against Ollama the moment anything selects it, and a second local tag
+would load a second 17 GB runner, which is the co-residency that panics this Mac.
+
+Claude Code has no environment variable for the session's own display name — `Ise`, the
+override map behind it, is a static table of marketing names — so the status line is
+where this gets fixed rather than in a flag.
+
+---
+
+## claude-mem inside a `qwen claude` session
+
+Recall works the way it always did: `--mcp cmem` wires the hosted cmem MCP, and the
+plugin's hooks inject context at session start.
+
+Capture needed a fix, and the bug it prevents is machine-wide. claude-mem runs **one**
+worker daemon per machine, and its observer compresses a session by spawning the
+`claude` CLI with the daemon's own environment. Nothing in claude-mem strips
+`ANTHROPIC_BASE_URL` along the way. So when a `qwen claude` session is the one whose
+SessionStart hook first starts that daemon, the daemon inherits the local base URL and
+auth token, and from then on every memory compression on this machine — cloud sessions
+included — is answered by Ollama until somebody notices.
+
+`scripts/qwen` now starts the worker itself, before the exec that sets those variables,
+with `env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_MODEL`. claude-mem's
+hook then finds a healthy worker on `127.0.0.1:37700 + uid % 100` and does nothing. If
+claude-mem is not installed, or `node` is missing, the wrapper skips it. Memory is not a
+reason to refuse a session.
+
+A worker that is **already** running gets checked rather than restarted: if its
+environment points at Ollama, the wrapper says so and leaves it alone. Killing that
+daemon drops the backoff that keeps it off a rate-limited provider, and that is Shawn's
+call to make.
+
+`QWEN_MEMORY=0` turns the whole thing off — no recall server, no worker, nothing
+started on claude-mem's behalf. An explicit `--mcp` still wins over it.
+
+---
+
+## `qwen` agent sessions know what tools they have
+
+`qwen claude` and `qwen codex` now default to `--tools lean`, and append
+`prompts/qwen-tools.md` to the session's system prompt.
+
+Both halves were missing, and together they produced a specific failure: the model
+would answer *"Pulling the latest HyperCrawl from the repo now"* and then nothing
+happened. The old default, `--tools mcp`, disallowed `Bash Read Write Edit Glob Grep`
+— so it had no way to pull anything — and nothing in its context said the tools it did
+have were real rather than a description of what someone else would do. A local model
+with no briefing narrates the action instead of taking it, and that reads exactly like
+work being done.
+
+`lean` keeps `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `TodoWrite` and `WebFetch`,
+dropping only `WebSearch`, `Task` and `NotebookEdit`.
+
+**`WebSearch` is excluded on purpose, not by oversight.** It is an Anthropic *server-side*
+tool, and these sessions talk to Ollama — offering it would hand the model a tool that can
+only ever error. `WebFetch` is client-side (Claude Code retrieves the page, the local model
+reads it), so it works and is enabled.
+
+For anything on GitHub the model uses `Bash`: `gh` is installed and already authenticated,
+so `gh repo clone` and `gh api` work with no credential prompt. The brief says so explicitly,
+because "pull the latest X and evaluate it" is a task the model can actually complete —
+clone it, then read what you cloned — and the failure being fixed here was describing that
+instead of doing it. The brief costs about **428
+tokens, 1.3% of a 32K window** — cheap against one confidently invented answer.
+
+It states two rules plainly: never claim an action without calling a tool, and read the
+file rather than answering from memory about a specific codebase. Then a short table of
+which tool suits which question, and an explicit list of what the model does *not* have,
+because "I cannot reach that" is a useful answer and a confident guess is not.
+
+Override per session with `--tools mcp` (the old lean-window behaviour) or `--tools all`.
+The brief is skipped under `--tools mcp`, where most of what it describes is unavailable.
+
+---
+
 ## Claude status line
 
 `scripts/statusline.sh` is the canonical source for Claude's optional status line. It prints the
 session model, the working directory, and the shell and legion worker counts. A model served
 locally shows as `QWEN LOCAL`; every other model shows its own name.
 
-Backdoor was removed from this machine on 2026-09-10, and the routing badges went with it. The
-script no longer reads `$HOME/.backdoor/failover-state.json`, no longer inspects
-`ANTHROPIC_BASE_URL` or `HTTPS_PROXY`, and can no longer print `BACKDOOR ON` or `BACKDOOR OFF`.
-A stale proxy variable left over from the router changes nothing about what it renders.
+Installing is a separate step from merging, so compare the hashes before you trust what
+you see on screen:
+
+```bash
+md5 -q scripts/statusline.sh ~/.claude/statusline.sh   # two lines, same value
+cp scripts/statusline.sh ~/.claude/statusline.sh
+```
+
+### The local-model badge
+
+`qwen claude` exports `QWEN_SESSION_MODEL`, and the status line prints `QWEN LOCAL`
+instead of the model name in the payload. Without it the line reads "Haiku 4.5" for a
+session Anthropic never sees: the local weights are served under a borrowed catalog id,
+and Claude Code derives every name it prints from that id.
+
+The variable is read from the status line's own environment first, then off the parent
+`claude` process, which is the walk the failover badge already does. A session whose
+`ANTHROPIC_BASE_URL` points at port 11434 with no wrapper to label it reads as
+`LOCAL · ollama`, and any other local tag is named: `LOCAL · gemma3:12b`.
+
+### The local-tier badge
+
+When the router fails a session over to local weights, the status line shows
+`LOCAL TIER . Anthropic down` in place of the model name.
+
+It replaces the name rather than sitting beside it, because during a failover the name is the one
+thing on the line that is false: Claude Code still believes it is talking to its configured cloud
+model and has no idea the router answered from Ollama. Showing both would print the lie and the
+correction side by side.
+
+This badge exists because the router's notification cannot cover the whole problem. The router
+already notifies on both transitions — into local and back to cloud — but those notices are rate
+limited by `failover_notify_cooldown_seconds` (900s). A second outage inside that window moves the
+session to local and back with **no notification at all**, which is the silent switch people
+actually hit. Notifications report events; this reports state, and state is the half a cooldown
+cannot suppress.
+
+Three independent conditions are required, each closing a different way to lie:
+
+| Condition | What it prevents |
+|---|---|
+| This session is routed through the router (`:8083` base URL or `:8084` proxy, read from the env or walked up the process ancestry) | Breaker state is global to the router, so a session talking directly to Anthropic must not inherit a badge from one that is routed |
+| `failover_active` is true **for `anthropic`** in `$HOME/.backdoor/failover-state.json` | A Codex failover says nothing about a Claude session |
+| The file's `pid` is alive **and is really the router** | A state file outlives the process that wrote it, and a recycled pid would otherwise resurrect a badge for a router that is gone |
+
+Anything invalid, unreadable, or unverifiable fails closed and renders no badge. A stale proxy
+variable left over from a retired router still changes nothing, because the environment alone was
+never sufficient.
+
+There is deliberately **no "off" badge.** The retired `BACKDOOR OFF` printed on every ordinary
+session and told nobody anything; the normal case does not need a label.
 
 `jq` is a hard dependency, and a missing one used to be invisible. The script parses the session
 payload with `jq`, so a host without it printed a bare ` . shells: 0` and exited 0: no model name
 and no way to tell that was a failure. The script now checks for `jq` first and prints
-`STATUSLINE BLIND . jq not found on PATH . no model` instead of a comfortable blank.
+`STATUSLINE BLIND . jq not found on PATH . no model or local-tier badge` instead of a
+comfortable blank.
 
 Run the fixture gate with:
 
@@ -1098,11 +1298,13 @@ Type `qwen` and the obliterated Qwen 3.8 27B answers. `Qwen` and `QWEN` reach th
 same file, because the boot volume is case-insensitive APFS.
 
 ```
-qwen                        interactive session
-qwen "explain this diff"    one-shot answer
-git diff | qwen -           prompt from stdin
+qwen                        standalone Qwen Code agent
+qwen "explain this diff"    one-shot agent task
+git diff | qwen             prompt from stdin
 qwen status                 what is resident, who owns compute
 qwen stop                   unload now instead of waiting out keep_alive
+qwen claude                 Claude Code on this model, tools that run
+qwen codex                  Codex on this model
 ```
 
 Install it the way `gbrowse` installs:
@@ -1181,9 +1383,12 @@ delete.
 
 ```
 qwen claude                    Claude Code on the 27B, cmem wired in
+qwen agent                     standalone Qwen Code (see above)
 qwen codex                     Codex on the 27B, cmem wired in
   --mcp cmem|none|all          MCP servers (default: cmem)
-  --tools mcp|lean|all         built-in tools alongside MCP (default: mcp)
+  --tools mcp|lean|all         built-in tools alongside MCP (default: lean)
+  QWEN_MEMORY=0                no recall server and no claude-mem worker
+  QWEN_MODEL_LABEL=...         what `/model` calls this model
 ```
 
 Ollama 0.32 serves the Anthropic Messages API at `/v1/messages`: correct envelope,
@@ -1256,7 +1461,7 @@ Codex settings are all `-c` overrides, so `~/.codex/config.toml` is never edited
 a session that dies leaves nothing pointing at a local model.
 
 Run `scripts/test-qwen.sh` after changing admission, locking, lease handling, or
-either agent command. Its 30 checks stub Ollama, launchd, both memory probes and
+the agent commands. Its checks stub Ollama, launchd, both memory probes and
 both agent binaries, so no case loads a model or starts a session.
 
 ## Migration Audit
