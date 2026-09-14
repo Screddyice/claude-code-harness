@@ -20,6 +20,17 @@ printf 'base\n' > "$repo/memory/records.jsonl"
 git -C "$repo" add memory/records.jsonl
 git -C "$repo" commit -qm base
 git -C "$repo" push -q origin main
+
+printf 'main local record\n' >> "$repo/memory/records.jsonl"
+TEAM_CONTEXT_DIR="$repo" "$hook" now
+
+[ -z "$(git -C "$repo" status --porcelain -- memory projects-context)" ] \
+  || { echo "FAIL: protected-branch sync should commit tracked paths locally" >&2; exit 1; }
+[ "$(git --git-dir="$origin" rev-list --count main)" = "1" ] \
+  || { echo "FAIL: protected-branch sync should not push to main" >&2; exit 1; }
+grep -q 'skipped: on main (protected)' "$repo/.memory-autosync.log" \
+  || { echo "FAIL: protected-branch push skip was not logged" >&2; exit 1; }
+
 git -C "$repo" switch -qc feat/sync
 printf 'branch\n' >> "$repo/memory/records.jsonl"
 git -C "$repo" commit -qam branch

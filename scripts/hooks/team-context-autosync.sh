@@ -41,6 +41,11 @@ ahead_of_upstream() {
 }
 push_branch() {
   local branch="$1"
+  case "$branch" in
+    main|master)
+      log "skipped: on $branch (protected) — stage a memory/ branch to resume syncing"
+      return 0 ;;
+  esac
   if git -C "$TC" push -q -u origin "$branch" 2>/dev/null; then
     log "pushed $(git -C "$TC" rev-parse --short HEAD) -> $branch"
   else
@@ -75,14 +80,6 @@ sync() {
   local branch
   branch="$(git -C "$TC" symbolic-ref --quiet --short HEAD 2>/dev/null)" || {
     log "skipped: detached HEAD"; return 0; }
-
-  # main is protected upstream; pushing there fails noisily and a sync must not
-  # be the thing that tries. Records stay committed locally either way.
-  case "$branch" in
-    main|master)
-      log "skipped: on $branch (protected) — stage a memory/ branch to resume syncing"
-      return 0 ;;
-  esac
 
   if [ -z "$(pending)" ]; then
     if ! has_upstream || [ "$(ahead_of_upstream)" -gt 0 ]; then
