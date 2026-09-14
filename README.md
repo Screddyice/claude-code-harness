@@ -142,31 +142,48 @@ while sharing one Codex setup.
 | Claude plugin marketplace | `.agents/plugins/marketplace.json` and `codex plugin marketplace add` |
 | Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
 
-## Bare `qwen` starts the governed local agent
+## Standalone local Qwen agent
 
-`qwen` starts the same guarded Claude Code path as `qwen claude`: the wrapper
-admits the local Ollama model, publishes the compute lease, starts the cmem worker
-before local environment variables are exported, and then launches the governed
-agent client. `qwen raw` is the only plain Ollama chat path.
+`qwen` starts **Qwen Code**, an independent coding agent connected to the local
+Ollama model. It can read and edit files, execute terminal commands, run builds,
+and retain sessions without launching Claude Code or Codex. Run it from the
+project directory. `qwen raw` provides plain chat without execution tools.
+
+Install Node.js 22+ and run `bash scripts/install-qwen-code.sh` once. The installer
+pins Qwen Code 0.23.3 in `~/.local/share/qwen-code`; its npm binary does not replace
+the guarded `~/.local/bin/qwen` launcher.
 
 | You type | You get |
 |---|---|
-| `qwen` | governed Claude Code agent session |
-| `qwen agent` or `qwen code` | alias for `qwen claude` |
-| `qwen "build this project"` | one-shot `claude -p` task |
-| `git diff | qwen -` | an agent task using stdin |
+| `qwen` | interactive standalone Qwen Code |
+| `qwen agent` or `qwen code` | the same standalone agent |
+| `qwen "build this project"` | one-shot agent task |
+| `git diff | qwen` | an agent task using stdin |
+| `qwen --continue` | the latest agent session for this project |
+| `qwen code --help` | Qwen Code options, approvals and MCP configuration |
 | `qwen raw` | plain Ollama chat |
-| `qwen codex` | explicit Codex client on the same guarded model |
+| `qwen claude` / `qwen codex` | explicit alternate agent clients |
 
-The default agent route is deliberate. It keeps local Qwen behind the same
-harness, hooks, MCP selection, memory controls and tool restrictions as the rest
-of Team Nebula automation instead of starting a separate tool runtime directly
-against Ollama. `--mcp` and `--tools` belong to the governed agent sessions;
-Ollama's own flags belong to `qwen raw`.
+The launcher reuses the existing model admission guard and compute lease. It
+sets the local OpenAI-compatible endpoint and a placeholder key. The checked-in
+`config/qwen-code-local.json` supplies 32,768-token context accounting, a
+4,096-token response cap, local-provider timeouts and disabled telemetry. These
+are system defaults: Qwen Code user/project settings can override them. No
+cloud fallback is configured. `QWEN_MODEL` selects the local model;
+`QWEN_CODE_BIN` overrides the installed executable path.
 
-Run `bash scripts/test-qwen.sh` after changing routing or admission. The test
-stubs Ollama, launchd, both memory probes and both agent clients, so no case
-loads a model or starts a session.
+Qwen Code reads `AGENTS.md` and `QWEN.md` for project instructions and uses its own
+`~/.qwen` settings, skills, MCP servers, approvals and session history. The
+Claude-specific hooks and memory integration below apply only to `qwen claude`.
+Normal approval prompts remain enabled. Use Qwen Code's native MCP commands to
+add integrations; `--mcp cmem` and `--tools lean` are alternate-client options.
+File, shell, search, skill and fetch tools load at startup. Qwen Code can discover
+other registered tools through `tool_search`, keeping their schemas out of the
+initial 32K context without removing their capabilities.
+
+Run `bash scripts/test-qwen.sh` to check routing and admission without loading a
+model. Verify real tool execution with a small disposable project before relying
+on a model for larger builds; a textual claim alone does not prove an edit or build.
 
 ---
 
@@ -1236,9 +1253,9 @@ Type `qwen` and the obliterated Qwen 3.8 27B answers. `Qwen` and `QWEN` reach th
 same file, because the boot volume is case-insensitive APFS.
 
 ```
-qwen                        governed Claude Code agent
+qwen                        standalone Qwen Code agent
 qwen "explain this diff"    one-shot agent task
-git diff | qwen -           prompt from stdin
+git diff | qwen             prompt from stdin
 qwen status                 what is resident, who owns compute
 qwen stop                   unload now instead of waiting out keep_alive
 qwen claude                 Claude Code on this model, tools that run
@@ -1321,7 +1338,7 @@ delete.
 
 ```
 qwen claude                    Claude Code on the 27B, cmem wired in
-qwen agent                     alias for `qwen claude`
+qwen agent                     standalone Qwen Code (see above)
 qwen codex                     Codex on the 27B, cmem wired in
   --mcp cmem|none|all          MCP servers (default: cmem)
   --tools mcp|lean|all         built-in tools alongside MCP (default: lean)

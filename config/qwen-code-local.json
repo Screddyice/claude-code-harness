@@ -1,0 +1,27 @@
+{
+  "$version": 4,
+  "security": { "auth": { "selectedType": "openai" } },
+  "model": { "name": "${QWEN_SESSION_MODEL}" },
+  "modelProviders": {
+    "openai": [{
+      "id": "${QWEN_SESSION_MODEL}",
+      "name": "Qwen local (Ollama)",
+      "envKey": "OPENAI_API_KEY",
+      "baseUrl": "${QWEN_LOCAL_BASE_URL}",
+      "generationConfig": {
+        "contextWindowSize": 32768,
+        "timeout": 300000,
+        "streamIdleTimeoutMs": 120000,
+        "maxRetries": 1,
+        "samplingParams": { "temperature": 0.2, "max_tokens": 4096 }
+      }
+    }]
+  },
+  "context": { "fileName": ["AGENTS.md", "QWEN.md"] },
+  "tools": {
+    "approvalMode": "default",
+    "eager": ["read_file", "grep_search", "glob", "edit", "write_file", "run_shell_command", "skill", "web_fetch"]
+  },
+  "telemetry": { "enabled": false, "logPrompts": false },
+  "privacy": { "usageStatisticsEnabled": false }
+}
