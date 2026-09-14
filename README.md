@@ -172,6 +172,14 @@ are system defaults: Qwen Code user/project settings can override them. No
 cloud fallback is configured. `QWEN_MODEL` selects the local model;
 `QWEN_CODE_BIN` overrides the installed executable path.
 
+The provider label Qwen Code prints in its banner and footer is the model tag
+itself, `qwen3.8:27b-obliterated (Ollama)`, expanded from `QWEN_SESSION_MODEL`
+at startup. It used to read `Qwen local (Ollama)`, which said nothing about
+which weights were loaded, and asking the model does not help: Qwen Code's
+system prompt tells it it is Qwen Code, so it denies being the obliterated
+build even when `ollama ps` and the process arguments show that it is. Read
+the footer, or `ollama ps`, never the model's own answer.
+
 Qwen Code reads `AGENTS.md` and `QWEN.md` for project instructions and uses its own
 `~/.qwen` settings, skills, MCP servers, approvals and session history. The
 Claude-specific hooks and memory integration below apply only to `qwen claude`.

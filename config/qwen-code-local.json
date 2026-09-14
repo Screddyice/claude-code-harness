@@ -5,7 +5,7 @@
   "modelProviders": {
     "openai": [{
       "id": "${QWEN_SESSION_MODEL}",
-      "name": "Qwen local (Ollama)",
+      "name": "${QWEN_SESSION_MODEL} (Ollama)",
       "envKey": "OPENAI_API_KEY",
       "baseUrl": "${QWEN_LOCAL_BASE_URL}",
       "generationConfig": {
