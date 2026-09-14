@@ -38,16 +38,25 @@
 #   forever.
 #
 # USAGE
-#   qwen                       interactive session (Qwen/QWEN work too on APFS)
-#   qwen "explain this diff"   one-shot answer
-#   git diff | qwen -          read the prompt from stdin
+#   qwen                       standalone Qwen Code agent on the local model
+#   qwen "build this project"  one-shot agent task, then exit
+#   git diff | qwen            read the prompt from stdin
 #   qwen status                what is resident, who owns compute
 #   qwen stop                  unload it now instead of waiting for keep_alive
 #   qwen claude [args]         a Claude Code session running on this model
+#   qwen agent  [args]         standalone Qwen Code (same as bare qwen)
+#   qwen code   [args]         standalone Qwen Code (same as bare qwen)
 #   qwen codex  [args]         a Codex session running on this model
+#   qwen raw [prompt]          plain Ollama chat, without execution tools
 #
-#   --mcp cmem|none|all        MCP servers for an agent session (default: cmem)
-#   --tools mcp|lean|all       built-in tools alongside MCP (default: mcp)
+#   Qwen Code supplies file editing, shell commands, builds and session history.
+#   It connects directly to Ollama and does not launch Claude Code or Codex.
+#   Only `qwen raw` is chat-only: its descriptions of actions do not execute.
+#
+#   --mcp cmem|none|all        MCP servers for claude/codex (default: cmem)
+#   --tools mcp|lean|all       built-in tools for claude/codex (default: lean)
+#   qwen code --help           Qwen Code options, including MCP and approvals
+#   QWEN_MEMORY=0              disable claude-client memory integration
 #
 #   --force         load even if the memory guard objects (it is advisory, not law)
 #   --keep-others   leave other resident Ollama models alone (default: unload them)
@@ -68,7 +77,17 @@ AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
 # ANTHROPIC_BASE_URL points at, so the local weights are served under a catalog id.
 # See cmd_claude for why this is the only way in and why nothing else worked.
 CLAUDE_MODEL_ID="${QWEN_CLAUDE_MODEL_ID:-claude-haiku-4-5-20251001}"
+# What a session should CALL this model. The id above is a catalog id borrowed to
+# get past Claude Code's model validation, so every surface that reads the id
+# says "Haiku 4.5" — the one thing on screen that is not true. The status line
+# reads QWEN_SESSION_MODEL (exported in cmd_claude) and prints this instead.
+MODEL_LABEL="${QWEN_MODEL_LABEL:-$MODEL (local)}"
 CMEM_URL="${QWEN_CMEM_URL:-https://cmem.ai/api/mcp}"
+# claude-mem's worker is a singleton daemon on one port per uid, matching
+# claude-mem's own default: 37700 + uid % 100.
+MEM_PORT="${CLAUDE_MEM_WORKER_PORT:-$(( 37700 + $(id -u) % 100 ))}"
+MEM_HOST="${CLAUDE_MEM_WORKER_HOST:-127.0.0.1}"
+MEM_CACHE="${QWEN_CLAUDE_MEM_CACHE:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/thedotmack/claude-mem}"
 
 host="${OLLAMA_HOST:-127.0.0.1:11434}"
 case "$host" in http://*|https://*) API="$host" ;; *) API="http://$host" ;; esac
@@ -147,6 +166,82 @@ ensure_cmem_token() {
     export CMEM_PRO_TOKEN
   fi
   [ -n "${CMEM_PRO_TOKEN:-}" ]
+}
+
+# claude-mem, from inside a session that is NOT talking to Anthropic.
+#
+# Recall is the easy half: the hosted cmem MCP is wired below like any other
+# server. Capture is the half that breaks, and it breaks globally.
+#
+# claude-mem's worker is ONE daemon for the whole machine, and its observer
+# compresses a session by spawning the `claude` CLI with the DAEMON's own
+# environment. Nothing in claude-mem strips ANTHROPIC_BASE_URL on the way
+# through. So if this session is the one whose SessionStart hook first starts
+# that daemon, the daemon inherits this wrapper's local base URL and auth token,
+# and from then on every memory compression on this machine — cloud sessions
+# included — is quietly answered by Ollama instead of Anthropic, until someone
+# notices and restarts it.
+#
+# Starting it HERE, before the exec that sets those variables, is the whole fix:
+# claude-mem's hook then finds a healthy worker and does nothing. If claude-mem
+# is not installed, or node is missing, this is a no-op — memory is not a reason
+# to refuse a session.
+mem_worker_up() {
+  curl -fsS --max-time 3 "http://$MEM_HOST:$MEM_PORT/api/health" 2>/dev/null |
+    jq -e '.status == "ok"' >/dev/null 2>&1
+}
+
+# Newest installed version that still has the worker and has not been orphaned by
+# an upgrade. Version-sorted, because 13.24.5 must not beat 13.24.23.
+mem_worker_script() {
+  local dir
+  for dir in $(ls -1 "$MEM_CACHE" 2>/dev/null | sort -Vr); do
+    [ -e "$MEM_CACHE/$dir/.orphaned_at" ] && continue
+    [ -f "$MEM_CACHE/$dir/scripts/worker-service.cjs" ] || continue
+    [ -f "$MEM_CACHE/$dir/scripts/bun-runner.js" ] || continue
+    printf '%s\n' "$MEM_CACHE/$dir/scripts"
+    return 0
+  done
+  return 1
+}
+
+# A worker that is already up but was born inside a local session is the exact
+# failure this function exists to prevent, and it outlives the session that
+# caused it. Say so; do not restart it. Killing the daemon drops the backoff that
+# keeps it from hammering a rate-limited provider, and that is Shawn's call.
+warn_if_mem_worker_is_local() {
+  local pid
+  pid=$(curl -fsS --max-time 3 "http://$MEM_HOST:$MEM_PORT/api/health" 2>/dev/null |
+    jq -r '.pid // empty') || return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  local dump
+  dump=$(ps -E -o command= -p "$pid" 2>/dev/null | tr ' ' '\n' |
+    grep -m1 '^ANTHROPIC_BASE_URL=' || true)
+  [ -n "$dump" ] || return 0
+  case "${dump#ANTHROPIC_BASE_URL=}" in
+    "$API"|"$API"/*|*:11434|*:11434/*)
+      note "the claude-mem worker (pid $pid) is pointed at a local Ollama server, so"
+      note "  memory compression is running on the local model for EVERY session."
+      note "  Restart it yourself when you want it back on Anthropic." ;;
+  esac
+}
+
+ensure_memory_worker() {
+  [ "${QWEN_MEMORY:-1}" = 0 ] && return 0
+  if mem_worker_up; then warn_if_mem_worker_is_local; return 0; fi
+  local scripts
+  scripts=$(mem_worker_script) || return 0
+  command -v node >/dev/null 2>&1 || { note "claude-mem needs node; skipping the worker"; return 0; }
+  note "starting the claude-mem worker before the local env is set, so memory capture stays on Anthropic"
+  env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_MODEL \
+      -u ANTHROPIC_SMALL_FAST_MODEL -u CLAUDE_CODE_SUBAGENT_MODEL \
+    node "$scripts/bun-runner.js" "$scripts/worker-service.cjs" start >/dev/null 2>&1 || true
+  local _
+  for _ in $(seq 1 15); do
+    mem_worker_up && return 0
+    sleep 1
+  done
+  note "the claude-mem worker did not come up; this session will recall but may not capture"
 }
 
 resident_bytes() {
@@ -347,7 +442,12 @@ cmd_stop() {
 # stops Claude Code substituting another one behind your back. To go back to the
 # cloud, quit and start a plain `claude`.
 mcp_spec="cmem"
-tools_mode="mcp"
+tools_mode="lean"
+
+# Where this script lives, following the symlink `~/.local/bin/qwen` uses, so
+# the prompt below is found however it was invoked.
+QWEN_SOURCE_DIR="$(cd -- "$(dirname -- "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")/.." && pwd -P)"
+
 
 parse_agent_opts() {
   while [ $# -gt 0 ]; do
@@ -408,6 +508,13 @@ cmd_claude() {
   local ctx="${OLLAMA_CONTEXT_LENGTH:-32768}"
   local -a extra=()
 
+  # QWEN_MEMORY=0 is the true-offline switch: no recall server, and nothing
+  # started on claude-mem's behalf. An explicit --mcp still wins over it.
+  if [ "${QWEN_MEMORY:-1}" = 0 ] && [ "$mcp_spec" = cmem ]; then
+    mcp_spec=none
+    note "QWEN_MEMORY=0: no claude-mem recall in this session"
+  fi
+
   case "$mcp_spec" in
     none) extra+=(--strict-mcp-config --mcp-config '{"mcpServers":{}}') ;;
     all)  note "loading every MCP server in ~/.claude.json; their tool schemas will crowd a ${ctx}-token window" ;;
@@ -418,19 +525,49 @@ cmd_claude() {
     *) die "--mcp takes cmem, none or all (got \"$mcp_spec\")" ;;
   esac
 
+  # Capture is a hook, not an MCP server, so it runs whatever --mcp says. What it
+  # must not do is give claude-mem's shared daemon this session's environment.
+  ensure_memory_worker
+
   # Tool schemas are the largest thing competing with your actual work for these
-  # 32k tokens, so the default keeps MCP and drops the built-in surface.
+  # 32k tokens, so the Claude default keeps file/shell tools and MCP.
   case "$tools_mode" in
     mcp)  extra+=(--disallowed-tools "Bash Read Write Edit NotebookEdit Glob Grep WebFetch WebSearch Task TodoWrite") ;;
-    lean) extra+=(--disallowed-tools "WebFetch WebSearch Task NotebookEdit") ;;
+    # WebSearch stays out: it is an Anthropic server-side tool, and this session
+    # talks to Ollama, so offering it would hand the model a tool that can only
+    # error. WebFetch is client-side -- Claude Code retrieves the page and the
+    # LOCAL model reads it -- so it works here and is how the model sees a URL.
+    lean) extra+=(--disallowed-tools "WebSearch Task NotebookEdit") ;;
     all)  ;;
     *) die "--tools takes mcp, lean or all (got \"$tools_mode\")" ;;
   esac
+
+  # Tell the model what it actually has. A local model with tools and no
+  # briefing narrates actions it never took -- "pulling the repo now" with no
+  # tool call behind it -- because nothing in its context says the tools
+  # execute. Roughly 400 tokens against a 32K window, which is cheap next to a
+  # confidently invented answer.
+  local tools_brief="$QWEN_SOURCE_DIR/prompts/qwen-tools.md"
+  if [ "$tools_mode" != "mcp" ] && [ -r "$tools_brief" ]; then
+    extra+=(--append-system-prompt "$(cat "$tools_brief")")
+  fi
 
   note "claude on $MODEL as $CLAUDE_MODEL_ID, ${ctx}-token window, mcp=$mcp_spec tools=$tools_mode"
   note "no failover: this session stays local until you quit it"
   # ANTHROPIC_API_KEY is dropped rather than forwarded. A local server has no use
   # for the real key and no reason to see it.
+  #
+  # QWEN_SESSION_MODEL says what is really answering. Claude Code derives every
+  # name it prints from the model id, and the id is a borrowed catalog entry, so
+  # left alone the session calls itself Haiku 4.5 from first prompt to last. The
+  # status line reads this variable — directly, or off this process when Claude
+  # Code spawns it — and prints the local model instead. The _NAME/_DESCRIPTION
+  # pairs relabel the same thing in /model, where the picker builds its own
+  # labels from these rather than from the catalog.
+  #
+  # The fable slot is pointed at the alias for the same reason the other three
+  # are: a slot left on a real Claude id is a 404 against Ollama the moment
+  # anything selects it, and a second local tag would load a second 17 GB runner.
   exec env -u ANTHROPIC_API_KEY \
     ANTHROPIC_BASE_URL="$API" \
     ANTHROPIC_AUTH_TOKEN=ollama-local \
@@ -438,8 +575,18 @@ cmd_claude() {
     ANTHROPIC_DEFAULT_OPUS_MODEL="$CLAUDE_MODEL_ID" \
     ANTHROPIC_DEFAULT_SONNET_MODEL="$CLAUDE_MODEL_ID" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_FABLE_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="$MODEL_LABEL" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="$MODEL_LABEL" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="$MODEL_LABEL" \
+    ANTHROPIC_DEFAULT_FABLE_MODEL_NAME="$MODEL_LABEL" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION="$MODEL_LABEL, served by Ollama" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION="$MODEL_LABEL, served by Ollama" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION="$MODEL_LABEL, served by Ollama" \
+    ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION="$MODEL_LABEL, served by Ollama" \
     ANTHROPIC_SMALL_FAST_MODEL="$CLAUDE_MODEL_ID" \
     CLAUDE_CODE_SUBAGENT_MODEL="$CLAUDE_MODEL_ID" \
+    QWEN_SESSION_MODEL="$MODEL" \
     CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" \
     CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 \
     CLAUDE_CODE_NO_MODEL_FALLBACK=1 \
@@ -477,6 +624,32 @@ cmd_codex() {
   exec "$codex_bin" "${extra[@]}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 }
 
+# Standalone Qwen Code uses its own tool loop and configuration. The private
+# npm prefix avoids replacing this guard with the package's own `qwen` binary.
+cmd_code() {
+  local code_bin="${QWEN_CODE_BIN:-$HOME/.local/share/qwen-code/node_modules/.bin/qwen}"
+  [ -x "$code_bin" ] || die "Qwen Code is missing; run scripts/install-qwen-code.sh from $QWEN_SOURCE_DIR"
+  case "${1:-}" in
+    --help|-h|--version|-v) exec "$code_bin" "$@" ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --keep-others) keep_others=1; shift ;;
+      *) break ;;
+    esac
+  done
+  start_server || die "Ollama did not come up on $API"
+  agent_admit
+  note "Qwen Code on $MODEL at $API; file and shell tools enabled"
+  # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
+  exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+    OPENAI_API_KEY=ollama-local OPENAI_BASE_URL="$API/v1" OPENAI_MODEL="$MODEL" \
+    QWEN_SESSION_MODEL="$MODEL" QWEN_LOCAL_BASE_URL="$API/v1" \
+    QWEN_CODE_SYSTEM_DEFAULTS_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
+    "$code_bin" --auth-type openai --model "$MODEL" --openai-base-url "$API/v1" "$@"
+}
+
 # --- argument parsing -------------------------------------------------------
 
 case "${1:-}" in
@@ -492,11 +665,16 @@ keep_others=0
 run_args=()
 prompt=""
 
+# Normal invocation is the standalone coding agent. Plain chat is explicit.
 case "${1:-}" in
-  status) cmd_status; exit 0 ;;
-  stop)   cmd_stop;   exit 0 ;;
-  claude) shift; cmd_claude "$@" ;;
-  codex)  shift; cmd_codex  "$@" ;;
+  status)       cmd_status; exit 0 ;;
+  stop)         cmd_stop;   exit 0 ;;
+  claude)       shift; cmd_claude "$@" ;;
+  agent|code)   shift; cmd_code "$@" ;;
+  -)            shift; cmd_code "$@" ;;
+  codex)        shift; cmd_codex  "$@" ;;
+  raw)          shift; set -- "$@" ;;
+  *)            cmd_code "$@" ;;
 esac
 
 while [ $# -gt 0 ]; do
