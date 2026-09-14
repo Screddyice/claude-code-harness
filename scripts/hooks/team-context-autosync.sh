@@ -28,6 +28,9 @@ log() {
   tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
 }
 pending() { git -C "$TC" status --porcelain -- "${PATHS[@]}" 2>/dev/null; }
+has_upstream() {
+  git -C "$TC" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1
+}
 ahead_of_upstream() {
   local upstream
   upstream="$(git -C "$TC" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || {
@@ -38,7 +41,7 @@ ahead_of_upstream() {
 }
 push_branch() {
   local branch="$1"
-  if git -C "$TC" push -q origin "$branch" 2>/dev/null; then
+  if git -C "$TC" push -q -u origin "$branch" 2>/dev/null; then
     log "pushed $(git -C "$TC" rev-parse --short HEAD) -> $branch"
   else
     log "fail: push (offline or non-fast-forward) — committed locally, retries next run"
@@ -82,7 +85,9 @@ sync() {
   esac
 
   if [ -z "$(pending)" ]; then
-    [ "$(ahead_of_upstream)" -gt 0 ] && push_branch "$branch"
+    if ! has_upstream || [ "$(ahead_of_upstream)" -gt 0 ]; then
+      push_branch "$branch"
+    fi
     return 0
   fi
 

@@ -19,10 +19,10 @@ mkdir -p "$repo/memory"
 printf 'base\n' > "$repo/memory/records.jsonl"
 git -C "$repo" add memory/records.jsonl
 git -C "$repo" commit -qm base
+git -C "$repo" push -q origin main
 git -C "$repo" switch -qc feat/sync
 printf 'branch\n' >> "$repo/memory/records.jsonl"
 git -C "$repo" commit -qam branch
-git -C "$repo" push -q -u origin feat/sync
 
 bad_origin="$tmp/missing-origin.git"
 git -C "$repo" remote set-url origin "$bad_origin"
@@ -31,14 +31,16 @@ TEAM_CONTEXT_DIR="$repo" "$hook" now
 
 [ -z "$(git -C "$repo" status --porcelain -- memory projects-context)" ] \
   || { echo "FAIL: first sync should leave tracked paths clean after committing" >&2; exit 1; }
-[ "$(git -C "$repo" rev-list --count '@{upstream}..HEAD')" = "1" ] \
-  || { echo "FAIL: failed push should leave branch one commit ahead of upstream" >&2; exit 1; }
+! git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1 \
+  || { echo "FAIL: failed first push should not have an upstream yet" >&2; exit 1; }
 grep -q 'fail: push' "$repo/.memory-autosync.log" \
   || { echo "FAIL: failed push was not logged" >&2; exit 1; }
 
 git -C "$repo" remote set-url origin "$origin"
 TEAM_CONTEXT_DIR="$repo" "$hook" now
 
+[ "$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" = "origin/feat/sync" ] \
+  || { echo "FAIL: retry push should establish upstream tracking" >&2; exit 1; }
 [ "$(git -C "$repo" rev-list --count '@{upstream}..HEAD')" = "0" ] \
   || { echo "FAIL: second sync should push the clean, already-committed record" >&2; exit 1; }
 grep -q 'pushed .* -> feat/sync' "$repo/.memory-autosync.log" \
