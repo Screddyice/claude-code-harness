@@ -38,24 +38,25 @@
 #   forever.
 #
 # USAGE
-#   qwen                       the model itself: an `ollama run` chat REPL
-#   qwen "explain this diff"   one-shot answer, then exit
-#   git diff | qwen -          read the prompt from stdin
+#   qwen                       standalone Qwen Code agent on the local model
+#   qwen "build this project"  one-shot agent task, then exit
+#   git diff | qwen            read the prompt from stdin
 #   qwen status                what is resident, who owns compute
 #   qwen stop                  unload it now instead of waiting for keep_alive
 #   qwen claude [args]         a Claude Code session running on this model
-#   qwen agent  [args]         alias for `qwen claude`
+#   qwen agent  [args]         standalone Qwen Code (same as bare qwen)
+#   qwen code   [args]         standalone Qwen Code (same as bare qwen)
 #   qwen codex  [args]         a Codex session running on this model
-#   qwen raw                   alias for bare `qwen`, kept for muscle memory
+#   qwen raw [prompt]          plain Ollama chat, without execution tools
 #
-#   Typing `qwen` opens Qwen, not an agent wrapped around it. The REPL has NO
-#   tool runtime: Ollama can emit a tool call and nothing executes it, so a
-#   plain `qwen` that announces it is "pulling the repo now" did nothing of the
-#   kind. Reach for `qwen claude` when the model has to act rather than answer.
+#   Qwen Code supplies file editing, shell commands, builds and session history.
+#   It connects directly to Ollama and does not launch Claude Code or Codex.
+#   Only `qwen raw` is chat-only: its descriptions of actions do not execute.
 #
-#   --mcp cmem|none|all        MCP servers for an agent session (default: cmem)
-#   --tools mcp|lean|all       built-in tools alongside MCP (default: lean)
-#   QWEN_MEMORY=0              no claude-mem at all: no recall MCP, no worker
+#   --mcp cmem|none|all        MCP servers for claude/codex (default: cmem)
+#   --tools mcp|lean|all       built-in tools for claude/codex (default: lean)
+#   qwen code --help           Qwen Code options, including MCP and approvals
+#   QWEN_MEMORY=0              disable claude-client memory integration
 #
 #   --force         load even if the memory guard objects (it is advisory, not law)
 #   --keep-others   leave other resident Ollama models alone (default: unload them)
@@ -529,7 +530,7 @@ cmd_claude() {
   ensure_memory_worker
 
   # Tool schemas are the largest thing competing with your actual work for these
-  # 32k tokens, so the default keeps MCP and drops the built-in surface.
+  # 32k tokens, so the Claude default keeps file/shell tools and MCP.
   case "$tools_mode" in
     mcp)  extra+=(--disallowed-tools "Bash Read Write Edit NotebookEdit Glob Grep WebFetch WebSearch Task TodoWrite") ;;
     # WebSearch stays out: it is an Anthropic server-side tool, and this session
@@ -623,6 +624,32 @@ cmd_codex() {
   exec "$codex_bin" "${extra[@]}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 }
 
+# Standalone Qwen Code uses its own tool loop and configuration. The private
+# npm prefix avoids replacing this guard with the package's own `qwen` binary.
+cmd_code() {
+  local code_bin="${QWEN_CODE_BIN:-$HOME/.local/share/qwen-code/node_modules/.bin/qwen}"
+  [ -x "$code_bin" ] || die "Qwen Code is missing; run scripts/install-qwen-code.sh from $QWEN_SOURCE_DIR"
+  case "${1:-}" in
+    --help|-h|--version|-v) exec "$code_bin" "$@" ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --keep-others) keep_others=1; shift ;;
+      *) break ;;
+    esac
+  done
+  start_server || die "Ollama did not come up on $API"
+  agent_admit
+  note "Qwen Code on $MODEL at $API; file and shell tools enabled"
+  # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
+  exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+    OPENAI_API_KEY=ollama-local OPENAI_BASE_URL="$API/v1" OPENAI_MODEL="$MODEL" \
+    QWEN_SESSION_MODEL="$MODEL" QWEN_LOCAL_BASE_URL="$API/v1" \
+    QWEN_CODE_SYSTEM_DEFAULTS_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
+    "$code_bin" --auth-type openai --model "$MODEL" --openai-base-url "$API/v1" "$@"
+}
+
 # --- argument parsing -------------------------------------------------------
 
 case "${1:-}" in
@@ -638,16 +665,16 @@ keep_others=0
 run_args=()
 prompt=""
 
-# Typing `qwen` opens Qwen. Everything that is not a subcommand is a prompt for
-# the model itself, handled by the `ollama run` path below — no agent, no harness,
-# no tool runtime. `raw` stays accepted because it named that behaviour for one
-# release; `agent` and `claude` are where the tools live.
+# Normal invocation is the standalone coding agent. Plain chat is explicit.
 case "${1:-}" in
   status)       cmd_status; exit 0 ;;
   stop)         cmd_stop;   exit 0 ;;
-  claude|agent) shift; cmd_claude "$@" ;;
+  claude)       shift; cmd_claude "$@" ;;
+  agent|code)   shift; cmd_code "$@" ;;
+  -)            shift; cmd_code "$@" ;;
   codex)        shift; cmd_codex  "$@" ;;
   raw)          shift; set -- "$@" ;;
+  *)            cmd_code "$@" ;;
 esac
 
 while [ $# -gt 0 ]; do
