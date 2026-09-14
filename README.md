@@ -1516,7 +1516,7 @@ reports it and changes nothing rather than guessing. Upstreaming this is the rea
 ```bash
 scripts/hooks/harness-guard-patch.sh          # patch every installed copy, quietly
 scripts/hooks/harness-guard-patch.sh --check  # report status, exit 1 if stale
-scripts/test-harness-guard.sh                 # 26 checks, no installed plugin touched
+scripts/test-harness-guard.sh                 # 31 checks, no installed plugin touched
 ```
 
 Apply mode always exits 0: a guard one release out of date is a smaller problem than
