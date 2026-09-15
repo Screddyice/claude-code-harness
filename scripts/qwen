@@ -77,6 +77,7 @@ DESKTOP_RESERVE=$((2 * GB))     # matches memguard's headroom reserve
 PROMPT_CACHE_MIB="${QWEN_PROMPT_CACHE_MIB:-1024}"   # LLAMA_ARG_CACHE_RAM on this host
 LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.backdoor/compute-leases}"
 LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
+STALE_SESSION_SECONDS="${QWEN_STALE_SESSION_SECONDS:-1800}"
 MODEL_KEY="$(printf '%s' "$MODEL" | tr -c '[:alnum:]_.-' '_')"
 MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/$MODEL_KEY/resident-bytes"
 AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
@@ -377,12 +378,40 @@ lock_holders() {
   lsof -nP -t "$LOCK_PATH" 2>/dev/null || true
 }
 
+qwen_session_age() {
+  local pid="$1" file started now
+  file="$LEASE_DIR/qwen-$pid.json"
+  [ -f "$file" ] || return 1
+  started=$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null) || return 1
+  case "$started" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(date +%s)
+  printf '%s\n' $(( now - started ))
+}
+
+qwen_session_is_stale() {
+  local pid="$1" age
+  case "$STALE_SESSION_SECONDS" in
+    ''|*[!0-9]*) die "QWEN_STALE_SESSION_SECONDS must be a non-negative integer" ;;
+  esac
+  # Reclaim only when Ollama confirms that no model is resident. If the probe
+  # fails, keep the owner and fail closed rather than guessing.
+  no_resident_models || return 1
+  age=$(qwen_session_age "$pid") || return 1
+  [ "$age" -ge "$STALE_SESSION_SECONDS" ]
+}
+
+no_resident_models() {
+  local names
+  names=$(resident_names) || return 1
+  [ -z "$names" ]
+}
+
 preempt_local_compute() {
   [ "$MODEL" = "qwen3.8:27b-obliterated" ] || return 0
   command -v lsof >/dev/null 2>&1 ||
     die "lsof is required to identify the local-compute lock owner safely"
 
-  local holders pid command deadline remaining
+  local holders pid command deadline remaining age
   holders=$(lock_holders)
   [ -n "$holders" ] || return 0
 
@@ -390,8 +419,16 @@ preempt_local_compute() {
     [ "$pid" = "$$" ] && continue
     command=$(ps -o command= -p "$pid" 2>/dev/null || true)
     case "$command" in
-      */scripts/qwen|*/scripts/qwen\ *|*/qwen|*/qwen\ *|*/qwen-code|*/qwen-code\ *|*/ollama|*/ollama\ *|ollama|ollama\ *)
-        die "another Qwen/Ollama session owns compute (pid $pid); close it before starting $MODEL"
+      */ollama|*/ollama\ *|ollama|ollama\ *)
+        die "another Ollama session owns compute (pid $pid); close it before starting $MODEL"
+        ;;
+      */scripts/qwen|*/scripts/qwen\ *|*/qwen|*/qwen\ *|*/qwen-code|*/qwen-code\ *)
+        if qwen_session_is_stale "$pid"; then
+          age=$(qwen_session_age "$pid" || printf 'unknown')
+          note "reclaiming stale Qwen session pid $pid (no model resident for ${age}s)"
+        else
+          die "another Qwen session owns compute (pid $pid); close it before starting $MODEL"
+        fi
         ;;
     esac
     note "preempting local compute owner pid $pid; future LLM-Jury runs use the frontier route"
@@ -408,8 +445,11 @@ preempt_local_compute() {
         [ "$pid" = "$$" ] && continue
         command=$(ps -o command= -p "$pid" 2>/dev/null || true)
         case "$command" in
-          */scripts/qwen|*/scripts/qwen\ *|*/qwen|*/qwen\ *|*/qwen-code|*/qwen-code\ *|*/ollama|*/ollama\ *|ollama|ollama\ *)
-            die "another Qwen/Ollama session still owns compute (pid $pid); refusing to force-stop it"
+          */ollama|*/ollama\ *|ollama|ollama\ *)
+            die "another Ollama session still owns compute (pid $pid); refusing to force-stop it"
+            ;;
+          */scripts/qwen|*/scripts/qwen\ *|*/qwen|*/qwen\ *|*/qwen-code|*/qwen-code\ *)
+            die "another Qwen session still owns compute (pid $pid); refusing to force-stop it"
             ;;
         esac
         note "local compute owner pid $pid did not exit after TERM; sending KILL"

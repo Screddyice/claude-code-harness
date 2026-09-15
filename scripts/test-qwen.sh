@@ -15,9 +15,10 @@ fail() { printf 'FAIL %s\n     %s\n' "$1" "${2:-}"; failures=$((failures + 1)); 
 
 STUB="$FIXTURE/bin"
 mkdir -p "$STUB"
+REAL_PS=$(command -v ps)
 # Everything the wrapper shells out to, except the six stubbed below. Linking the
 # real binaries keeps the test honest: only Ollama and the memory probes are fake.
-for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm mv env cut ls sort ps; do
+for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm mv env cut ls sort ps stat; do
   path=$(command -v "$tool") || continue
   ln -sf "$path" "$STUB/$tool"
 done
@@ -93,6 +94,17 @@ cat > "$STUB/lsof" <<'EOF'
 [ -r "$FIXTURE/holder.pid" ] && cat "$FIXTURE/holder.pid"
 EOF
 
+rm -f "$STUB/ps"
+cat > "$STUB/ps" <<EOF
+#!/bin/bash
+if [ -f "\$FIXTURE/stale-owner" ]; then
+  case "\$*" in
+    *"command="*) printf 'node %s/qwen --continue\\n' "\$FIXTURE"; exit 0 ;;
+  esac
+fi
+exec "$REAL_PS" "\$@"
+EOF
+
 cat > "$STUB/launchctl" <<'EOF'
 #!/bin/bash
 exit 0
@@ -146,7 +158,7 @@ reset_world() {
         "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
         "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" \
         "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up" \
-        "$FIXTURE/holder.pid"
+        "$FIXTURE/holder.pid" "$FIXTURE/stale-owner"
   # A claude-mem install the wrapper can find: newest version wins, and an
   # orphaned one is skipped even when it sorts higher.
   rm -rf "$FIXTURE/mem-cache"
@@ -168,6 +180,7 @@ run_qwen() {
     QWEN_MODEL="${TEST_QWEN_MODEL-$MODEL}" \
     QWEN_STATE_DIR="$FIXTURE/state" \
     QWEN_EVICTION_TIMEOUT="${QWEN_EVICTION_TIMEOUT:-30}" \
+    QWEN_STALE_SESSION_SECONDS="${QWEN_STALE_SESSION_SECONDS:-1800}" \
     LLMJURY_COMPUTE_LEASE_DIR="$FIXTURE/leases" \
     LLMJURY_LOCAL_LOCK="$FIXTURE/compute.lock" \
     CMEM_PRO_TOKEN=test-token-not-real \
@@ -348,6 +361,68 @@ case "$out" in
   *"preempting local compute owner pid"*"RAN run $MODEL hello"*)
     pass "27B preempts a cooperating local owner and loads" ;;
   *) fail "27B preempts a cooperating local owner and loads" "$out" ;;
+esac
+
+# An abandoned Qwen session is reclaimable after the stale threshold when its
+# model has already unloaded. A live model owner remains protected.
+reset_world
+python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
+import fcntl, os, signal, sys, time
+from pathlib import Path
+
+handle = open(sys.argv[1], "a")
+marker = Path(sys.argv[2])
+marker.write_text(str(os.getpid()), encoding="utf-8")
+
+def release_and_exit(_signum, _frame):
+    marker.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, release_and_exit)
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 1
+printf '{"active":true,"model":"%s","pid":%d,"source":"qwen","expires_at":%d}\n' \
+  "$MODEL" "$holder" "$(( $(date +%s) + 3600 ))" > "$FIXTURE/leases/qwen-$holder.json"
+touch "$FIXTURE/stale-owner"
+out=$(QWEN_STALE_SESSION_SECONDS=0 run_qwen raw "hello")
+wait "$holder" 2>/dev/null || true
+case "$out" in
+  *"reclaiming stale Qwen session pid"*"RAN run $MODEL hello"*)
+    pass "27B reclaims an abandoned Qwen session" ;;
+  *) fail "27B reclaims an abandoned Qwen session" "$out" ;;
+esac
+
+reset_world
+python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
+import fcntl, os, signal, sys, time
+from pathlib import Path
+
+handle = open(sys.argv[1], "a")
+marker = Path(sys.argv[2])
+marker.write_text(str(os.getpid()), encoding="utf-8")
+
+def release_and_exit(_signum, _frame):
+    marker.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, release_and_exit)
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 1
+printf '{"active":true,"model":"%s","pid":%d,"source":"qwen","expires_at":%d}\n' \
+  "$MODEL" "$holder" "$(( $(date +%s) + 3600 ))" > "$FIXTURE/leases/qwen-$holder.json"
+touch "$FIXTURE/stale-owner"
+out=$(QWEN_STALE_SESSION_SECONDS=999999 run_qwen raw "hello")
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+case "$out" in
+  *"another Qwen session owns compute"*) pass "an active Qwen owner stays protected" ;;
+  *) fail "an active Qwen owner stays protected" "$out" ;;
 esac
 
 # `exec` skips the EXIT trap, so leases outlive their session by design; the next
