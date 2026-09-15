@@ -23,7 +23,7 @@
   },
   "context": {
     "fileName": ["AGENTS.md", "QWEN.md"],
-    "autoCompactThreshold": 0.7
+    "autoCompactThreshold": 0.8
   },
   "tools": {
     "approvalMode": "default",

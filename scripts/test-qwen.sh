@@ -484,7 +484,7 @@ done
 if jq -e '
   .model.maxToolCallsPerTurn == 24 and
   .model.skipLoopDetection == false and
-  .context.autoCompactThreshold == 0.7
+  .context.autoCompactThreshold == 0.8
 ' "$ROOT/config/qwen-code-local.json" >/dev/null; then
   pass "standalone Qwen defaults bound context and repeated tool turns"
 else
