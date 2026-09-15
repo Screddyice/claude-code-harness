@@ -357,9 +357,10 @@ lease_prune() {
   done
 }
 
-# The reviewer and cooperating councils take this same lock nonblocking, so
-# holding it for the session is what makes them skip rather than collide. The
-# kernel releases it if this process is killed; there is no stale state to clean.
+# The reviewer and cooperating councils take this same lock nonblocking. A 27B
+# launch is the explicit user request for the exclusive owner, so it preempts a
+# cooperating holder of this lock before taking it. The kernel releases the lock
+# if that holder is killed; there is no stale state to clean.
 take_lock() {
   mkdir -p "$(dirname "$LOCK_PATH")"
   exec 9>>"$LOCK_PATH"
@@ -370,6 +371,60 @@ try:
 except (BlockingIOError, OSError):
     sys.exit(1)
 PY
+}
+
+lock_holders() {
+  lsof -nP -t "$LOCK_PATH" 2>/dev/null || true
+}
+
+preempt_local_compute() {
+  [ "$MODEL" = "qwen3.8:27b-obliterated" ] || return 0
+  command -v lsof >/dev/null 2>&1 ||
+    die "lsof is required to identify the local-compute lock owner safely"
+
+  local holders pid command deadline remaining
+  holders=$(lock_holders)
+  [ -n "$holders" ] || return 0
+
+  for pid in $holders; do
+    [ "$pid" = "$$" ] && continue
+    command=$(ps -o command= -p "$pid" 2>/dev/null || true)
+    case "$command" in
+      */scripts/qwen|*/scripts/qwen\ *|*/qwen|*/qwen\ *|*/qwen-code|*/qwen-code\ *|*/ollama|*/ollama\ *|ollama|ollama\ *)
+        die "another Qwen/Ollama session owns compute (pid $pid); close it before starting $MODEL"
+        ;;
+    esac
+    note "preempting local compute owner pid $pid; future LLM-Jury runs use the frontier route"
+    kill -TERM "$pid" 2>/dev/null ||
+      die "could not terminate local compute owner pid $pid"
+  done
+
+  deadline=$(( $(date +%s) + ${QWEN_PREEMPT_TIMEOUT:-10} ))
+  while :; do
+    remaining=$(lock_holders)
+    [ -z "$remaining" ] && return 0
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      for pid in $remaining; do
+        [ "$pid" = "$$" ] && continue
+        command=$(ps -o command= -p "$pid" 2>/dev/null || true)
+        case "$command" in
+          */scripts/qwen|*/scripts/qwen\ *|*/qwen|*/qwen\ *|*/qwen-code|*/qwen-code\ *|*/ollama|*/ollama\ *|ollama|ollama\ *)
+            die "another Qwen/Ollama session still owns compute (pid $pid); refusing to force-stop it"
+            ;;
+        esac
+        note "local compute owner pid $pid did not exit after TERM; sending KILL"
+        kill -KILL "$pid" 2>/dev/null ||
+          die "could not force-stop local compute owner pid $pid"
+      done
+      deadline=$(( $(date +%s) + 5 ))
+    fi
+    sleep 1
+  done
+}
+
+acquire_compute_lock() {
+  preempt_local_compute
+  take_lock || die "another local council or background review owns compute; retry when it finishes"
 }
 
 cleanup() { lease_close; }
@@ -494,7 +549,7 @@ agent_admit() {
     return 0
   fi
   disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
-  take_lock || die "another local council or background review owns compute; retry when it finishes"
+  acquire_compute_lock
   lease_open
   if [ "$force" = 1 ]; then
     if [ "$keep_others" != 1 ]; then stop_other_models; fi
@@ -733,9 +788,7 @@ if is_resident; then
   note "attaching to the resident $MODEL"
 else
   disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
-  if ! take_lock; then
-    die "another local council or background review owns compute; retry when it finishes"
-  fi
+  acquire_compute_lock
   lease_open
   if [ "$force" = 1 ]; then
     [ "$keep_others" = 1 ] || stop_other_models
