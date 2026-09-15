@@ -40,7 +40,7 @@ codex-harness/
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   ├── gbrowse                       # headed-browser wrapper that survives a session
-│   ├── qwen                          # loads the exclusive 27B without panicking the Mac
+│   ├── qwen                          # defaults to local 4B; explicit 27B keeps admission guards
 │   ├── test-qwen.sh                  # admission, lock and lease tests (loads no model)
 │   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
 │   ├── dns-postflight.sh             # did the cutover land, and did mail survive
@@ -184,7 +184,9 @@ while sharing one Codex setup.
 `qwen` starts **Qwen Code**, an independent coding agent connected to the local
 Ollama model. It can read and edit files, execute terminal commands, run builds,
 and retain sessions without launching Claude Code or Codex. Run it from the
-project directory. `qwen raw` provides plain chat without execution tools.
+project directory. The default model is `qwen3.5:4b-64k`. Type `qwen 27b`
+to select **`qwen3.8:27b-obliterated`**; the 27B selector never chooses a stock
+model. `qwen raw` provides plain chat without execution tools.
 
 Install Node.js 22+ and run `bash scripts/install-qwen-code.sh` once. The installer
 pins Qwen Code 0.23.3 in `~/.local/share/qwen-code`; its npm binary does not replace
@@ -192,7 +194,9 @@ the guarded `~/.local/bin/qwen` launcher.
 
 | You type | You get |
 |---|---|
-| `qwen` | interactive standalone Qwen Code |
+| `qwen` | interactive standalone Qwen Code on 4B |
+| `qwen 27b` | standalone agent on Qwen3.8 27B OBLITERATED |
+| `qwen 27b claude` / `qwen 27b codex` | alternate clients on the same obliterated 27B |
 | `qwen agent` or `qwen code` | the same standalone agent |
 | `qwen "build this project"` | one-shot agent task |
 | `git diff | qwen` | an agent task using stdin |
@@ -206,11 +210,13 @@ sets the local OpenAI-compatible endpoint and a placeholder key. The checked-in
 `config/qwen-code-local.json` supplies 32,768-token context accounting, a
 4,096-token response cap, local-provider timeouts and disabled telemetry. These
 are system defaults: Qwen Code user/project settings can override them. No
-cloud fallback is configured. `QWEN_MODEL` selects the local model;
+cloud fallback is configured. The client retains its conservative 32K budget
+on the 64K 4B tag. `QWEN_MODEL` selects a local model; an explicit `27b` selector
+overrides that environment setting.
 `QWEN_CODE_BIN` overrides the installed executable path.
 
 The provider label Qwen Code prints in its banner and footer is the model tag
-itself, `qwen3.8:27b-obliterated (Ollama)`, expanded from `QWEN_SESSION_MODEL`
+itself, such as `qwen3.5:4b-64k (Ollama)`, expanded from `QWEN_SESSION_MODEL`
 at startup. It used to read `Qwen local (Ollama)`, which said nothing about
 which weights were loaded, and asking the model does not help: Qwen Code's
 system prompt tells it it is Qwen Code, so it denies being the obliterated
@@ -1292,13 +1298,15 @@ something; moving the reviewer to `SessionEnd` would leave no session to wake.
 Run `scripts/test-local-diff-review-cooldown.sh` after changing the cooldown or
 cache-key logic.
 
-## Running the 27B locally (`scripts/qwen`)
+## Selecting local Qwen models (`scripts/qwen`)
 
-Type `qwen` and the obliterated Qwen 3.8 27B answers. `Qwen` and `QWEN` reach the
+Type `qwen` for Qwen3.5 4B, or `qwen 27b` for Qwen3.8 27B OBLITERATED. `Qwen` and `QWEN` reach the
 same file, because the boot volume is case-insensitive APFS.
 
 ```
-qwen                        standalone Qwen Code agent
+qwen                        standalone Qwen Code agent on 4B
+qwen 27b                    standalone agent on the obliterated 27B
+qwen 27b raw "hello"        plain chat on the obliterated 27B
 qwen "explain this diff"    one-shot agent task
 git diff | qwen             prompt from stdin
 qwen status                 what is resident, who owns compute
@@ -1312,6 +1320,12 @@ Install it the way `gbrowse` installs:
 ```bash
 ln -sfn "$PWD/scripts/qwen" ~/.local/bin/qwen
 ```
+
+Claude's catalog alias must have the same Ollama manifest digest as the selected
+model. The launcher refreshes an idle stale alias, and refuses to repoint one
+that is still resident. Status and stop commands count the alias only when its
+digest matches, so `qwen stop` cannot unload a 27B alias selected by another
+session. Use `qwen 27b stop` to stop that model.
 
 ### Why a wrapper instead of `ollama run`
 
@@ -1361,8 +1375,10 @@ leave it alone, or `--force` to load past every check above.
 
 The opening estimate is deliberately high, `disk * 1.15 + cells * 45_000` plus the
 1 GiB prompt cache, or about 22.7 GB. Once a load succeeds the wrapper writes what
-`/api/ps` reported into `~/.cache/qwen-27b/resident-bytes` and uses that number
-from then on. Delete the file to re-measure after changing `num_ctx`,
+`/api/ps` reported into `~/.cache/qwen/<model-key>/resident-bytes` and uses that
+number for the selected model. A 4B measurement cannot lower the 27B admission
+estimate. `QWEN_STATE_DIR` overrides the cache root; each model still gets its
+own subdirectory. Delete the file to re-measure after changing `num_ctx`,
 `OLLAMA_NUM_PARALLEL`, or the KV cache type.
 
 A second `qwen` while the model is already resident costs no new memory, so it

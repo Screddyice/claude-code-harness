@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# qwen — run the obliterated Qwen 3.8 27B locally by typing one word.
+# qwen — local Qwen 4B by default; `qwen 27b` selects the optional 27B.
 #
 # WHY THIS EXISTS
 #   Backdoor was removed on 2026-09-10 and took `~/.local/bin/qwen` with it. Losing
@@ -38,7 +38,8 @@
 #   forever.
 #
 # USAGE
-#   qwen                       standalone Qwen Code agent on the local model
+#   qwen                       standalone Qwen Code agent on Qwen3.5 4B
+#   qwen 27b [command/prompt]   explicitly select Qwen3.8 27B
 #   qwen "build this project"  one-shot agent task, then exit
 #   git diff | qwen            read the prompt from stdin
 #   qwen status                what is resident, who owns compute
@@ -65,13 +66,19 @@
 #   straight through.
 set -euo pipefail
 
-MODEL="${QWEN_MODEL:-qwen3.8:27b-obliterated}"
+MODEL="${QWEN_MODEL:-qwen3.5:4b-64k}"
+# Consume the model selector before dispatching an agent or passing a prompt.
+# An explicit CLI selection wins over a saved QWEN_MODEL override.
+case "${1:-}" in
+  27b|27B) MODEL="qwen3.8:27b-obliterated"; shift ;;
+esac
 GB=$((1024 ** 3))
 DESKTOP_RESERVE=$((2 * GB))     # matches memguard's headroom reserve
 PROMPT_CACHE_MIB="${QWEN_PROMPT_CACHE_MIB:-1024}"   # LLAMA_ARG_CACHE_RAM on this host
 LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.backdoor/compute-leases}"
 LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
-MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen-27b}/resident-bytes"
+MODEL_KEY="$(printf '%s' "$MODEL" | tr -c '[:alnum:]_.-' '_')"
+MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/$MODEL_KEY/resident-bytes"
 AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
 # Claude Code refuses any model id outside its compiled catalog, whatever
 # ANTHROPIC_BASE_URL points at, so the local weights are served under a catalog id.
@@ -128,7 +135,9 @@ resident_names() { api /api/ps | jq -r '.models[]?.name // empty'; }
 # the very session that is using it.
 same_model() {
   local name="${1%:latest}"
-  [ "$name" = "${MODEL%:latest}" ] || [ "$name" = "${CLAUDE_MODEL_ID%:latest}" ]
+  [ "$name" = "${MODEL%:latest}" ] || {
+    [ "$name" = "${CLAUDE_MODEL_ID%:latest}" ] && alias_matches_model
+  }
 }
 
 other_resident_names() {
@@ -147,14 +156,25 @@ tag_resident_bytes() {
 
 # `ollama cp` copies the manifest, not the weights: measured delta on this host
 # was 0 KB. Both tags share ID 2d93c6242422, and Ollama keeps one runner for them.
+alias_matches_model() {
+  api /api/tags 30 | jq -e --arg m "${MODEL%:latest}" --arg a "${CLAUDE_MODEL_ID%:latest}" '
+    [.models[]? | select((.name | sub(":latest$";"")) == $m) | .digest][0] as $model |
+    [.models[]? | select((.name | sub(":latest$";"")) == $a) | .digest][0] as $alias |
+    ($model != null and $model != "" and $model == $alias)
+  ' >/dev/null 2>&1
+}
+
 ensure_alias() {
-  if api /api/tags 30 | jq -e --arg a "${CLAUDE_MODEL_ID%:latest}" \
-      '[.models[]? | select((.name | sub(":latest$";"")) == $a)] | length > 0' >/dev/null 2>&1; then
-    return 0
+  alias_matches_model && return 0
+  # An old alias may still be serving another session. Changing its manifest
+  # while that runner is active would make name-based residency checks lie.
+  if [ -n "$(tag_resident_bytes "$CLAUDE_MODEL_ID" || true)" ]; then
+    die "$CLAUDE_MODEL_ID is resident with different or unknown weights; finish that session before selecting $MODEL"
   fi
-  note "creating the Ollama alias $CLAUDE_MODEL_ID -> $MODEL (manifest copy, no extra disk)"
+  note "setting the Ollama alias $CLAUDE_MODEL_ID -> $MODEL (manifest copy, no extra disk)"
   ollama cp "$MODEL" "$CLAUDE_MODEL_ID" >/dev/null 2>&1 ||
     die "could not create the alias tag $CLAUDE_MODEL_ID"
+  alias_matches_model || die "the alias tag $CLAUDE_MODEL_ID does not match $MODEL"
 }
 
 # claude-mem's hosted recall. The token is referenced, never copied: Claude Code
@@ -249,7 +269,11 @@ resident_bytes() {
     '[.models[]? | select(.name == $m or .name == ($m + ":latest")) | .size][0] // empty'
 }
 
-is_resident() { [ -n "$(resident_bytes)" ] || [ -n "$(tag_resident_bytes "$CLAUDE_MODEL_ID")" ]; }
+is_resident() {
+  [ -n "$(resident_bytes)" ] || {
+    alias_matches_model && [ -n "$(tag_resident_bytes "$CLAUDE_MODEL_ID")" ]
+  }
+}
 
 # --- memory -----------------------------------------------------------------
 
@@ -398,7 +422,7 @@ cmd_status() {
   local size under
   size=$(resident_bytes || true)
   under="$MODEL"
-  if [ -z "${size:-}" ]; then
+  if [ -z "${size:-}" ] && alias_matches_model; then
     # An agent session loads the same blobs under the catalog-id alias, which is
     # this model resident, not some other model.
     size=$(tag_resident_bytes "$CLAUDE_MODEL_ID" || true)
@@ -429,8 +453,10 @@ cmd_status() {
 cmd_stop() {
   server_up || { note "Ollama is not running; nothing to unload"; return 0; }
   ollama stop "$MODEL" >/dev/null 2>&1 || true
-  ollama stop "$CLAUDE_MODEL_ID" >/dev/null 2>&1 || true
-  note "unloaded $MODEL (and its $CLAUDE_MODEL_ID alias)"
+  if alias_matches_model; then
+    ollama stop "$CLAUDE_MODEL_ID" >/dev/null 2>&1 || true
+  fi
+  note "unloaded $MODEL and any matching catalog alias"
 }
 
 # Shared setup for an agent session (Claude Code or Codex) on the local model.
