@@ -227,6 +227,12 @@ uses the remote verifier-gated ladder, so the two workloads never share model
 memory. An in-flight council loses its current turn when Qwen preempts it; a
 new invocation performs the frontier handoff.
 
+The launcher also reclaims an abandoned Qwen session when the lock holder is a
+Qwen process older than 30 minutes and Ollama reports no resident model. Set
+`QWEN_STALE_SESSION_SECONDS` to tune that threshold. The launcher keeps a live
+Qwen session or any Ollama owner protected when it cannot prove that the session
+is stale.
+
 For better throughput, use `qwen` for broad repository discovery and `qwen 27b code`
 for a focused implementation slice. Give the 27B a named phase or target, ask it to
 edit and test that slice, and keep further inventory out of the turn unless the edit
