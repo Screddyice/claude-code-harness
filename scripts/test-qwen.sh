@@ -496,7 +496,7 @@ for entry in "" agent code; do
   fi
 done
 if jq -e '
-  .model.maxToolCallsPerTurn == 24 and
+  .model.maxToolCallsPerTurn == 12 and
   .model.skipLoopDetection == false and
   .context.autoCompactThreshold == 0.8
 ' "$ROOT/config/qwen-code-local.json" >/dev/null; then

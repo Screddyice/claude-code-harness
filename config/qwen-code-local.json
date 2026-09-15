@@ -3,7 +3,7 @@
   "security": { "auth": { "selectedType": "openai" } },
   "model": {
     "name": "${QWEN_SESSION_MODEL}",
-    "maxToolCallsPerTurn": 24,
+    "maxToolCallsPerTurn": 12,
     "skipLoopDetection": false
   },
   "modelProviders": {
