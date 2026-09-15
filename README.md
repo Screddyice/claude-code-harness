@@ -40,7 +40,7 @@ codex-harness/
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
 │   ├── gbrowse                       # headed-browser wrapper that survives a session
-│   ├── qwen                          # loads the exclusive 27B without panicking the Mac
+│   ├── qwen                          # defaults to local 4B; explicit 27B keeps admission guards
 │   ├── test-qwen.sh                  # admission, lock and lease tests (loads no model)
 │   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
 │   ├── dns-postflight.sh             # did the cutover land, and did mail survive
@@ -116,6 +116,43 @@ feat/nebby-verdict-routing  -> hotfix/nebby-slack-backoff  (7 commits, not 16)
 hotfix/nebby-slack-backoff  -> main                        (escape hatch)
 ```
 
+## team-context memory auto-sync
+
+`scripts/hooks/team-context-autosync.sh` is a **Stop** hook that commits and pushes
+`memory/` and `projects-context/` in `~/TeamNebula/team-context` to whatever branch
+that repo is currently on. Register it in `~/.claude/settings.json` with
+`"async": true` so it never delays session end.
+
+```bash
+scripts/hooks/team-context-autosync.sh status   # branch, pause state, pending, recent runs
+scripts/hooks/team-context-autosync.sh now      # sync immediately, ignoring the pause flag
+scripts/hooks/team-context-autosync.sh pause    # stop auto-syncing
+scripts/hooks/team-context-autosync.sh resume
+```
+
+**Why this exists.** It replaces tmn-skills' `memory-autosync.sh`, which stopped
+running on 2026-08-31 when the tree it lived in (`~/moonshot/...`) ceased to exist.
+Nothing noticed for ten days: 22 episodic records piled up uncommitted, and the
+log's final lines were *successes*, so there was no failure to find. Its last run
+had also pushed to a dedicated branch and opened a PR nobody watched — that PR sat
+open for eleven days holding a record that existed nowhere else.
+
+Three design choices follow from that:
+
+- **Pushes to the current branch, never its own.** Records land where the session
+  was already working, so they cannot strand on an orphan branch.
+- **Never opens a PR.** A PR nobody watches is how the record above got stranded.
+- **Refuses to push to `main`/`master`.** Those are protected upstream; a sync must
+  not be the thing that discovers that. Records still commit locally.
+
+**PII guard.** Before committing, the hook scans the staged diff for email
+addresses and aborts if it finds one belonging to a named individual. Role and
+vendor addresses (`support@`, `admin@`, `noreply@`) and org-domain addresses pass.
+This exists because agents append memory records automatically: on 2026-09-10 a
+client contact's address reached `records.jsonl` with nobody looking, and the
+repo's own no-PII rule failed silently. A blocked sync logs the addresses, resets
+the index, and leaves the work uncommitted for a human to scrub.
+
 ## Who This Is For
 
 You operate multiple companies or orgs out of a single workspace directory, each with
@@ -147,7 +184,9 @@ while sharing one Codex setup.
 `qwen` starts **Qwen Code**, an independent coding agent connected to the local
 Ollama model. It can read and edit files, execute terminal commands, run builds,
 and retain sessions without launching Claude Code or Codex. Run it from the
-project directory. `qwen raw` provides plain chat without execution tools.
+project directory. The default model is `qwen3.5:4b-64k`. Type `qwen 27b`
+to select **`qwen3.8:27b-obliterated`**; the 27B selector never chooses a stock
+model. `qwen raw` provides plain chat without execution tools.
 
 Install Node.js 22+ and run `bash scripts/install-qwen-code.sh` once. The installer
 pins Qwen Code 0.23.4 in `~/.local/share/qwen-code`; its npm binary does not replace
@@ -155,7 +194,9 @@ the guarded `~/.local/bin/qwen` launcher.
 
 | You type | You get |
 |---|---|
-| `qwen` | interactive standalone Qwen Code |
+| `qwen` | interactive standalone Qwen Code on 4B |
+| `qwen 27b` | standalone agent on Qwen3.8 27B OBLITERATED |
+| `qwen 27b claude` / `qwen 27b codex` | alternate clients on the same obliterated 27B |
 | `qwen agent` or `qwen code` | the same standalone agent |
 | `qwen "build this project"` | one-shot agent task |
 | `git diff | qwen` | an agent task using stdin |
@@ -170,12 +211,14 @@ sets the local OpenAI-compatible endpoint and a placeholder key. The checked-in
 4,096-token response cap, local-provider timeouts and disabled telemetry. It
 compacts at 80% of the provider window, enables Qwen Code's loop detector, and
 stops a turn after 24 tool calls. These are system defaults: Qwen Code
-user/project settings can override them. No cloud fallback is configured.
-`QWEN_MODEL` selects the local model;
+user/project settings can override them. No
+cloud fallback is configured. The client retains its conservative 32K budget
+on the 64K 4B tag. `QWEN_MODEL` selects a local model; an explicit `27b` selector
+overrides that environment setting.
 `QWEN_CODE_BIN` overrides the installed executable path.
 
 The provider label Qwen Code prints in its banner and footer is the model tag
-itself, `qwen3.8:27b-obliterated (Ollama)`, expanded from `QWEN_SESSION_MODEL`
+itself, such as `qwen3.5:4b-64k (Ollama)`, expanded from `QWEN_SESSION_MODEL`
 at startup. It used to read `Qwen local (Ollama)`, which said nothing about
 which weights were loaded, and asking the model does not help: Qwen Code's
 system prompt tells it it is Qwen Code, so it denies being the obliterated
@@ -199,11 +242,11 @@ on a model for larger builds; a textual claim alone does not prove an edit or bu
 
 ## A `qwen claude` session says Qwen, not Haiku
 
-Claude Code refuses any model id outside its compiled catalog, so the local weights are
-served under one: `claude-haiku-4-5-20251001`, an `ollama cp` manifest copy that shares
-its blobs and its runner with `qwen3.8:27b-obliterated`. Every surface that derives a
-name from the id then calls the session Haiku 4.5, which is the one thing on screen that
-is false.
+Claude Code refuses any model id outside its compiled catalog, so the selected local
+model is served under one: `claude-haiku-4-5-20251001`, an `ollama cp` manifest copy
+that shares its blobs and runner with whichever Qwen tag the launcher selected. Every
+surface that derives a name from the id then calls the session Haiku 4.5, which is the
+one thing on screen that is false.
 
 Two places now say otherwise:
 
@@ -214,11 +257,12 @@ Two places now say otherwise:
   wrapper to label it still reads as local.
 - **`/model`.** The picker builds its labels from
   `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL_NAME` when they are set, so all
-  four now read `qwen3.8:27b-obliterated (local)`. Override with `QWEN_MODEL_LABEL`.
+  four now read the selected Qwen tag, such as `qwen3.5:4b-64k (local)`. Override
+  with `QWEN_MODEL_LABEL`.
 
 The fable slot joined the other three in pointing at the alias. A slot left on a real
 Claude id is a 404 against Ollama the moment anything selects it, and a second local tag
-would load a second 17 GB runner, which is the co-residency that panics this Mac.
+would load a second runner, which is the co-residency that panics this Mac.
 
 Claude Code has no environment variable for the session's own display name — `Ise`, the
 override map behind it, is a static table of marketing names — so the status line is
@@ -1257,13 +1301,15 @@ something; moving the reviewer to `SessionEnd` would leave no session to wake.
 Run `scripts/test-local-diff-review-cooldown.sh` after changing the cooldown or
 cache-key logic.
 
-## Running the 27B locally (`scripts/qwen`)
+## Selecting local Qwen models (`scripts/qwen`)
 
-Type `qwen` and the obliterated Qwen 3.8 27B answers. `Qwen` and `QWEN` reach the
+Type `qwen` for Qwen3.5 4B, or `qwen 27b` for Qwen3.8 27B OBLITERATED. `Qwen` and `QWEN` reach the
 same file, because the boot volume is case-insensitive APFS.
 
 ```
-qwen                        standalone Qwen Code agent
+qwen                        standalone Qwen Code agent on 4B
+qwen 27b                    standalone agent on the obliterated 27B
+qwen 27b raw "hello"        plain chat on the obliterated 27B
 qwen "explain this diff"    one-shot agent task
 git diff | qwen             prompt from stdin
 qwen status                 what is resident, who owns compute
@@ -1277,6 +1323,12 @@ Install it the way `gbrowse` installs:
 ```bash
 ln -sfn "$PWD/scripts/qwen" ~/.local/bin/qwen
 ```
+
+Claude's catalog alias must have the same Ollama manifest digest as the selected
+model. The launcher refreshes an idle stale alias, and refuses to repoint one
+that is still resident. Status and stop commands count the alias only when its
+digest matches, so `qwen stop` cannot unload a 27B alias selected by another
+session. Use `qwen 27b stop` to stop that model.
 
 ### Why a wrapper instead of `ollama run`
 
@@ -1326,8 +1378,10 @@ leave it alone, or `--force` to load past every check above.
 
 The opening estimate is deliberately high, `disk * 1.15 + cells * 45_000` plus the
 1 GiB prompt cache, or about 22.7 GB. Once a load succeeds the wrapper writes what
-`/api/ps` reported into `~/.cache/qwen-27b/resident-bytes` and uses that number
-from then on. Delete the file to re-measure after changing `num_ctx`,
+`/api/ps` reported into `~/.cache/qwen/<model-key>/resident-bytes` and uses that
+number for the selected model. A 4B measurement cannot lower the 27B admission
+estimate. `QWEN_STATE_DIR` overrides the cache root; each model still gets its
+own subdirectory. Delete the file to re-measure after changing `num_ctx`,
 `OLLAMA_NUM_PARALLEL`, or the KV cache type.
 
 A second `qwen` while the model is already resident costs no new memory, so it
@@ -1347,9 +1401,11 @@ swapped tiers under a live session, which is what made it unreliable enough to
 delete.
 
 ```
-qwen claude                    Claude Code on the 27B, cmem wired in
+qwen claude                    Claude Code on the default 4B, cmem wired in
+qwen 27b claude                Claude Code on the obliterated 27B, cmem wired in
 qwen agent                     standalone Qwen Code (see above)
-qwen codex                     Codex on the 27B, cmem wired in
+qwen codex                     Codex on the default 4B, cmem wired in
+qwen 27b codex                 Codex on the obliterated 27B, cmem wired in
   --mcp cmem|none|all          MCP servers (default: cmem)
   --tools mcp|lean|all         built-in tools alongside MCP (default: lean)
   QWEN_MEMORY=0                no recall server and no claude-mem worker
@@ -1375,23 +1431,23 @@ and answers `[claude-code:unrecognized_model]` for anything else, wherever
 | plus `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | refused |
 | the same blobs under a catalog id | worked first try |
 
-So `qwen claude` runs `ollama cp qwen3.8:27b-obliterated claude-haiku-4-5-20251001`
-once. That copies the manifest, not the weights: the measured delta on this host
-was 0 KB, both tags carry ID `2d93c6242422`, and Ollama keeps one runner for them.
-Override the id with `QWEN_CLAUDE_MODEL_ID`.
+So `qwen claude` runs `ollama cp <selected-model> claude-haiku-4-5-20251001` when the
+alias is missing or stale and idle. That copies the manifest, not the weights: the
+measured delta on this host was 0 KB for the 27B alias, and Ollama keeps one runner for
+matching tags. Override the id with `QWEN_CLAUDE_MODEL_ID`.
 
 Every model slot — `ANTHROPIC_MODEL`, the Opus, Sonnet and Haiku defaults,
 `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` — points at that one
 alias. Claude Code resolves its background work separately from the main model, and
 both other outcomes are wrong: a real Claude id 404s against Ollama, and a second
-local tag loads a second 17 GB runner, which is the co-residency that panics this
-Mac. Codex needs none of this; it has no allowlist and takes the real tag.
+local tag loads a second runner, which is the co-residency that panics this Mac.
+Codex needs none of this; it has no allowlist and takes the real tag.
 
-The wrapper treats the alias and the canonical tag as one model throughout. Nothing
-unloads the alias "to make room" and evicts the session using it, `qwen status`
-reports it as this model resident rather than a foreign one, and `qwen stop`
-unloads both tags. Reporting the alias as "not loaded" is how you end up holding
-17 GB you believe is free.
+The wrapper treats the alias and the selected canonical tag as one model only when their
+manifest digests match. It refreshes an idle stale alias, refuses to repoint one that is
+still resident, and keeps status and stop scoped to the matching alias. Reporting the
+matching alias as "not loaded" is how you end up holding memory you believe is free;
+unloading a stale resident alias is how you evict another session.
 
 #### Keeping 32k tokens usable
 
@@ -1428,6 +1484,65 @@ a session that dies leaves nothing pointing at a local model.
 Run `scripts/test-qwen.sh` after changing admission, locking, lease handling, or
 the agent commands. Its checks stub Ollama, launchd, both memory probes and
 both agent binaries, so no case loads a model or starts a session.
+
+## claude-harness guard patch
+
+`scripts/hooks/harness-guard-patch.sh` runs on `SessionStart` and keeps one rule in
+the claude-harness plugin's `PreToolUse` guard from denying safe commands. It is a
+no-op once the patch is in.
+
+### What the upstream rule did
+
+The plugin blocks recursive deletion of a repo's `.claude-harness` state, which is
+right. The pattern was not: it matched the delete command anywhere in the command
+string, after any whitespace. Two things it was never aimed at got denied:
+
+- `git rm -r --cached .claude-harness`, which drops index entries and leaves every
+  file on disk. That is exactly how you stop tracking the scaffold.
+- Any script whose **comment or heredoc** merely contained the phrase. The tool call
+  was refused before a byte was written, so a script that deleted nothing could not
+  even be created. That is how this was found.
+
+### What replaces it
+
+The delete command has to sit in command position: the start of a line, after a
+separator or shell keyword, or behind `sudo`/`xargs` and their common options.
+Anchoring that way loses `git rm`, which does delete from the working tree, so
+that gets its own rule with `--cached` exempted.
+
+| Command | Before | After |
+|---------|--------|-------|
+| a bare recursive delete of the directory | deny | deny |
+| the same after `&&`, `if`, `sudo -u`, or `xargs -0` | deny | deny |
+| `git rm -r` on it, no `--cached` | deny | deny |
+| `git rm -r --cached` on it | deny | **allow** |
+| the phrase inside a comment, heredoc, or quoted text | deny | **allow** |
+| a backtick command substitution deleting the directory | deny | deny |
+
+That last row is its own small lesson. Backtick command substitution is still active
+inside double quotes, so the guard treats a backtick before the delete command the
+same way it treats `$(`.
+
+### Why it is reapplied every session
+
+The plugin is a clone of `panayiotism/claude-harness-marketplace` and a sync
+overwrites the file, the same reason `gstack-browser-shim.sh` runs on `SessionStart`.
+That clone's `hooks/hooks.json` already carries an unrelated local quoting fix, so
+local patching is the existing arrangement rather than a new one.
+
+The patch text lives beside the script as `harness-guard-patch.before` and
+`.after`, matched and replaced literally. If upstream rewrites the rule, the script
+reports it and changes nothing rather than guessing. Upstreaming this is the real fix.
+
+```bash
+scripts/hooks/harness-guard-patch.sh          # patch every installed copy, quietly
+scripts/hooks/harness-guard-patch.sh --check  # report status, exit 1 if stale
+scripts/test-harness-guard.sh                 # 31 checks, no installed plugin touched
+```
+
+Apply mode always exits 0: a guard one release out of date is a smaller problem than
+a hook that fails every new session. `--check` returns the real verdict, which is what
+the tests assert against.
 
 ## Migration Audit
 

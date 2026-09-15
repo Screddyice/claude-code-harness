@@ -47,6 +47,12 @@ cat > "$STUB/ollama" <<'EOF'
 printf '%s\n' "$*" >> "$FIXTURE/ollama.log"
 case "$1" in
   run) printf 'RAN %s\n' "$*" ;;
+  cp)
+    jq --arg src "$2" --arg dest "$3" '
+      (.models[] | select(.name == $src)) as $source |
+      .models = ([.models[] | select(.name != $dest)] + [$source | .name = $dest])
+    ' "$FIXTURE/tags.json" > "$FIXTURE/tags.next" && mv "$FIXTURE/tags.next" "$FIXTURE/tags.json" ;;
+
   stop)
     [ ! -f "$FIXTURE/stop-fails" ] || exit 42
     if [ ! -f "$FIXTURE/stop-keeps-resident" ]; then
@@ -123,10 +129,9 @@ EOF
 chmod +x "$STUB"/*
 
 MODEL=qwen3.8:27b-obliterated
-# 16.5 GB on disk, which is what this tag actually reports.
-printf '{"models":[{"name":"%s","size":17716740000}]}\n' "$MODEL" > "$FIXTURE/tags.json"
 
 reset_world() {
+  printf '{"models":[{"name":"%s","size":17716740000,"digest":"heavy"},{"name":"qwen3.5:4b-64k","size":2500000000,"digest":"small"}]}\n' "$MODEL" > "$FIXTURE/tags.json"
   echo '{"models":[]}' > "$FIXTURE/ps.json"
   echo 1 > "$FIXTURE/pressure"
   echo 80 > "$FIXTURE/free_pct"
@@ -154,6 +159,7 @@ reset_world() {
 run_qwen() {
   env -i PATH="$STUB" HOME="$FIXTURE" FIXTURE="$FIXTURE" \
     OLLAMA_HOST=127.0.0.1:11434 \
+    QWEN_MODEL="${TEST_QWEN_MODEL-$MODEL}" \
     QWEN_STATE_DIR="$FIXTURE/state" \
     QWEN_EVICTION_TIMEOUT="${QWEN_EVICTION_TIMEOUT:-30}" \
     LLMJURY_COMPUTE_LEASE_DIR="$FIXTURE/leases" \
@@ -325,6 +331,12 @@ fi
 # --- agent sessions ---------------------------------------------------------
 
 ALIAS=claude-haiku-4-5-20251001
+set_alias() {
+  jq --arg source "$1" --arg alias "$ALIAS" '
+    (.models[] | select(.name == $source)) as $model |
+    .models = ([.models[] | select(.name != $alias)] + [$model | .name = $alias])
+  ' "$FIXTURE/tags.json" > "$FIXTURE/tags.next" && mv "$FIXTURE/tags.next" "$FIXTURE/tags.json"
+}
 
 # Claude Code 2.1.267 refuses any model id outside its compiled catalog, whatever
 # ANTHROPIC_BASE_URL points at. Serving the same blobs under a catalog id is the
@@ -414,6 +426,7 @@ fi
 # The alias and the canonical tag are one model on one set of blobs. Unloading the
 # alias "to make room" would evict the session that is using it.
 reset_world
+set_alias "$MODEL"
 printf '{"models":[{"name":"%s:latest","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
 run_qwen claude >/dev/null
 if grep -q "^stop $ALIAS" "$FIXTURE/ollama.log"; then
@@ -425,6 +438,7 @@ fi
 # An agent session loads the blobs under the alias. Reporting that as "not loaded"
 # plus a foreign resident model is how you end up holding 17 GB you think is free.
 reset_world
+set_alias "$MODEL"
 printf '{"models":[{"name":"%s:latest","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
 out=$(run_qwen status)
 case "$out" in
@@ -433,6 +447,7 @@ case "$out" in
 esac
 
 reset_world
+set_alias "$MODEL"
 run_qwen stop >/dev/null
 if grep -qx "stop $MODEL" "$FIXTURE/ollama.log" && grep -qx "stop $ALIAS" "$FIXTURE/ollama.log"; then
   pass "stop unloads both the canonical tag and the alias"
@@ -480,7 +495,6 @@ for entry in "" agent code; do
     fail "${entry:-default} pins local provider and context defaults"
   fi
 done
-
 if jq -e '
   .model.maxToolCallsPerTurn == 24 and
   .model.skipLoopDetection == false and
@@ -609,6 +623,88 @@ out=$(run_qwen claude --mcp bogus)
 case "$out" in
   *"--mcp takes cmem, none or all"*) pass "an unknown --mcp value is refused" ;;
   *) fail "an unknown --mcp value is refused" "$out" ;;
+esac
+
+# --- 4B default and explicit 27B selection -----------------------------------
+
+reset_world
+TEST_QWEN_MODEL= run_qwen 'build this project' >/dev/null
+if grep -qxF 'qwen3.5:4b-64k' "$FIXTURE/qwen-code.argv" &&
+   grep -qxF 'build this project' "$FIXTURE/qwen-code.argv"; then
+  pass "unconfigured qwen selects 4B and preserves the prompt"
+else
+  fail "unconfigured qwen selects 4B"
+fi
+
+for entry in '' code agent claude codex raw; do
+  reset_world
+  out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen 27b $entry hello)
+  case "$out" in
+    *"$MODEL"*) pass "27b ${entry:-default} overrides a saved 4B selection" ;;
+    *) fail "27b ${entry:-default} selects 27B" "$out" ;;
+  esac
+  if grep -qxF '27b' "$FIXTURE/qwen-code.argv" 2>/dev/null; then
+    fail "model selector is consumed before the agent prompt"
+  fi
+done
+
+reset_world
+TEST_QWEN_MODEL= run_qwen 27B code hello >/dev/null
+if grep -qxF "$MODEL" "$FIXTURE/qwen-code.argv"; then
+  pass "27B uppercase selector uses the heavy model"
+else
+  fail "27B uppercase selector uses the heavy model"
+fi
+
+reset_world
+set_alias "$MODEL"
+TEST_QWEN_MODEL= run_qwen claude >/dev/null
+if grep -qxF "cp qwen3.5:4b-64k $ALIAS" "$FIXTURE/ollama.log" &&
+   [ "$(claude_env QWEN_SESSION_MODEL)" = 'qwen3.5:4b-64k' ]; then
+  pass "Claude refreshes an idle 27B alias to 4B"
+else
+  fail "Claude refreshes an idle stale alias"
+fi
+
+reset_world
+set_alias "$MODEL"
+printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
+if out=$(TEST_QWEN_MODEL= run_qwen claude); then
+  fail "an active stale alias blocks a model switch" "$out"
+elif [ ! -s "$FIXTURE/ollama.log" ]; then
+  pass "an active stale alias is neither changed nor unloaded"
+else
+  fail "an active stale alias is left untouched" "$(cat "$FIXTURE/ollama.log")"
+fi
+
+reset_world
+set_alias "$MODEL"
+printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
+out=$(TEST_QWEN_MODEL= run_qwen status)
+case "$out" in
+  *"qwen3.5:4b-64k"*"not loaded"*"also resident: $ALIAS"*) pass "4B status does not claim a resident 27B alias" ;;
+  *) fail "4B status distinguishes a foreign alias" "$out" ;;
+esac
+TEST_QWEN_MODEL= run_qwen stop >/dev/null
+if grep -qxF "stop $ALIAS" "$FIXTURE/ollama.log"; then
+  fail "4B stop must not unload a 27B alias"
+else
+  pass "4B stop leaves the 27B alias alone"
+fi
+
+reset_world
+mkdir -p "$FIXTURE/state/qwen3.5_4b-64k"
+echo 1 > "$FIXTURE/state/qwen3.5_4b-64k/resident-bytes"
+echo 20 > "$FIXTURE/free_pct"
+out=$(run_qwen 27b raw hello)
+case "$out" in
+  *"needs ~"*) pass "27B admission does not reuse a smaller 4B measurement" ;;
+  *) fail "resident measurements are model-specific" "$out" ;;
+esac
+out=$(TEST_QWEN_MODEL= run_qwen raw hello)
+case "$out" in
+  *"RAN run qwen3.5:4b-64k hello"*) pass "4B admission uses its own recorded measurement" ;;
+  *) fail "4B measurement is usable" "$out" ;;
 esac
 
 printf '\n%s\n' "$([ "$failures" -eq 0 ] && echo 'all qwen checks passed' || echo "$failures qwen check(s) failed")"
