@@ -217,6 +217,16 @@ on the 64K 4B tag. `QWEN_MODEL` selects a local model; an explicit `27b` selecto
 overrides that environment setting.
 `QWEN_CODE_BIN` overrides the installed executable path.
 
+The 27B selector owns the shared local-compute lock. If a cooperating LLM-Jury
+council or diff reviewer holds that lock, the launcher terminates that exact
+holder, waits for the kernel lock to release, and then runs the normal pressure
+and RAM checks. It refuses to force-stop another Qwen or Ollama process. A 4B
+launch keeps the non-preemptive behavior. When Qwen owns the 27B lease,
+`llmjury solve --backend ollama --frontier auto` skips the local council and
+uses the remote verifier-gated ladder, so the two workloads never share model
+memory. An in-flight council loses its current turn when Qwen preempts it; a
+new invocation performs the frontier handoff.
+
 For better throughput, use `qwen` for broad repository discovery and `qwen 27b code`
 for a focused implementation slice. Give the 27B a named phase or target, ask it to
 edit and test that slice, and keep further inventory out of the turn unless the edit
