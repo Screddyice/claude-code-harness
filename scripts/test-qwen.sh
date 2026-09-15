@@ -88,6 +88,11 @@ cat > "$STUB/pgrep" <<'EOF'
 exit 1
 EOF
 
+cat > "$STUB/lsof" <<'EOF'
+#!/bin/bash
+[ -r "$FIXTURE/holder.pid" ] && cat "$FIXTURE/holder.pid"
+EOF
+
 cat > "$STUB/launchctl" <<'EOF'
 #!/bin/bash
 exit 0
@@ -140,7 +145,8 @@ reset_world() {
         "$FIXTURE/claude.argv" "$FIXTURE/claude.env" \
         "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
         "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" \
-        "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up"
+        "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up" \
+        "$FIXTURE/holder.pid"
   # A claude-mem install the wrapper can find: newest version wins, and an
   # orphaned one is skipped even when it sorts higher.
   rm -rf "$FIXTURE/mem-cache"
@@ -296,7 +302,7 @@ case "$out" in
   *) fail "attaching to a resident model skips the guard" "$out" ;;
 esac
 
-# The reviewer and cooperating councils hold this same lock, nonblocking.
+# A 4B session remains conservative: it does not preempt another local owner.
 reset_world
 python3 - "$FIXTURE/compute.lock" <<'PY' &
 import fcntl, sys, time
@@ -306,12 +312,42 @@ time.sleep(10)
 PY
 holder=$!
 sleep 1
-out=$(run_qwen raw "hello")
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen raw "hello")
 kill "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
 case "$out" in
   *"owns compute"*) pass "a held compute lock refuses the load" ;;
   *) fail "a held compute lock refuses the load" "$out" ;;
+esac
+
+# A requested 27B session is the exclusive owner. It terminates a cooperating
+# local holder, waits for the kernel lock to clear, and then loads normally.
+reset_world
+python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
+import fcntl, os, signal, sys, time
+from pathlib import Path
+
+handle = open(sys.argv[1], "a")
+marker = Path(sys.argv[2])
+marker.write_text(str(os.getpid()), encoding="utf-8")
+
+def release_and_exit(_signum, _frame):
+    marker.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, release_and_exit)
+signal.signal(signal.SIGINT, release_and_exit)
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 1
+out=$(run_qwen raw "hello")
+wait "$holder" 2>/dev/null || true
+case "$out" in
+  *"preempting local compute owner pid"*"RAN run $MODEL hello"*)
+    pass "27B preempts a cooperating local owner and loads" ;;
+  *) fail "27B preempts a cooperating local owner and loads" "$out" ;;
 esac
 
 # `exec` skips the EXIT trap, so leases outlive their session by design; the next
