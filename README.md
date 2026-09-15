@@ -210,12 +210,17 @@ sets the local OpenAI-compatible endpoint and a placeholder key. The checked-in
 `config/qwen-code-local.json` supplies 32,768-token context accounting, a
 4,096-token response cap, local-provider timeouts and disabled telemetry. It
 compacts at 80% of the provider window, enables Qwen Code's loop detector, and
-stops a turn after 24 tool calls. These are system defaults: Qwen Code
+stops a turn after 12 tool calls. These are system defaults: Qwen Code
 user/project settings can override them. No
 cloud fallback is configured. The client retains its conservative 32K budget
 on the 64K 4B tag. `QWEN_MODEL` selects a local model; an explicit `27b` selector
 overrides that environment setting.
 `QWEN_CODE_BIN` overrides the installed executable path.
+
+For better throughput, use `qwen` for broad repository discovery and `qwen 27b code`
+for a focused implementation slice. Give the 27B a named phase or target, ask it to
+edit and test that slice, and keep further inventory out of the turn unless the edit
+needs it. Keep other local models stopped while the 27B is resident.
 
 The provider label Qwen Code prints in its banner and footer is the model tag
 itself, such as `qwen3.5:4b-64k (Ollama)`, expanded from `QWEN_SESSION_MODEL`
