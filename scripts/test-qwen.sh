@@ -495,6 +495,15 @@ for entry in "" agent code; do
     fail "${entry:-default} pins local provider and context defaults"
   fi
 done
+if jq -e '
+  .model.maxToolCallsPerTurn == 24 and
+  .model.skipLoopDetection == false and
+  .context.autoCompactThreshold == 0.8
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "standalone Qwen defaults bound context and repeated tool turns"
+else
+  fail "standalone Qwen defaults bound context and repeated tool turns"
+fi
 reset_world
 run_qwen code --help >/dev/null
 if [ ! -s "$FIXTURE/ollama.log" ]; then

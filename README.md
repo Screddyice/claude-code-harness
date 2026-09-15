@@ -189,7 +189,7 @@ to select **`qwen3.8:27b-obliterated`**; the 27B selector never chooses a stock
 model. `qwen raw` provides plain chat without execution tools.
 
 Install Node.js 22+ and run `bash scripts/install-qwen-code.sh` once. The installer
-pins Qwen Code 0.23.3 in `~/.local/share/qwen-code`; its npm binary does not replace
+pins Qwen Code 0.23.4 in `~/.local/share/qwen-code`; its npm binary does not replace
 the guarded `~/.local/bin/qwen` launcher.
 
 | You type | You get |
@@ -208,8 +208,10 @@ the guarded `~/.local/bin/qwen` launcher.
 The launcher reuses the existing model admission guard and compute lease. It
 sets the local OpenAI-compatible endpoint and a placeholder key. The checked-in
 `config/qwen-code-local.json` supplies 32,768-token context accounting, a
-4,096-token response cap, local-provider timeouts and disabled telemetry. These
-are system defaults: Qwen Code user/project settings can override them. No
+4,096-token response cap, local-provider timeouts and disabled telemetry. It
+compacts at 80% of the provider window, enables Qwen Code's loop detector, and
+stops a turn after 24 tool calls. These are system defaults: Qwen Code
+user/project settings can override them. No
 cloud fallback is configured. The client retains its conservative 32K budget
 on the 64K 4B tag. `QWEN_MODEL` selects a local model; an explicit `27b` selector
 overrides that environment setting.

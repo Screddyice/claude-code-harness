@@ -8,7 +8,6 @@
     if printf '%s' "$COMMAND" | grep -qE '(^|[;&|(`]|\$\()[[:space:]]*((if|then|do|else|while|until)[[:space:]]+)?((sudo([[:space:]]+(-[ugp][[:space:]]+[^[:space:];&|]+|-[^[:space:];&|]+|--[^=[:space:];&|]+(=[^[:space:];&|]+)?))*|xargs([[:space:]]+(-[nPIsdJLaE][[:space:]]*[^[:space:];&|]+|-[^[:space:];&|]+|--[^=[:space:];&|]+(=[^[:space:];&|]+)?))*)[[:space:]]+)?rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f?[[:space:]][^;&|]*\.claude-harness'; then
         DENY_REASON="BLOCKED: Deleting .claude-harness would destroy all session state and memory."
     fi
-
     # `git rm` does delete from the working tree, and no longer matches the rule
     # above now that it is anchored to command position. `--cached` is the safe
     # form: it drops index entries and leaves every file where it is.
@@ -17,4 +16,3 @@
             DENY_REASON="BLOCKED: git rm would delete .claude-harness from the working tree. Add --cached to untrack it without touching the files."
         fi
     fi
-

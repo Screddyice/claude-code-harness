@@ -1,7 +1,11 @@
 {
   "$version": 4,
   "security": { "auth": { "selectedType": "openai" } },
-  "model": { "name": "${QWEN_SESSION_MODEL}" },
+  "model": {
+    "name": "${QWEN_SESSION_MODEL}",
+    "maxToolCallsPerTurn": 24,
+    "skipLoopDetection": false
+  },
   "modelProviders": {
     "openai": [{
       "id": "${QWEN_SESSION_MODEL}",
@@ -17,7 +21,10 @@
       }
     }]
   },
-  "context": { "fileName": ["AGENTS.md", "QWEN.md"] },
+  "context": {
+    "fileName": ["AGENTS.md", "QWEN.md"],
+    "autoCompactThreshold": 0.8
+  },
   "tools": {
     "approvalMode": "default",
     "eager": ["read_file", "grep_search", "glob", "edit", "write_file", "run_shell_command", "skill", "web_fetch"]
