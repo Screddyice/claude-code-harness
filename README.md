@@ -240,11 +240,11 @@ on a model for larger builds; a textual claim alone does not prove an edit or bu
 
 ## A `qwen claude` session says Qwen, not Haiku
 
-Claude Code refuses any model id outside its compiled catalog, so the local weights are
-served under one: `claude-haiku-4-5-20251001`, an `ollama cp` manifest copy that shares
-its blobs and its runner with `qwen3.8:27b-obliterated`. Every surface that derives a
-name from the id then calls the session Haiku 4.5, which is the one thing on screen that
-is false.
+Claude Code refuses any model id outside its compiled catalog, so the selected local
+model is served under one: `claude-haiku-4-5-20251001`, an `ollama cp` manifest copy
+that shares its blobs and runner with whichever Qwen tag the launcher selected. Every
+surface that derives a name from the id then calls the session Haiku 4.5, which is the
+one thing on screen that is false.
 
 Two places now say otherwise:
 
@@ -255,11 +255,12 @@ Two places now say otherwise:
   wrapper to label it still reads as local.
 - **`/model`.** The picker builds its labels from
   `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL_NAME` when they are set, so all
-  four now read `qwen3.8:27b-obliterated (local)`. Override with `QWEN_MODEL_LABEL`.
+  four now read the selected Qwen tag, such as `qwen3.5:4b-64k (local)`. Override
+  with `QWEN_MODEL_LABEL`.
 
 The fable slot joined the other three in pointing at the alias. A slot left on a real
 Claude id is a 404 against Ollama the moment anything selects it, and a second local tag
-would load a second 17 GB runner, which is the co-residency that panics this Mac.
+would load a second runner, which is the co-residency that panics this Mac.
 
 Claude Code has no environment variable for the session's own display name — `Ise`, the
 override map behind it, is a static table of marketing names — so the status line is
@@ -1398,9 +1399,11 @@ swapped tiers under a live session, which is what made it unreliable enough to
 delete.
 
 ```
-qwen claude                    Claude Code on the 27B, cmem wired in
+qwen claude                    Claude Code on the default 4B, cmem wired in
+qwen 27b claude                Claude Code on the obliterated 27B, cmem wired in
 qwen agent                     standalone Qwen Code (see above)
-qwen codex                     Codex on the 27B, cmem wired in
+qwen codex                     Codex on the default 4B, cmem wired in
+qwen 27b codex                 Codex on the obliterated 27B, cmem wired in
   --mcp cmem|none|all          MCP servers (default: cmem)
   --tools mcp|lean|all         built-in tools alongside MCP (default: lean)
   QWEN_MEMORY=0                no recall server and no claude-mem worker
@@ -1426,23 +1429,23 @@ and answers `[claude-code:unrecognized_model]` for anything else, wherever
 | plus `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | refused |
 | the same blobs under a catalog id | worked first try |
 
-So `qwen claude` runs `ollama cp qwen3.8:27b-obliterated claude-haiku-4-5-20251001`
-once. That copies the manifest, not the weights: the measured delta on this host
-was 0 KB, both tags carry ID `2d93c6242422`, and Ollama keeps one runner for them.
-Override the id with `QWEN_CLAUDE_MODEL_ID`.
+So `qwen claude` runs `ollama cp <selected-model> claude-haiku-4-5-20251001` when the
+alias is missing or stale and idle. That copies the manifest, not the weights: the
+measured delta on this host was 0 KB for the 27B alias, and Ollama keeps one runner for
+matching tags. Override the id with `QWEN_CLAUDE_MODEL_ID`.
 
 Every model slot — `ANTHROPIC_MODEL`, the Opus, Sonnet and Haiku defaults,
 `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` — points at that one
 alias. Claude Code resolves its background work separately from the main model, and
 both other outcomes are wrong: a real Claude id 404s against Ollama, and a second
-local tag loads a second 17 GB runner, which is the co-residency that panics this
-Mac. Codex needs none of this; it has no allowlist and takes the real tag.
+local tag loads a second runner, which is the co-residency that panics this Mac.
+Codex needs none of this; it has no allowlist and takes the real tag.
 
-The wrapper treats the alias and the canonical tag as one model throughout. Nothing
-unloads the alias "to make room" and evicts the session using it, `qwen status`
-reports it as this model resident rather than a foreign one, and `qwen stop`
-unloads both tags. Reporting the alias as "not loaded" is how you end up holding
-17 GB you believe is free.
+The wrapper treats the alias and the selected canonical tag as one model only when their
+manifest digests match. It refreshes an idle stale alias, refuses to repoint one that is
+still resident, and keeps status and stop scoped to the matching alias. Reporting the
+matching alias as "not loaded" is how you end up holding memory you believe is free;
+unloading a stale resident alias is how you evict another session.
 
 #### Keeping 32k tokens usable
 
