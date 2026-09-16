@@ -140,6 +140,17 @@ cat > "$STUB/qwen-code" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" > "$FIXTURE/qwen-code.argv"
 env > "$FIXTURE/qwen-code.env"
+# A goal test lists one Goal status per attempt; each call consumes the first.
+if [ -s "$FIXTURE/goal-statuses" ]; then
+  status=$(sed -n 1p "$FIXTURE/goal-statuses")
+  sed 1d "$FIXTURE/goal-statuses" > "$FIXTURE/goal-statuses.next"
+  mv "$FIXTURE/goal-statuses.next" "$FIXTURE/goal-statuses"
+  lease=$(find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null)
+  printf '%s lease=%s argv=%s\n' "$status" "${lease:+yes}" "$*" >> "$FIXTURE/goal-calls"
+  printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"read_file","input":{"file_path":"src/app.py"}}]}}\n'
+  printf '{"type":"stream_event","event":{"type":"goal_state","goal_state":{"goal":{"status":"%s","lastReason":"stub reason %s"}}}}\n' "$status" "$status"
+  [ "$status" = complete ] || exit 1
+fi
 exit 0
 EOF
 
@@ -158,7 +169,8 @@ reset_world() {
         "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
         "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" \
         "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up" \
-        "$FIXTURE/holder.pid" "$FIXTURE/stale-owner"
+        "$FIXTURE/holder.pid" "$FIXTURE/stale-owner" \
+        "$FIXTURE/goal-statuses" "$FIXTURE/goal-calls"
   # A claude-mem install the wrapper can find: newest version wins, and an
   # orphaned one is skipped even when it sorts higher.
   rm -rf "$FIXTURE/mem-cache"
@@ -670,6 +682,57 @@ if jq -e '
   pass "side queries go to a registered fast model"
 else
   fail "side queries go to a registered fast model"
+fi
+
+# --- qwen goal ------------------------------------------------------------------
+reset_world
+out=$(run_qwen 27b goal "make the tests pass"); status=$?
+case "$status:$out" in
+  0:*) fail "goal refuses to run unattended without -y" "exited 0: $out" ;;
+  *"needs -y"*) pass "goal refuses to run unattended without -y" ;;
+  *) fail "goal refuses to run unattended without -y" "$out" ;;
+esac
+
+reset_world
+printf 'complete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 0 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 1 ] &&
+   grep -q -- '-y -o stream-json /goal make the tests pass' "$FIXTURE/goal-calls" &&
+   grep -q 'goal complete on attempt 1' <<<"$out" && grep -q 'read_file src/app.py' <<<"$out"; then
+  pass "goal stops after a verified completion and shows each tool call"
+else
+  fail "goal stops after a verified completion" "status=$status $out $(cat "$FIXTURE/goal-calls" 2>/dev/null)"
+fi
+
+reset_world
+printf 'paused\nusage_limited\ncomplete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 0 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 3 ] &&
+   ! grep -q -- '--continue\|--resume' "$FIXTURE/goal-calls" &&
+   [ "$(grep -c 'lease=yes' "$FIXTURE/goal-calls")" -eq 3 ] &&
+   grep -q 'starting a fresh session' <<<"$out"; then
+  pass "a stalled goal retries in a fresh session while holding the lease"
+else
+  fail "a stalled goal retries in a fresh session" "status=$status $out $(cat "$FIXTURE/goal-calls" 2>/dev/null)"
+fi
+
+reset_world
+printf 'paused\npaused\npaused\npaused\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y --attempts 2 "make the tests pass"); status=$?
+if [ "$status" = 1 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 2 ] &&
+   grep -q 'not complete after 2 attempts' <<<"$out"; then
+  pass "goal gives up after --attempts and exits 1"
+else
+  fail "goal gives up after --attempts" "status=$status $out"
+fi
+
+reset_world
+printf 'blocked\ncomplete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 2 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 1 ]; then
+  pass "a verified blocked goal stops without retrying"
+else
+  fail "a verified blocked goal stops without retrying" "status=$status $out"
 fi
 
 # --- side-query model ----------------------------------------------------------
