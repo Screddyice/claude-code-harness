@@ -787,6 +787,20 @@ commits and its head no longer matches the merged PR, so it correctly needs a PR
 Both directions are worth testing, because a fix that only satisfies the first one silently
 turns the rule off for reused branches.
 
+**An older commit of the merged head also counts** (`hook_head_within_merged`, used by
+both hooks). A clone that stopped pulling before its PR merged still sits on an earlier
+commit of the same branch: the PR gained commits on the remote and landed, and nothing in
+this checkout is outside it. The exact-SHA test failed there and the Stop hook demanded a
+PR it could never satisfy (teamnebula-ai/teamnebula.ai `feat/fe-nebos-team-login`, 25
+commits behind after #425 merged, 2026-09-17). HEAD now counts as merged when it is the
+merged head or its ancestor. It reads local objects only, so a merged head that was never
+fetched keeps the old answer instead of touching the network, and a branch reused for new
+commits still needs a PR because its head is not an ancestor of the old merge.
+
+```
+merged PR, HEAD is an ancestor of its head -> merged_pr   (satisfied — checkout is just stale)
+```
+
 `merged_pr` is deliberately a separate status rather than reusing `has_pr` — "already
 landed" and "has an open review surface" are different facts, and anything that logs or
 reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
