@@ -240,14 +240,33 @@ saves request bodies, then send the saved `messages` and `tools` to Ollama's
 Give Qwen a Goal and it keeps working until it proves the goal is met:
 
 ```bash
-qwen 27b                  # then type: /goal Make every test in tests/ pass. Done means pytest exits 0.
-qwen 27b code -y "/goal Make every test in tests/ pass. Done means pytest exits 0."   # headless
+qwen 27b goal -y "Make every test in tests/ pass. Done means pytest exits 0."
+qwen 27b                  # interactive: type /goal <objective> in the session
 ```
 
 `/goal` re-prompts the model after every turn until it calls `update_goal` with
 evidence, and a verifier checks that evidence before the Goal counts as done.
 State a done condition a command can check. `-y` approves every tool call,
-shell included, so use it only in a directory you can throw away or reset.
+shell included, so run it only in a directory you can throw away or reset.
+
+`qwen goal` runs that headless, prints each tool call and every Goal status
+change, and writes the raw stream to `~/.cache/qwen/goals/`. When an attempt
+ends without a verified completion (a loop halt, a paused or usage-limited
+Goal, a crash) it starts the same objective in a fresh session, up to
+`--attempts` / `QWEN_GOAL_ATTEMPTS` (default 3). The files keep every earlier
+attempt's edits. It exits 0 on a verified completion, 2 on a verified blocked
+Goal, and 1 when the attempts run out. It holds the compute lock and lease
+across attempts.
+
+A fresh session is the retry because resuming a stalled one did not work. One
+run fixed 8 of 10 failing tests, stalled on invalid `read_file` calls, and hit
+Qwen Code's guard against five identical calls in a row. Resuming that session
+with `--continue` ran 14 minutes on the last one-line bug without editing it.
+Real Qwen Code on the same files in a new session fixed it in 7 tool calls, and
+the Goal ended verified `complete` in 476 seconds. Sampling was not the cause:
+30 replays of the stalled moment at temperature 0.2 and at Qwen's published
+thinking-mode settings (0.6, top_p 0.95, top_k 20, repeat_penalty 1.0), with
+and without a think-first instruction, gave the same result.
 
 Four settings make that loop hold on a 32,768-token window:
 
