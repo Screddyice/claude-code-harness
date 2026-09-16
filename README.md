@@ -268,6 +268,24 @@ the Goal ended verified `complete` in 476 seconds. Sampling was not the cause:
 thinking-mode settings (0.6, top_p 0.95, top_k 20, repeat_penalty 1.0), with
 and without a think-first instruction, gave the same result.
 
+A live `qwen 27b goal -y` run on a fresh copy of the six-bug fixture finished
+verified `complete` on its own, 63 minutes after launch:
+
+| Attempt | Tool calls | Ended |
+|---|---|---|
+| 1 | 9 | Its first edit dropped the colon from `for line in lines[1:]:`. It re-read `parser.py` until the repeat guard stopped it. |
+| 2 | 44 | Fixed the syntax error and the remaining bugs, so all 11 tests passed, then called `update_goal` with `evidence_refs` instead of `evidenceRefs` seven times until the guard stopped it. |
+| 3 | 19 | Re-ran the tests, cited them, and the 4B verifier accepted. |
+
+Both stalls were malformed output rather than wrong reasoning. The
+`qwen3.8:27b-obliterated` tag sets `repeat_penalty 1.15`, which penalizes
+tokens the model just saw, such as the first `:` in `[1:]` or the key named in
+an error message. In 17 replays each of the loop edit, 3 of 9 edits at 1.15
+dropped the colon and none of 3 at 1.0 did; at 1.0 the model read the file
+before editing in the other 14. Ollama's OpenAI endpoint does not accept a
+per-request `repeat_penalty`, so changing it means rebuilding the tag, which
+Backdoor also uses as its failover model.
+
 Four settings make that loop hold on a 32,768-token window:
 
 | Setting | Why |
