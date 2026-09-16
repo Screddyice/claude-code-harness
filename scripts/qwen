@@ -378,14 +378,17 @@ lock_holders() {
   lsof -nP -t "$LOCK_PATH" 2>/dev/null || true
 }
 
+# Age comes from the process, not its lease file: lease_prune deletes a lease
+# once its 4-hour expiry passes, even while the session lives, and the sessions
+# most worth reclaiming are exactly the ones that old. ps prints [[dd-]hh:]mm:ss.
 qwen_session_age() {
-  local pid="$1" file started now
-  file="$LEASE_DIR/qwen-$pid.json"
-  [ -f "$file" ] || return 1
-  started=$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null) || return 1
-  case "$started" in ''|*[!0-9]*) return 1 ;; esac
-  now=$(date +%s)
-  printf '%s\n' $(( now - started ))
+  local pid="$1" etime days=0 rest h=0 m=0 sec=""
+  etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
+  case "$etime" in ''|*[!0-9:-]*) return 1 ;; esac
+  case "$etime" in *-*) days=${etime%%-*}; rest=${etime#*-} ;; *) rest=$etime ;; esac
+  IFS=: read -r h m sec <<<"$rest"
+  [ -n "$sec" ] || { sec=$m; m=$h; h=0; }
+  printf '%s\n' $(( 10#$days * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$sec ))
 }
 
 qwen_session_is_stale() {

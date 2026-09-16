@@ -395,6 +395,37 @@ case "$out" in
   *) fail "27B reclaims an abandoned Qwen session" "$out" ;;
 esac
 
+# A session past its 4-hour lease expiry has had the lease pruned while it still
+# holds the lock. It must stay reclaimable.
+reset_world
+python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
+import fcntl, os, signal, sys, time
+from pathlib import Path
+
+handle = open(sys.argv[1], "a")
+marker = Path(sys.argv[2])
+marker.write_text(str(os.getpid()), encoding="utf-8")
+
+def release_and_exit(_signum, _frame):
+    marker.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, release_and_exit)
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 2
+rm -f "$FIXTURE/leases/qwen-$holder.json"
+touch "$FIXTURE/stale-owner"
+out=$(QWEN_STALE_SESSION_SECONDS=1 run_qwen raw "hello")
+wait "$holder" 2>/dev/null || true
+case "$out" in
+  *"reclaiming stale Qwen session pid"*"RAN run $MODEL hello"*)
+    pass "27B reclaims an abandoned Qwen session whose lease was pruned" ;;
+  *) fail "27B reclaims an abandoned Qwen session whose lease was pruned" "$out" ;;
+esac
+
 reset_world
 python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
 import fcntl, os, signal, sys, time
