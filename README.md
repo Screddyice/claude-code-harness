@@ -247,7 +247,10 @@ new invocation performs the frontier handoff.
 
 The launcher also reclaims an abandoned Qwen session when the lock holder is a
 Qwen process older than 30 minutes and Ollama reports no resident model. Set
-`QWEN_STALE_SESSION_SECONDS` to tune that threshold. The launcher keeps a live
+`QWEN_STALE_SESSION_SECONDS` to tune that threshold. The launcher reads the
+session's age from `ps -o etime`. It used the lease file's mtime until the
+lease prune started deleting leases past their 4-hour expiry while the session
+still ran, which left every session older than 4 hours unreclaimable. The launcher keeps a live
 Qwen session or any Ollama owner protected when it cannot prove that the session
 is stale.
 
