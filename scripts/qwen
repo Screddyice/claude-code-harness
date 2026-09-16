@@ -67,6 +67,11 @@
 set -euo pipefail
 
 MODEL="${QWEN_MODEL:-qwen3.5:4b-64k}"
+# Qwen Code sends side queries (the Goal completion verifier, follow-up
+# suggestions) to this model. The verifier aborts after a fixed 30 s, and a cold
+# 11K-token verifier prompt takes the 27B ~40 s to read, so a 27B Goal could
+# never finish verified. The 4B reads it in seconds.
+FAST_MODEL="${QWEN_FAST_MODEL:-qwen3.5:4b-64k}"
 # Consume the model selector before dispatching an agent or passing a prompt.
 # An explicit CLI selection wins over a saved QWEN_MODEL override.
 case "${1:-}" in
@@ -124,8 +129,9 @@ start_server() {
 }
 
 # Tag -> on-disk bytes, from /api/tags. Ollama answers ":latest" for a bare tag.
-disk_bytes() {
-  api /api/tags 30 | jq -r --arg m "$MODEL" \
+disk_bytes() { disk_bytes_for "$MODEL"; }
+disk_bytes_for() {
+  api /api/tags 30 | jq -r --arg m "$1" \
     '[.models[] | select(.name == $m or .name == ($m + ":latest")) | .size][0] // empty'
 }
 
@@ -374,6 +380,22 @@ except (BlockingIOError, OSError):
 PY
 }
 
+descendant_pids() {
+  ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
+    { parent[$1] = $2; order[NR] = $1 }
+    END {
+      found[root] = 1
+      do {
+        changed = 0
+        for (i = 1; i <= NR; i++) {
+          p = order[i]
+          if (!(p in found) && (parent[p] in found)) { found[p] = 1; changed = 1 }
+        }
+      } while (changed)
+      for (p in found) if (p != root) print p
+    }'
+}
+
 lock_holders() {
   lsof -nP -t "$LOCK_PATH" 2>/dev/null || true
 }
@@ -429,6 +451,11 @@ preempt_local_compute() {
         if qwen_session_is_stale "$pid"; then
           age=$(qwen_session_age "$pid" || printf 'unknown')
           note "reclaiming stale Qwen session pid $pid (no model resident for ${age}s)"
+          # Qwen Code's launcher does not forward TERM to the CLI it spawns, so
+          # stopping only the lock holder left the real session running.
+          for child in $(descendant_pids "$pid"); do
+            kill -TERM "$child" 2>/dev/null || true
+          done
         else
           die "another Qwen session owns compute (pid $pid); close it before starting $MODEL"
         fi
@@ -589,6 +616,12 @@ parse_agent_opts() {
 agent_admit() {
   if is_resident; then
     note "attaching to the resident $MODEL"
+    # Residency does not last a whole agent session: a Goal verification swaps
+    # the 27B out for the side-query model, and the diff reviewer or a council
+    # that sees no 27B loaded and a free lock would take the GPU mid-run. Hold
+    # the lock and lease when nobody else does; another Qwen session that
+    # already holds them protects this one too.
+    if take_lock 2>/dev/null; then lease_open; fi
     return 0
   fi
   disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
@@ -764,12 +797,23 @@ cmd_code() {
     esac
   done
   start_server || die "Ollama did not come up on $API"
+  # Ollama will not hold the 27B and the 4B together on this host: loading one
+  # evicts the other, so no extra admission headroom is needed. Each 4B call
+  # costs a 27B reload, which is why the config turns off the per-turn side
+  # queries (tool summaries, follow-up suggestions) and this turns off session
+  # titles, leaving Goal verification as the only one. A model that is not
+  # pulled falls back to the session model.
+  if [ "$FAST_MODEL" != "$MODEL" ] && [ -z "$(disk_bytes_for "$FAST_MODEL")" ]; then
+    note "side-query model $FAST_MODEL is not pulled; side queries use $MODEL"
+    FAST_MODEL="$MODEL"
+  fi
   agent_admit
-  note "Qwen Code on $MODEL at $API; file and shell tools enabled"
+  note "Qwen Code on $MODEL at $API (side queries: $FAST_MODEL); file and shell tools enabled"
   # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
   exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
     OPENAI_API_KEY=ollama-local OPENAI_BASE_URL="$API/v1" OPENAI_MODEL="$MODEL" \
-    QWEN_SESSION_MODEL="$MODEL" QWEN_LOCAL_BASE_URL="$API/v1" \
+    QWEN_SESSION_MODEL="$MODEL" QWEN_FAST_MODEL="$FAST_MODEL" QWEN_LOCAL_BASE_URL="$API/v1" \
+    QWEN_DISABLE_AUTO_TITLE=1 \
     QWEN_CODE_SYSTEM_DEFAULTS_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
     "$code_bin" --auth-type openai --model "$MODEL" --openai-base-url "$API/v1" "$@"
 }

@@ -3,9 +3,9 @@
   "security": { "auth": { "selectedType": "openai" } },
   "model": {
     "name": "${QWEN_SESSION_MODEL}",
-    "maxToolCallsPerTurn": 12,
-    "skipLoopDetection": false
+    "chatCompression": { "maxRecentFilesToRetain": 1 }
   },
+  "fastModel": "${QWEN_FAST_MODEL}",
   "modelProviders": {
     "openai": [{
       "id": "${QWEN_SESSION_MODEL}",
@@ -19,11 +19,24 @@
         "maxRetries": 1,
         "samplingParams": { "temperature": 0.2, "max_tokens": 4096 }
       }
+    }, {
+      "id": "${QWEN_FAST_MODEL}",
+      "name": "${QWEN_FAST_MODEL} (Ollama, side queries)",
+      "envKey": "OPENAI_API_KEY",
+      "baseUrl": "${QWEN_LOCAL_BASE_URL}",
+      "generationConfig": {
+        "contextWindowSize": 32768,
+        "timeout": 120000,
+        "maxRetries": 1,
+        "samplingParams": { "temperature": 0.2, "max_tokens": 4096 },
+        "extra_body": { "reasoning_effort": "none" }
+      }
     }]
   },
   "context": {
     "fileName": ["AGENTS.md", "QWEN.md"],
-    "autoCompactThreshold": 0.8
+    "autoCompactThreshold": 0.8,
+    "clearContextOnIdle": { "toolResultsTotalCharsThreshold": 24000, "toolResultsNumToKeep": 3 }
   },
   "skills": { "disabledLevels": ["user", "bundled"] },
   "memory": { "enableManagedAutoMemory": false, "enableManagedAutoDream": false },
@@ -31,8 +44,12 @@
   "tools": {
     "approvalMode": "default",
     "eager": ["read_file", "grep_search", "glob", "edit", "write_file", "run_shell_command"],
-    "toolSearch": { "threshold": 0 }
+    "toolSearch": { "threshold": 0 },
+    "truncateToolOutputThreshold": 8000,
+    "truncateToolOutputLines": 200
   },
+  "ui": { "enableFollowupSuggestions": false },
+  "experimental": { "emitToolUseSummaries": false },
   "telemetry": { "enabled": false, "logPrompts": false },
   "privacy": { "usageStatisticsEnabled": false }
 }
