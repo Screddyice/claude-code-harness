@@ -615,6 +615,19 @@ if jq -e '
 else
   fail "standalone Qwen defaults bound context and repeated tool turns"
 fi
+if jq -e '
+  (.skills.disabledLevels | index("user") and index("bundled")) and
+  .memory.enableManagedAutoMemory == false and
+  .memory.enableManagedAutoDream == false and
+  .tools.toolSearch.threshold == 0 and
+  (.tools.eager | index("skill") | not) and
+  (.tools.eager | index("web_fetch") | not) and
+  (.permissions.deny | index("notebook_edit"))
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "standalone Qwen defaults keep the startup prompt near 11K tokens"
+else
+  fail "standalone Qwen defaults keep the startup prompt near 11K tokens"
+fi
 reset_world
 run_qwen code --help >/dev/null
 if [ ! -s "$FIXTURE/ollama.log" ]; then

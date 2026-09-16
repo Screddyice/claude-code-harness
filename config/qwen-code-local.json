@@ -25,9 +25,13 @@
     "fileName": ["AGENTS.md", "QWEN.md"],
     "autoCompactThreshold": 0.8
   },
+  "skills": { "disabledLevels": ["user", "bundled"] },
+  "memory": { "enableManagedAutoMemory": false, "enableManagedAutoDream": false },
+  "permissions": { "deny": ["notebook_edit"] },
   "tools": {
     "approvalMode": "default",
-    "eager": ["read_file", "grep_search", "glob", "edit", "write_file", "run_shell_command", "skill", "web_fetch"]
+    "eager": ["read_file", "grep_search", "glob", "edit", "write_file", "run_shell_command"],
+    "toolSearch": { "threshold": 0 }
   },
   "telemetry": { "enabled": false, "logPrompts": false },
   "privacy": { "usageStatisticsEnabled": false }

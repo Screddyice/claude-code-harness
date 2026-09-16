@@ -217,6 +217,24 @@ on the 64K 4B tag. `QWEN_MODEL` selects a local model; an explicit `27b` selecto
 overrides that environment setting.
 `QWEN_CODE_BIN` overrides the installed executable path.
 
+The same file keeps Qwen Code's startup prompt near 11K tokens. With stock
+settings a session in `~` opened at 21,895 tokens of a 32,768-token window, so
+compaction fired on the first tool result and the model lost track of commands
+it had just run, which tripped the loop detector. Stock settings also ran a
+17.5K-token memory-extraction pass and a 6.7K-token memory "dream" after turns,
+queued on the same single Ollama slot as the session. The defaults now:
+
+| Setting | Tokens saved |
+|---|---|
+| `skills.disabledLevels: ["user", "bundled"]` drops 96 skill descriptions; project skills still load | ~7.5K |
+| `memory.enableManagedAutoMemory` and `enableManagedAutoDream` set to false | ~1.2K, plus both background passes |
+| `tools.toolSearch.threshold: 0` and a shorter `tools.eager` list defer `skill`, `web_fetch`, `monitor`, `zoom_image` and `task_stop` behind `tool_search` | ~2K |
+| `permissions.deny: ["notebook_edit"]` | ~0.3K |
+
+Measure a change the same way: point `OPENAI_BASE_URL` at a stub server that
+saves request bodies, then send the saved `messages` and `tools` to Ollama's
+`/api/chat` with `num_predict: 1` and read `prompt_eval_count`.
+
 The 27B selector owns the shared local-compute lock. If a cooperating LLM-Jury
 council or diff reviewer holds that lock, the launcher terminates that exact
 holder, waits for the kernel lock to release, and then runs the normal pressure
