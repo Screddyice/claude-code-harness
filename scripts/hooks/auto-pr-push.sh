@@ -75,7 +75,7 @@ mkdir -p "$log_dir" 2>/dev/null || { rmdir "$lockdir" 2>/dev/null; exit 0; }
     merged_oid="$(gh pr list ${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"} \
       --head "$HOOK_BRANCH" --state merged \
       --json headRefOid --jq '.[0].headRefOid // empty' 2>>"$log")"
-    if [ -n "${merged_oid:-}" ] && [ "$merged_oid" = "$head_oid" ]; then
+    if hook_head_within_merged "$head_oid" "${merged_oid:-}"; then
       printf '%s [skip] %s@%s already merged as %s\n' \
         "$timestamp" "$HOOK_REPO_DIR" "$HOOK_BRANCH" "$(printf '%.12s' "$merged_oid")" >>"$log" 2>&1
       exit 0
