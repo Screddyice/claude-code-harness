@@ -235,7 +235,7 @@ Measure a change the same way: point `OPENAI_BASE_URL` at a stub server that
 saves request bodies, then send the saved `messages` and `tools` to Ollama's
 `/api/chat` with `num_predict: 1` and read `prompt_eval_count`.
 
-#### Autonomous runs
+### Autonomous runs
 
 Give Qwen a Goal and it keeps working until it proves the goal is met:
 
