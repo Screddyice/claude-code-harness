@@ -140,6 +140,17 @@ cat > "$STUB/qwen-code" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" > "$FIXTURE/qwen-code.argv"
 env > "$FIXTURE/qwen-code.env"
+# A goal test lists one Goal status per attempt; each call consumes the first.
+if [ -s "$FIXTURE/goal-statuses" ]; then
+  status=$(sed -n 1p "$FIXTURE/goal-statuses")
+  sed 1d "$FIXTURE/goal-statuses" > "$FIXTURE/goal-statuses.next"
+  mv "$FIXTURE/goal-statuses.next" "$FIXTURE/goal-statuses"
+  lease=$(find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null)
+  printf '%s lease=%s argv=%s\n' "$status" "${lease:+yes}" "$*" >> "$FIXTURE/goal-calls"
+  printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"read_file","input":{"file_path":"src/app.py"}}]}}\n'
+  printf '{"type":"stream_event","event":{"type":"goal_state","goal_state":{"goal":{"status":"%s","lastReason":"stub reason %s"}}}}\n' "$status" "$status"
+  [ "$status" = complete ] || exit 1
+fi
 exit 0
 EOF
 
@@ -158,7 +169,8 @@ reset_world() {
         "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
         "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" \
         "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up" \
-        "$FIXTURE/holder.pid" "$FIXTURE/stale-owner"
+        "$FIXTURE/holder.pid" "$FIXTURE/stale-owner" \
+        "$FIXTURE/goal-statuses" "$FIXTURE/goal-calls"
   # A claude-mem install the wrapper can find: newest version wins, and an
   # orphaned one is skipped even when it sorts higher.
   rm -rf "$FIXTURE/mem-cache"
@@ -188,6 +200,7 @@ run_qwen() {
     CLAUDE_MEM_WORKER_PORT=37799 \
     QWEN_MEMORY="${QWEN_MEMORY:-1}" \
     QWEN_CODE_BIN="$STUB/qwen-code" \
+    QWEN_FAST_MODEL="${QWEN_FAST_MODEL-}" \
     bash "$QWEN" "$@" 2>&1 </dev/null
 }
 
@@ -399,7 +412,7 @@ esac
 # holds the lock. It must stay reclaimable.
 reset_world
 python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
-import fcntl, os, signal, sys, time
+import fcntl, os, signal, subprocess, sys, time
 from pathlib import Path
 
 handle = open(sys.argv[1], "a")
@@ -411,6 +424,8 @@ def release_and_exit(_signum, _frame):
     raise SystemExit(0)
 
 signal.signal(signal.SIGTERM, release_and_exit)
+child = subprocess.Popen(["sleep", "30"])
+Path(sys.argv[2] + ".child").write_text(str(child.pid), encoding="utf-8")
 fcntl.flock(handle, fcntl.LOCK_EX)
 time.sleep(10)
 PY
@@ -425,6 +440,15 @@ case "$out" in
     pass "27B reclaims an abandoned Qwen session whose lease was pruned" ;;
   *) fail "27B reclaims an abandoned Qwen session whose lease was pruned" "$out" ;;
 esac
+child=$(cat "$FIXTURE/holder.pid.child" 2>/dev/null)
+sleep 1
+if [ -n "$child" ] && ! kill -0 "$child" 2>/dev/null; then
+  pass "reclaiming a Qwen session also stops the CLI it spawned"
+else
+  [ -n "$child" ] && kill "$child" 2>/dev/null
+  fail "reclaiming a Qwen session also stops the CLI it spawned" "child ${child:-unknown} still running"
+fi
+rm -f "$FIXTURE/holder.pid.child"
 
 reset_world
 python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
@@ -638,13 +662,132 @@ for entry in "" agent code; do
   fi
 done
 if jq -e '
-  .model.maxToolCallsPerTurn == 12 and
-  .model.skipLoopDetection == false and
-  .context.autoCompactThreshold == 0.8
+  (.model | has("maxToolCallsPerTurn") | not) and
+  (.model | has("skipLoopDetection") | not) and
+  .model.chatCompression.maxRecentFilesToRetain == 1 and
+  .context.autoCompactThreshold == 0.8 and
+  .context.clearContextOnIdle.toolResultsTotalCharsThreshold == 24000 and
+  .context.clearContextOnIdle.toolResultsNumToKeep == 3 and
+  .tools.truncateToolOutputThreshold == 8000 and
+  .tools.truncateToolOutputLines == 200
 ' "$ROOT/config/qwen-code-local.json" >/dev/null; then
-  pass "standalone Qwen defaults bound context and repeated tool turns"
+  pass "standalone Qwen defaults let a turn run and fit a 32K window"
 else
-  fail "standalone Qwen defaults bound context and repeated tool turns"
+  fail "standalone Qwen defaults let a turn run and fit a 32K window"
+fi
+if jq -e '
+  .fastModel == "${QWEN_FAST_MODEL}" and
+  ([.modelProviders.openai[].id] | index("${QWEN_SESSION_MODEL}") and index("${QWEN_FAST_MODEL}"))
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "side queries go to a registered fast model"
+else
+  fail "side queries go to a registered fast model"
+fi
+
+# --- qwen goal ------------------------------------------------------------------
+reset_world
+out=$(run_qwen 27b goal "make the tests pass"); status=$?
+case "$status:$out" in
+  0:*) fail "goal refuses to run unattended without -y" "exited 0: $out" ;;
+  *"needs -y"*) pass "goal refuses to run unattended without -y" ;;
+  *) fail "goal refuses to run unattended without -y" "$out" ;;
+esac
+
+reset_world
+printf 'complete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 0 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 1 ] &&
+   grep -q -- '-y -o stream-json /goal make the tests pass' "$FIXTURE/goal-calls" &&
+   grep -q 'goal complete on attempt 1' <<<"$out" && grep -q 'read_file src/app.py' <<<"$out"; then
+  pass "goal stops after a verified completion and shows each tool call"
+else
+  fail "goal stops after a verified completion" "status=$status $out $(cat "$FIXTURE/goal-calls" 2>/dev/null)"
+fi
+
+reset_world
+printf 'paused\nusage_limited\ncomplete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 0 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 3 ] &&
+   ! grep -q -- '--continue\|--resume' "$FIXTURE/goal-calls" &&
+   [ "$(grep -c 'lease=yes' "$FIXTURE/goal-calls")" -eq 3 ] &&
+   grep -q 'starting a fresh session' <<<"$out"; then
+  pass "a stalled goal retries in a fresh session while holding the lease"
+else
+  fail "a stalled goal retries in a fresh session" "status=$status $out $(cat "$FIXTURE/goal-calls" 2>/dev/null)"
+fi
+
+reset_world
+printf 'paused\npaused\npaused\npaused\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y --attempts 2 "make the tests pass"); status=$?
+if [ "$status" = 1 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 2 ] &&
+   grep -q 'not complete after 2 attempts' <<<"$out"; then
+  pass "goal gives up after --attempts and exits 1"
+else
+  fail "goal gives up after --attempts" "status=$status $out"
+fi
+
+reset_world
+printf 'blocked\ncomplete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 2 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 1 ]; then
+  pass "a verified blocked goal stops without retrying"
+else
+  fail "a verified blocked goal stops without retrying" "status=$status $out"
+fi
+
+# --- side-query model ----------------------------------------------------------
+reset_world
+run_qwen code >/dev/null
+if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-64k' "$FIXTURE/qwen-code.env" &&
+   grep -qxF 'QWEN_DISABLE_AUTO_TITLE=1' "$FIXTURE/qwen-code.env"; then
+  pass "27B Qwen Code sends side queries to the 4B, with auto titles off"
+else
+  fail "27B Qwen Code sends side queries to the 4B" "$(grep -E 'QWEN_(FAST_MODEL|DISABLE_AUTO_TITLE)' "$FIXTURE/qwen-code.env" 2>/dev/null)"
+fi
+if jq -e '
+  .ui.enableFollowupSuggestions == false and
+  .experimental.emitToolUseSummaries == false
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "per-turn side queries are off, so the 4B is not loaded every turn"
+else
+  fail "per-turn side queries are off, so the 4B is not loaded every turn"
+fi
+if jq -e '
+  (.modelProviders.openai[] | select(.id == "${QWEN_FAST_MODEL}") | .generationConfig.extra_body.reasoning_effort) == "none"
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "the side-query model answers without thinking, inside the verifier's 30 s"
+else
+  fail "the side-query model answers without thinking, inside the verifier's 30 s"
+fi
+
+# An agent that attaches to an already-resident model still takes a free lock
+# and lease, because its own Goal verification can unload that model mid-run.
+reset_world
+printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
+out=$(run_qwen code)
+if grep -q 'attaching to the resident' <<<"$out" &&
+   [ -n "$(find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null)" ]; then
+  pass "an attaching agent session holds the lease while it runs"
+else
+  fail "an attaching agent session holds the lease while it runs" "$out $(ls "$FIXTURE/leases")"
+fi
+
+reset_world
+printf '{"models":[{"name":"%s","size":17716740000,"digest":"heavy"}]}\n' "$MODEL" > "$FIXTURE/tags.json"
+out=$(run_qwen code)
+if grep -qxF "QWEN_FAST_MODEL=$MODEL" "$FIXTURE/qwen-code.env"; then
+  pass "an unpulled side-query model falls back to the session model"
+else
+  fail "an unpulled side-query model falls back to the session model" "$out"
+fi
+
+reset_world
+TEST_QWEN_MODEL= run_qwen code >/dev/null
+if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-64k' "$FIXTURE/qwen-code.env" &&
+   grep -qxF 'QWEN_SESSION_MODEL=qwen3.5:4b-64k' "$FIXTURE/qwen-code.env"; then
+  pass "a 4B session is its own side-query model"
+else
+  fail "a 4B session is its own side-query model" "$(grep -E 'QWEN_(FAST|SESSION)_MODEL' "$FIXTURE/qwen-code.env")"
 fi
 if jq -e '
   (.skills.disabledLevels | index("user") and index("bundled")) and

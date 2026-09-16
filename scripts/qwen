@@ -47,6 +47,8 @@
 #   qwen claude [args]         a Claude Code session running on this model
 #   qwen agent  [args]         standalone Qwen Code (same as bare qwen)
 #   qwen code   [args]         standalone Qwen Code (same as bare qwen)
+#   qwen goal -y "objective"   run a /goal headless until verified complete,
+#                              retrying in a fresh session (QWEN_GOAL_ATTEMPTS, default 3)
 #   qwen codex  [args]         a Codex session running on this model
 #   qwen raw [prompt]          plain Ollama chat, without execution tools
 #
@@ -67,6 +69,11 @@
 set -euo pipefail
 
 MODEL="${QWEN_MODEL:-qwen3.5:4b-64k}"
+# Qwen Code sends side queries (the Goal completion verifier, follow-up
+# suggestions) to this model. The verifier aborts after a fixed 30 s, and a cold
+# 11K-token verifier prompt takes the 27B ~40 s to read, so a 27B Goal could
+# never finish verified. The 4B reads it in seconds.
+FAST_MODEL="${QWEN_FAST_MODEL:-qwen3.5:4b-64k}"
 # Consume the model selector before dispatching an agent or passing a prompt.
 # An explicit CLI selection wins over a saved QWEN_MODEL override.
 case "${1:-}" in
@@ -124,8 +131,9 @@ start_server() {
 }
 
 # Tag -> on-disk bytes, from /api/tags. Ollama answers ":latest" for a bare tag.
-disk_bytes() {
-  api /api/tags 30 | jq -r --arg m "$MODEL" \
+disk_bytes() { disk_bytes_for "$MODEL"; }
+disk_bytes_for() {
+  api /api/tags 30 | jq -r --arg m "$1" \
     '[.models[] | select(.name == $m or .name == ($m + ":latest")) | .size][0] // empty'
 }
 
@@ -374,6 +382,22 @@ except (BlockingIOError, OSError):
 PY
 }
 
+descendant_pids() {
+  ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
+    { parent[$1] = $2; order[NR] = $1 }
+    END {
+      found[root] = 1
+      do {
+        changed = 0
+        for (i = 1; i <= NR; i++) {
+          p = order[i]
+          if (!(p in found) && (parent[p] in found)) { found[p] = 1; changed = 1 }
+        }
+      } while (changed)
+      for (p in found) if (p != root) print p
+    }'
+}
+
 lock_holders() {
   lsof -nP -t "$LOCK_PATH" 2>/dev/null || true
 }
@@ -429,6 +453,11 @@ preempt_local_compute() {
         if qwen_session_is_stale "$pid"; then
           age=$(qwen_session_age "$pid" || printf 'unknown')
           note "reclaiming stale Qwen session pid $pid (no model resident for ${age}s)"
+          # Qwen Code's launcher does not forward TERM to the CLI it spawns, so
+          # stopping only the lock holder left the real session running.
+          for child in $(descendant_pids "$pid"); do
+            kill -TERM "$child" 2>/dev/null || true
+          done
         else
           die "another Qwen session owns compute (pid $pid); close it before starting $MODEL"
         fi
@@ -470,7 +499,11 @@ acquire_compute_lock() {
   take_lock || die "another local council or background review owns compute; retry when it finishes"
 }
 
-cleanup() { lease_close; }
+CODE_CONFIG_PATH=""
+cleanup() {
+  lease_close
+  [ -z "$CODE_CONFIG_PATH" ] || [ "$CODE_CONFIG_PATH" = "$QWEN_SOURCE_DIR/config/qwen-code-local.json" ] || rm -f "$CODE_CONFIG_PATH"
+}
 trap cleanup EXIT INT TERM
 
 # --- admission --------------------------------------------------------------
@@ -589,6 +622,12 @@ parse_agent_opts() {
 agent_admit() {
   if is_resident; then
     note "attaching to the resident $MODEL"
+    # Residency does not last a whole agent session: a Goal verification swaps
+    # the 27B out for the side-query model, and the diff reviewer or a council
+    # that sees no 27B loaded and a free lock would take the GPU mid-run. Hold
+    # the lock and lease when nobody else does; another Qwen session that
+    # already holds them protects this one too.
+    if take_lock 2>/dev/null; then lease_open; fi
     return 0
   fi
   disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
@@ -750,11 +789,47 @@ cmd_codex() {
 
 # Standalone Qwen Code uses its own tool loop and configuration. The private
 # npm prefix avoids replacing this guard with the package's own `qwen` binary.
+code_bin() {
+  local bin="${QWEN_CODE_BIN:-$HOME/.local/share/qwen-code/node_modules/.bin/qwen}"
+  [ -x "$bin" ] || die "Qwen Code is missing; run scripts/install-qwen-code.sh from $QWEN_SOURCE_DIR"
+  printf '%s\n' "$bin"
+}
+
+# Starts Ollama, settles the side-query model and admits the session model.
+code_prepare() {
+  start_server || die "Ollama did not come up on $API"
+  # Ollama will not hold the 27B and the 4B together on this host: loading one
+  # evicts the other, so no extra admission headroom is needed. Each 4B call
+  # costs a 27B reload, which is why the config turns off the per-turn side
+  # queries (tool summaries, follow-up suggestions) and this turns off session
+  # titles, leaving Goal verification as the only one. A model that is not
+  # pulled falls back to the session model.
+  if [ "$FAST_MODEL" != "$MODEL" ] && [ -z "$(disk_bytes_for "$FAST_MODEL")" ]; then
+    note "side-query model $FAST_MODEL is not pulled; side queries use $MODEL"
+    FAST_MODEL="$MODEL"
+  fi
+  CODE_CONFIG_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json"
+  if [ "$FAST_MODEL" = "$MODEL" ]; then
+    CODE_CONFIG_PATH="${TMPDIR:-/tmp}/qwen-code-local.$$.$RANDOM.json"
+    jq '.modelProviders.openai |= .[:1]' \
+      "$QWEN_SOURCE_DIR/config/qwen-code-local.json" > "$CODE_CONFIG_PATH"
+  fi
+  agent_admit
+  # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
+  CODE_ENV=(
+    OPENAI_API_KEY=ollama-local OPENAI_BASE_URL="$API/v1" OPENAI_MODEL="$MODEL"
+    QWEN_SESSION_MODEL="$MODEL" QWEN_FAST_MODEL="$FAST_MODEL" QWEN_LOCAL_BASE_URL="$API/v1"
+    QWEN_DISABLE_AUTO_TITLE=1
+    QWEN_CODE_SYSTEM_DEFAULTS_PATH="$CODE_CONFIG_PATH"
+  )
+  CODE_ARGS=(--auth-type openai --model "$MODEL" --openai-base-url "$API/v1")
+}
+
 cmd_code() {
-  local code_bin="${QWEN_CODE_BIN:-$HOME/.local/share/qwen-code/node_modules/.bin/qwen}"
-  [ -x "$code_bin" ] || die "Qwen Code is missing; run scripts/install-qwen-code.sh from $QWEN_SOURCE_DIR"
+  local bin
+  bin=$(code_bin) || exit 1
   case "${1:-}" in
-    --help|-h|--version|-v) exec "$code_bin" "$@" ;;
+    --help|-h|--version|-v) exec "$bin" "$@" ;;
   esac
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -763,15 +838,103 @@ cmd_code() {
       *) break ;;
     esac
   done
-  start_server || die "Ollama did not come up on $API"
-  agent_admit
-  note "Qwen Code on $MODEL at $API; file and shell tools enabled"
-  # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
-  exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
-    OPENAI_API_KEY=ollama-local OPENAI_BASE_URL="$API/v1" OPENAI_MODEL="$MODEL" \
-    QWEN_SESSION_MODEL="$MODEL" QWEN_LOCAL_BASE_URL="$API/v1" \
-    QWEN_CODE_SYSTEM_DEFAULTS_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
-    "$code_bin" --auth-type openai --model "$MODEL" --openai-base-url "$API/v1" "$@"
+  code_prepare
+  note "Qwen Code on $MODEL at $API (side queries: $FAST_MODEL); file and shell tools enabled"
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" "$bin" "${CODE_ARGS[@]}" "$@"
+  local rc=$?
+  [ -z "$CODE_CONFIG_PATH" ] || [ "$CODE_CONFIG_PATH" = "$QWEN_SOURCE_DIR/config/qwen-code-local.json" ] || rm -f "$CODE_CONFIG_PATH"
+  CODE_CONFIG_PATH=""
+  return "$rc"
+}
+
+# Prints a line per tool call and Goal status change from Qwen Code's
+# stream-json on stdin, and copies every raw line to the log in argv[1].
+GOAL_PROGRESS_PY=$(cat <<'PY'
+import json, os, sys
+log = open(sys.argv[1], "a")
+last = None
+for raw in sys.stdin:
+    log.write(raw); log.flush()
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        continue
+    kind = d.get("type")
+    if kind == "assistant":
+        for c in d.get("message", {}).get("content", []):
+            if c.get("type") != "tool_use":
+                continue
+            a = c.get("input") or {}
+            detail = a.get("file_path") or a.get("command") or a.get("pattern") or a.get("query") or ""
+            if a.get("file_path"):
+                detail = os.path.relpath(detail) if detail.startswith(os.getcwd()) else detail
+            print("  %s %s" % (c.get("name"), " ".join(str(detail).split())[:100]), flush=True)
+    elif kind == "stream_event" and d.get("event", {}).get("type") == "goal_state":
+        g = (d["event"].get("goal_state") or {}).get("goal") or {}
+        now = (g.get("status"), g.get("lastReason"))
+        if g and now != last:
+            last = now
+            reason = " ".join((g.get("lastReason") or "").split())[:200]
+            print("  goal %s%s" % (g.get("status"), ": " + reason if reason else ""), flush=True)
+    elif kind == "result" and d.get("is_error"):
+        msg = (d.get("error") or {}).get("message") or d.get("subtype")
+        print("  stopped: %s" % " ".join(str(msg).split())[:200], flush=True)
+PY
+)
+
+# The last Goal state's field in a stream-json log, skipping lines that are not JSON.
+goal_field() {
+  jq -Rrn --arg f "$1" '[inputs | fromjson? | select(.type == "stream_event" and .event.type == "goal_state")
+    | .event.goal_state.goal] | last | .[$f] // empty' "$2" 2>/dev/null
+}
+
+# Runs a Goal headless and starts a fresh session whenever an attempt ends
+# without a verified completion. A 27B session that stalls tends to stay stalled
+# when resumed, because its long history keeps the dead end in view; the same
+# objective in a new session reads the files again, and the files keep every
+# earlier attempt's edits.
+cmd_goal() {
+  local bin objective="" yes=0 attempts="${QWEN_GOAL_ATTEMPTS:-3}" attempt=1 dir log status reason rc
+  bin=$(code_bin) || exit 1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yolo) yes=1; shift ;;
+      --attempts) [ $# -ge 2 ] || die "--attempts needs a number"; attempts="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      --keep-others) keep_others=1; shift ;;
+      --) shift; objective="$*"; break ;;
+      -*) die "unknown goal option $1 (qwen goal -y [--attempts N] \"objective\")" ;;
+      *) objective="$*"; break ;;
+    esac
+  done
+  [ -n "$objective" ] || die 'usage: qwen [27b] goal -y [--attempts N] "objective with a checkable done condition"'
+  [ "$yes" = 1 ] || die "a goal runs unattended and needs -y, which approves every tool call (shell included) in $(pwd)"
+  case "$attempts" in ''|*[!0-9]*|0) die "--attempts must be a positive integer" ;; esac
+
+  code_prepare
+  dir="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/goals/$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "$dir"
+  note "goal on $MODEL (side queries: $FAST_MODEL), up to $attempts fresh-session attempts; logs in $dir"
+  while :; do
+    log="$dir/attempt-$attempt.jsonl"
+    note "attempt $attempt/$attempts"
+    rc=0
+    env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" \
+      "$bin" "${CODE_ARGS[@]}" -y -o stream-json "/goal $objective" </dev/null |
+      python3 -c "$GOAL_PROGRESS_PY" "$log" || rc=$?
+    status=$(goal_field status "$log")
+    reason=$(goal_field lastReason "$log")
+    case "$status" in
+      complete) note "goal complete on attempt $attempt: $reason"; return 0 ;;
+      blocked) note "goal blocked on attempt $attempt: $reason"; return 2 ;;
+    esac
+    if [ "$attempt" -ge "$attempts" ]; then
+      note "goal not complete after $attempts attempts (last: ${status:-no goal state}, exit $rc); logs in $dir"
+      return 1
+    fi
+    note "attempt $attempt ended ${status:-without a goal state}${reason:+: $reason}; starting a fresh session, which keeps this attempt's file changes"
+    attempt=$((attempt + 1))
+  done
 }
 
 # --- argument parsing -------------------------------------------------------
@@ -795,6 +958,7 @@ case "${1:-}" in
   stop)         cmd_stop;   exit 0 ;;
   claude)       shift; cmd_claude "$@" ;;
   agent|code)   shift; cmd_code "$@" ;;
+  goal)         shift; cmd_goal "$@"; exit $? ;;
   -)            shift; cmd_code "$@" ;;
   codex)        shift; cmd_codex  "$@" ;;
   raw)          shift; set -- "$@" ;;

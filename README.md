@@ -209,8 +209,8 @@ The launcher reuses the existing model admission guard and compute lease. It
 sets the local OpenAI-compatible endpoint and a placeholder key. The checked-in
 `config/qwen-code-local.json` supplies 32,768-token context accounting, a
 4,096-token response cap, local-provider timeouts and disabled telemetry. It
-compacts at 80% of the provider window, enables Qwen Code's loop detector, and
-stops a turn after 12 tool calls. These are system defaults: Qwen Code
+compacts at 80% of the provider window and leaves Qwen Code's own turn guards
+in charge (see "Autonomous runs" below). These are system defaults: Qwen Code
 user/project settings can override them. No
 cloud fallback is configured. The client retains its conservative 32K budget
 on the 64K 4B tag. `QWEN_MODEL` selects a local model; an explicit `27b` selector
@@ -235,6 +235,96 @@ Measure a change the same way: point `OPENAI_BASE_URL` at a stub server that
 saves request bodies, then send the saved `messages` and `tools` to Ollama's
 `/api/chat` with `num_predict: 1` and read `prompt_eval_count`.
 
+### Autonomous runs
+
+Give Qwen a Goal and it keeps working until it proves the goal is met:
+
+```bash
+qwen 27b goal -y "Make every test in tests/ pass. Done means pytest exits 0."
+qwen 27b                  # interactive: type /goal <objective> in the session
+```
+
+`/goal` re-prompts the model after every turn until it calls `update_goal` with
+evidence, and a verifier checks that evidence before the Goal counts as done.
+State a done condition a command can check. `-y` approves every tool call,
+shell included, so run it only in a directory you can throw away or reset.
+
+`qwen goal` runs that headless, prints each tool call and every Goal status
+change, and writes the raw stream to `~/.cache/qwen/goals/`. When an attempt
+ends without a verified completion (a loop halt, a paused or usage-limited
+Goal, a crash) it starts the same objective in a fresh session, up to
+`--attempts` / `QWEN_GOAL_ATTEMPTS` (default 3). The files keep every earlier
+attempt's edits. It exits 0 on a verified completion, 2 on a verified blocked
+Goal, and 1 when the attempts run out. It holds the compute lock and lease
+across attempts.
+
+A fresh session is the retry because resuming a stalled one did not work. One
+run fixed 8 of 10 failing tests, stalled on invalid `read_file` calls, and hit
+Qwen Code's guard against five identical calls in a row. Resuming that session
+with `--continue` ran 14 minutes on the last one-line bug without editing it.
+Real Qwen Code on the same files in a new session fixed it in 7 tool calls, and
+the Goal ended verified `complete` in 476 seconds. Sampling was not the cause:
+30 replays of the stalled moment at temperature 0.2 and at Qwen's published
+thinking-mode settings (0.6, top_p 0.95, top_k 20, repeat_penalty 1.0), with
+and without a think-first instruction, gave the same result.
+
+A live `qwen 27b goal -y` run on a fresh copy of the six-bug fixture finished
+verified `complete` on its own, 63 minutes after launch:
+
+| Attempt | Tool calls | Ended |
+|---|---|---|
+| 1 | 9 | Its first edit dropped the colon from `for line in lines[1:]:`. It re-read `parser.py` until the repeat guard stopped it. |
+| 2 | 44 | Fixed the syntax error and the remaining bugs, so all 11 tests passed, then called `update_goal` with `evidence_refs` instead of `evidenceRefs` seven times until the guard stopped it. |
+| 3 | 19 | Re-ran the tests, cited them, and the 4B verifier accepted. |
+
+Both stalls were malformed output rather than wrong reasoning. The
+`qwen3.8:27b-obliterated` tag sets `repeat_penalty 1.15`, which penalizes
+tokens the model just saw, such as the first `:` in `[1:]` or the key named in
+an error message. In 17 replays each of the loop edit, 3 of 9 edits at 1.15
+dropped the colon and none of 3 at 1.0 did; at 1.0 the model read the file
+before editing in the other 14. Ollama's OpenAI endpoint does not accept a
+per-request `repeat_penalty`, so changing it means rebuilding the tag, which
+Backdoor also uses as its failover model.
+
+Four settings make that loop hold on a 32,768-token window:
+
+| Setting | Why |
+|---|---|
+| No `model.maxToolCallsPerTurn` | Any explicit value is a hard cap. The old `12` halted every turn at call 12; the default halts only on repeated calls, with a backstop at 1,000. |
+| No `model.skipLoopDetection` | `false` enabled the streaming heuristics that halted the run after compaction. Qwen Code's always-on guard against identical repeated calls stays. |
+| `context.clearContextOnIdle.toolResultsTotalCharsThreshold: 24000`, `toolResultsNumToKeep: 3` | Replaces old tool output with a placeholder and keeps the calls, so the model still knows what it ran. The default of 500,000 chars never fires on 32K. |
+| `model.chatCompression.maxRecentFilesToRetain: 1`, `tools.truncateToolOutputThreshold: 8000`, `truncateToolOutputLines: 200` | Summary compaction used to re-attach up to five files at 5K tokens each, which put a session straight back over the trigger. |
+
+Measured on a fixture with six planted bugs and about 8K tokens of source,
+27B headless: the run fixed every test in 16 tool calls and 7 minutes. The
+prompt peaked at 21.9K tokens, tool-result clearing took it from 18.9K to
+15.7K once, and neither summary compaction nor a loop halt fired.
+
+The Goal verifier needs a second model. Qwen Code aborts it after a fixed
+30 seconds, in 0.24.0 too, and the 27B reads prompts at about 268 tokens per
+second, so an 11K-token verifier prompt timed out every time. The config sends
+side queries to `QWEN_FAST_MODEL` (default `qwen3.5:4b-64k`) with
+`reasoning_effort: none`: the 4B answered a verifier-shaped request in 1.0 s
+against 9.5 s with thinking on, and Ollama ignores the `enable_thinking: false`
+that Qwen Code sends. In a test run the 4B verifier rejected a completion claim
+that cited the wrong evidence, and the 27B went back to work.
+
+Ollama will not hold both models on this Mac, so each verification unloads the
+27B, runs the 4B, and reloads the 27B. Verification runs only when the model
+claims it is done, so the config turns off the side queries that would swap
+every turn (`experimental.emitToolUseSummaries`,
+`ui.enableFollowupSuggestions`) and the launcher sets `QWEN_DISABLE_AUTO_TITLE=1`.
+A 4B that is not pulled falls back to the session model.
+
+An agent session that attaches to an already-loaded model now takes the
+compute lock and lease when they are free. During a test run the verifier swap
+left no 27B loaded and no lock held, and the local diff reviewer loaded its
+own model into the gap.
+
+With the 27B loaded and the usual desktop apps open, this Mac ran at 14% to 18%
+free memory. Claude Code's memory guard for its own background tasks killed two
+of four test runs at that level, so start long Goal runs from a terminal.
+
 The 27B selector owns the shared local-compute lock. If a cooperating LLM-Jury
 council or diff reviewer holds that lock, the launcher terminates that exact
 holder, waits for the kernel lock to release, and then runs the normal pressure
@@ -247,7 +337,9 @@ new invocation performs the frontier handoff.
 
 The launcher also reclaims an abandoned Qwen session when the lock holder is a
 Qwen process older than 30 minutes and Ollama reports no resident model. Set
-`QWEN_STALE_SESSION_SECONDS` to tune that threshold. The launcher reads the
+`QWEN_STALE_SESSION_SECONDS` to tune that threshold. A reclaim also stops the
+processes the session spawned: Qwen Code's launcher does not pass TERM on to its
+CLI, which kept running after its parent died. The launcher reads the
 session's age from `ps -o etime`. It used the lease file's mtime until the
 lease prune started deleting leases past their 4-hour expiry while the session
 still ran, which left every session older than 4 hours unreclaimable. The launcher keeps a live
