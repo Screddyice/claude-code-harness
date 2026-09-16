@@ -304,7 +304,27 @@ hook_branch_already_merged() {
     --head "$HOOK_BRANCH" --state merged \
     --json headRefOid --jq '.[0].headRefOid // empty' 2>/dev/null)"
 
-  [ -n "$merged_oid" ] && [ "$merged_oid" = "$head_oid" ]
+  hook_head_within_merged "$head_oid" "$merged_oid"
+}
+
+# True when HEAD is the merged PR's head, or an ancestor of it.
+#
+# The ancestor case is a checkout that stopped pulling before the PR merged:
+# the PR gained commits on the remote, landed, and this clone still sits on an
+# older commit of the same branch. Everything it has is inside the merged head,
+# so there is nothing to open, yet the exact-SHA test failed and the Stop hook
+# demanded a PR it could never satisfy. Observed 2026-09-17 on
+# teamnebula-ai/teamnebula.ai feat/fe-nebos-team-login, 25 commits behind its
+# remote after #425 merged. Local objects only: if the merged head was never
+# fetched this stays false rather than touching the network. A branch reused for
+# new commits has a HEAD that is not an ancestor of the old merge, so it still
+# needs its own PR.
+hook_head_within_merged() {
+  local head_oid="$1" merged_oid="$2"
+  [ -n "$head_oid" ] && [ -n "$merged_oid" ] || return 1
+  [ "$merged_oid" = "$head_oid" ] && return 0
+  git cat-file -e "${merged_oid}^{commit}" 2>/dev/null || return 1
+  git merge-base --is-ancestor "$head_oid" "$merged_oid" 2>/dev/null
 }
 
 # True when THIS exact commit is already the head of a PR on another branch.

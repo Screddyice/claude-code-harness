@@ -89,6 +89,16 @@ grep -q '\[skip\].*already merged' "$log" \
   || fail "a branch whose HEAD is already merged must not be re-proposed"
 grep -q 'DRYRUN' "$log" && fail "guard fired but the hook still intended to push"
 
+# 2b. Checkout stopped pulling before the PR merged: the merged head is a later
+#     commit of this branch and HEAD is its ancestor -> must skip, not re-propose.
+git -C "$repo" commit -q --allow-empty -m 'landed on the remote after this checkout stopped pulling'
+later_oid="$(git -C "$repo" rev-parse HEAD)"
+git -C "$repo" reset -q --hard "$head_oid"
+MOCK_MERGED_OID="$later_oid" run
+grep -q '\[skip\].*already merged' "$log" \
+  || fail "a branch behind its merged PR head must not be re-proposed"
+grep -q 'DRYRUN' "$log" && fail "behind-merged guard fired but the hook still intended to push"
+
 # 3. Branch reused for NEW commits after its PR merged -> must proceed again.
 #    Guards keyed on the merged SHA, not the branch name, so this stays possible.
 printf 'more\n' >> "$repo/a.txt"
