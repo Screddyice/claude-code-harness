@@ -140,6 +140,7 @@ cat > "$STUB/qwen-code" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" > "$FIXTURE/qwen-code.argv"
 env > "$FIXTURE/qwen-code.env"
+find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' > "$FIXTURE/qwen-code.leases" 2>/dev/null
 # A goal test lists one Goal status per attempt; each call consumes the first.
 if [ -s "$FIXTURE/goal-statuses" ]; then
   status=$(sed -n 1p "$FIXTURE/goal-statuses")
@@ -167,7 +168,7 @@ reset_world() {
         "$FIXTURE/stop-fails" "$FIXTURE/stop-keeps-resident" \
         "$FIXTURE/claude.argv" "$FIXTURE/claude.env" \
         "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
-        "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" \
+        "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" "$FIXTURE/qwen-code.leases" \
         "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up" \
         "$FIXTURE/holder.pid" "$FIXTURE/stale-owner" \
         "$FIXTURE/goal-statuses" "$FIXTURE/goal-calls"
@@ -480,7 +481,7 @@ case "$out" in
   *) fail "an active Qwen owner stays protected" "$out" ;;
 esac
 
-# `exec` skips the EXIT trap, so leases outlive their session by design; the next
+# `qwen raw` execs `ollama run`, which skips the EXIT trap, so its leases outlive the session; the next
 # run is what clears them, and only once the owning pid is gone.
 reset_world
 printf '{"active":true,"model":"%s","pid":999999,"source":"qwen","expires_at":%d}\n' \
@@ -794,11 +795,17 @@ fi
 reset_world
 printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
 out=$(run_qwen code)
-if grep -q 'attaching to the resident' <<<"$out" &&
-   [ -n "$(find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null)" ]; then
+if grep -q 'attaching to the resident' <<<"$out" && [ -s "$FIXTURE/qwen-code.leases" ]; then
   pass "an attaching agent session holds the lease while it runs"
 else
-  fail "an attaching agent session holds the lease while it runs" "$out $(ls "$FIXTURE/leases")"
+  fail "an attaching agent session holds the lease while it runs" "$out $(cat "$FIXTURE/qwen-code.leases" 2>/dev/null)"
+fi
+# The wrapper waits for Qwen Code instead of exec-ing it, so its EXIT trap
+# releases the lease as soon as the session ends.
+if [ -z "$(find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null)" ]; then
+  pass "a Qwen Code session releases its lease when it exits"
+else
+  fail "a Qwen Code session releases its lease when it exits" "$(ls "$FIXTURE/leases")"
 fi
 
 reset_world

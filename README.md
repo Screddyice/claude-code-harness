@@ -323,7 +323,9 @@ same id could hand the session the side-query entry's `reasoning_effort: none`.
 An agent session that attaches to an already-loaded model now takes the
 compute lock and lease when they are free. During a test run the verifier swap
 left no 27B loaded and no lock held, and the local diff reviewer loaded its
-own model into the gap.
+own model into the gap. A Qwen Code session releases its lease the moment it
+exits, because the launcher waits for Qwen Code instead of `exec`-ing it. `qwen
+raw` still `exec`s `ollama run`, so its lease stays until the next launch prunes it.
 
 With the 27B loaded and the usual desktop apps open, this Mac ran at 14% to 18%
 free memory. Claude Code's memory guard for its own background tasks killed two
