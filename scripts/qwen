@@ -843,7 +843,9 @@ cmd_code() {
   done
   code_prepare
   note "Qwen Code on $MODEL at $API (side queries: $FAST_MODEL); file and shell tools enabled"
-  exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" "$bin" "${CODE_ARGS[@]}" "$@"
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" "$bin" "${CODE_ARGS[@]}" "$@"
+  local rc=$?
+  return "$rc"
 }
 
 # Prints a line per tool call and Goal status change from Qwen Code's
@@ -956,12 +958,12 @@ case "${1:-}" in
   status)       cmd_status; exit 0 ;;
   stop)         cmd_stop;   exit 0 ;;
   claude)       shift; cmd_claude "$@" ;;
-  agent|code)   shift; cmd_code "$@" ;;
+  agent|code)   shift; cmd_code "$@"; exit $? ;;
   goal)         shift; cmd_goal "$@"; exit $? ;;
-  -)            shift; cmd_code "$@" ;;
+  -)            shift; cmd_code "$@"; exit $? ;;
   codex)        shift; cmd_codex  "$@" ;;
   raw)          shift; set -- "$@" ;;
-  *)            cmd_code "$@" ;;
+  *)            cmd_code "$@"; exit $? ;;
 esac
 
 while [ $# -gt 0 ]; do
