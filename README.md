@@ -291,14 +291,17 @@ verified `complete` on its own, 63 minutes after launch:
 | 2 | 44 | Fixed the syntax error and the remaining bugs, so all 11 tests passed, then called `update_goal` with `evidence_refs` instead of `evidenceRefs` seven times until the guard stopped it. |
 | 3 | 19 | Re-ran the tests, cited them, and the 4B verifier accepted. |
 
-Both stalls were malformed output rather than wrong reasoning. The
-`qwen3.8:27b-obliterated` tag sets `repeat_penalty 1.15`, which penalizes
-tokens the model just saw, such as the first `:` in `[1:]` or the key named in
-an error message. In 17 replays each of the loop edit, 3 of 9 edits at 1.15
-dropped the colon and none of 3 at 1.0 did; at 1.0 the model read the file
-before editing in the other 14. Ollama's OpenAI endpoint does not accept a
-per-request `repeat_penalty`, so changing it means rebuilding the tag, which
-Backdoor also uses as its failover model.
+Both stalls were malformed output rather than wrong reasoning. Keep the tag's
+`repeat_penalty 1.15`; it is not the cause. A single-state replay first
+suggested it was (3 of 9 loop edits dropped the colon at 1.15, 0 of 3 at 1.0),
+so the full task ran 4 times at each value with every tool call executed: all
+8 runs passed, 1.15 made no syntax-breaking edits and no invalid tool calls,
+and 1.0 made 2 and 1. The publisher's model card calls 1.15 "Critical for
+agents. Without it, greedy decoding loops on repeated tool calls", and
+recommends temperature 0.1 to 0.3 for agents, which covers Qwen Code's 0.2.
+Ollama's OpenAI endpoint has no per-request `repeat_penalty` anyway, and the
+tag is also Backdoor's failover model. The fresh-session retry in `qwen goal` is
+what absorbs these slips.
 
 Four settings make that loop hold on a 32,768-token window:
 
