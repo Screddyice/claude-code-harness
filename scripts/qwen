@@ -499,11 +499,7 @@ acquire_compute_lock() {
   take_lock || die "another local council or background review owns compute; retry when it finishes"
 }
 
-CODE_CONFIG_PATH=""
-cleanup() {
-  lease_close
-  [ -z "$CODE_CONFIG_PATH" ] || [ "$CODE_CONFIG_PATH" = "$QWEN_SOURCE_DIR/config/qwen-code-local.json" ] || rm -f "$CODE_CONFIG_PATH"
-}
+cleanup() { lease_close; }
 trap cleanup EXIT INT TERM
 
 # --- admission --------------------------------------------------------------
@@ -808,11 +804,18 @@ code_prepare() {
     note "side-query model $FAST_MODEL is not pulled; side queries use $MODEL"
     FAST_MODEL="$MODEL"
   fi
+  # When the session model answers its own side queries, the checked-in config
+  # would register one id twice, and the side-query entry turns reasoning off.
+  # The derived single-provider copy lives at a fixed path so `exec` needs no
+  # cleanup; it is rewritten atomically on every launch.
   CODE_CONFIG_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json"
   if [ "$FAST_MODEL" = "$MODEL" ]; then
-    CODE_CONFIG_PATH="${TMPDIR:-/tmp}/qwen-code-local.$$.$RANDOM.json"
-    jq '.modelProviders.openai |= .[:1]' \
-      "$QWEN_SOURCE_DIR/config/qwen-code-local.json" > "$CODE_CONFIG_PATH"
+    local state="${QWEN_STATE_DIR:-$HOME/.cache/qwen}"
+    mkdir -p "$state"
+    CODE_CONFIG_PATH="$state/qwen-code-local.single-model.json"
+    jq '.modelProviders.openai |= .[:1]' "$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
+      > "$CODE_CONFIG_PATH.$$" && mv -f "$CODE_CONFIG_PATH.$$" "$CODE_CONFIG_PATH" ||
+      die "could not write $CODE_CONFIG_PATH"
   fi
   agent_admit
   # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
@@ -840,11 +843,7 @@ cmd_code() {
   done
   code_prepare
   note "Qwen Code on $MODEL at $API (side queries: $FAST_MODEL); file and shell tools enabled"
-  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" "$bin" "${CODE_ARGS[@]}" "$@"
-  local rc=$?
-  [ -z "$CODE_CONFIG_PATH" ] || [ "$CODE_CONFIG_PATH" = "$QWEN_SOURCE_DIR/config/qwen-code-local.json" ] || rm -f "$CODE_CONFIG_PATH"
-  CODE_CONFIG_PATH=""
-  return "$rc"
+  exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" "$bin" "${CODE_ARGS[@]}" "$@"
 }
 
 # Prints a line per tool call and Goal status change from Qwen Code's

@@ -314,7 +314,11 @@ Ollama will not hold both models on this Mac, so each verification unloads the
 claims it is done, so the config turns off the side queries that would swap
 every turn (`experimental.emitToolUseSummaries`,
 `ui.enableFollowupSuggestions`) and the launcher sets `QWEN_DISABLE_AUTO_TITLE=1`.
-A 4B that is not pulled falls back to the session model.
+A 4B that is not pulled falls back to the session model. When the session
+model is also the side-query model (plain `qwen`, or that fallback), the launcher
+writes a copy of the config with one provider to
+`~/.cache/qwen/qwen-code-local.single-model.json`, because two entries with the
+same id could hand the session the side-query entry's `reasoning_effort: none`.
 
 An agent session that attaches to an already-loaded model now takes the
 compute lock and lease when they are free. During a test run the verifier swap
