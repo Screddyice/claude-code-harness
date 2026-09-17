@@ -684,6 +684,35 @@ else
   fail "side queries go to a registered fast model"
 fi
 
+# A Qwen Code session must end the wrapper when Qwen Code exits. Falling through
+# would reach the raw-chat path and start `ollama run` with the session's prompt.
+reset_world
+run_qwen code "fix the tests" >/dev/null
+if [ -f "$FIXTURE/qwen-code.argv" ] && ! grep -q '^run ' "$FIXTURE/ollama.log" 2>/dev/null; then
+  pass "a Qwen Code session does not fall through to Ollama chat"
+else
+  fail "a Qwen Code session does not fall through to Ollama chat" "$(cat "$FIXTURE/ollama.log" 2>/dev/null)"
+fi
+
+# When the session model is its own side-query model, the provider list must not
+# register the same id twice; the side-query entry turns reasoning off.
+reset_world
+TEST_QWEN_MODEL= run_qwen code >/dev/null
+cfg=$(grep '^QWEN_CODE_SYSTEM_DEFAULTS_PATH=' "$FIXTURE/qwen-code.env" | cut -d= -f2-)
+if [ -s "$cfg" ] && [ "$(jq '.modelProviders.openai | length' "$cfg")" = 1 ] &&
+   [ "$(jq -r '.modelProviders.openai[0].id' "$cfg")" = '${QWEN_SESSION_MODEL}' ]; then
+  pass "a 4B session registers its model once"
+else
+  fail "a 4B session registers its model once" "config=$cfg $(jq -c '[.modelProviders.openai[].id]' "$cfg" 2>&1)"
+fi
+reset_world
+run_qwen code >/dev/null
+if grep -qxF "QWEN_CODE_SYSTEM_DEFAULTS_PATH=$ROOT/config/qwen-code-local.json" "$FIXTURE/qwen-code.env"; then
+  pass "a 27B session uses the checked-in two-provider config"
+else
+  fail "a 27B session uses the checked-in two-provider config" "$(grep QWEN_CODE_SYSTEM_DEFAULTS_PATH "$FIXTURE/qwen-code.env")"
+fi
+
 # --- qwen goal ------------------------------------------------------------------
 reset_world
 out=$(run_qwen 27b goal "make the tests pass"); status=$?
