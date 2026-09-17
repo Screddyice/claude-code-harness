@@ -128,7 +128,11 @@ scripts/hooks/team-context-autosync.sh status   # branch, pause state, pending, 
 scripts/hooks/team-context-autosync.sh now      # sync immediately, ignoring the pause flag
 scripts/hooks/team-context-autosync.sh pause    # stop auto-syncing
 scripts/hooks/team-context-autosync.sh resume
+scripts/hooks/team-context-autosync.sh check    # SessionStart: systemMessage if the last sync was blocked
 ```
+
+Register `check` as a **SessionStart** hook too. The Stop hook runs async, so nothing
+it prints reaches a session; `check` is how a blocked sync becomes visible.
 
 **Why this exists.** It replaces tmn-skills' `memory-autosync.sh`, which stopped
 running on 2026-08-31 when the tree it lived in (`~/moonshot/...`) ceased to exist.
@@ -152,6 +156,16 @@ This exists because agents append memory records automatically: on 2026-09-10 a
 client contact's address reached `records.jsonl` with nobody looking, and the
 repo's own no-PII rule failed silently. A blocked sync logs the addresses, resets
 the index, and leaves the work uncommitted for a human to scrub.
+
+The block itself then failed silently. From 2026-09-11 to 2026-09-17 one record quoted
+the WhatsApp JID shape `digits@s.whatsapp.net`; every sync in those six days logged
+`BLOCKED` to `.memory-autosync.log`, which nobody reads, and 54 records sat uncommitted.
+Two changes followed. Placeholder local parts (`digits@`, `phone@`, `number@`, `user@`,
+`username@`, `name@`, `example@`, `someone@`) now pass the scan. A blocked sync also
+writes `.memory-autosync-blocked` with the time and the addresses, a successful commit
+removes it, and `check` turns it into a `systemMessage` at the next session start that
+names the address and the command to rerun. `scripts/test-team-context-autosync.sh`
+covers the placeholder, a named address, the marker, and the message.
 
 ## Who This Is For
 

@@ -9,9 +9,10 @@
 # 2026-09-11: commit and push to whatever branch the session is already on, and
 # never open a PR — a PR nobody watches is how #725 happened.
 #
-# Usage: team-context-autosync.sh [sync|now|pause|resume|status]
+# Usage: team-context-autosync.sh [sync|now|pause|resume|status|check]
 #   sync    commit+push unless paused   (what the Stop hook calls)
 #   now     same, ignores the pause flag
+#   check   SessionStart: emit a systemMessage if the last sync was BLOCKED
 set -uo pipefail
 
 TC="${TEAM_CONTEXT_DIR:-$HOME/TeamNebula/team-context}"
@@ -19,6 +20,10 @@ CMD="${1:-sync}"
 LOCK="$TC/.memory-autosync.lock"
 LOG="$TC/.memory-autosync.log"
 PAUSE="$TC/.memory-autosync-paused"
+# Present only while the most recent sync attempt was blocked. The Stop hook runs
+# async, so its stderr reaches nobody: from 2026-09-11 to 09-17 every sync logged
+# BLOCKED to $LOG and 54 records sat uncommitted. `check` reads this at session start.
+BLOCKED="$TC/.memory-autosync-blocked"
 PATHS=(memory projects-context)
 
 [ -d "$TC/.git" ] || exit 0
@@ -64,6 +69,7 @@ pii_hits() {
     | cut -c2- \
     | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
     | grep -viE '^(admin|support|info|hello|noreply|no-reply|contact|sales|team|help|billing|security)@' \
+    | grep -viE '^(digits|phone|number|user|username|name|example|someone)@' \
     | grep -viE '@teamnebula\.ai$' \
     | sort -u
 }
@@ -99,6 +105,7 @@ sync() {
   if [ -n "$hits" ]; then
     git -C "$TC" reset -q -- "${PATHS[@]}" 2>/dev/null
     log "BLOCKED: unscrubbed email(s) in staged records: $(echo "$hits" | tr '\n' ' ')"
+    { date '+%F %T'; echo "$hits"; } > "$BLOCKED"
     printf 'team-context sync BLOCKED — scrub these before committing:\n%s\n' "$hits" >&2
     return 0
   fi
@@ -107,6 +114,7 @@ sync() {
   n="$(git -C "$TC" diff --cached --numstat | wc -l | tr -d ' ')"
   msg="memory(auto): sync from $(hostname -s) $(date '+%F %H:%M') (${n} file(s))"
   git -C "$TC" commit -q -m "$msg" 2>/dev/null || { log "fail: commit"; return 0; }
+  rm -f "$BLOCKED"
 
   push_branch "$branch"
   return 0
@@ -122,7 +130,17 @@ case "$CMD" in
     echo "branch: $(git -C "$TC" symbolic-ref --quiet --short HEAD 2>/dev/null || echo '(detached)')"
     [ -f "$PAUSE" ] && echo "state:  PAUSED" || echo "state:  active"
     echo "pending:"; pending | sed 's/^/  /' | head -10
+    [ -f "$BLOCKED" ] && { echo "BLOCKED since $(head -1 "$BLOCKED") by:"; tail -n +2 "$BLOCKED" | sed 's/^/  /'; }
     [ -f "$LOG" ] && { echo "recent:"; tail -5 "$LOG" | sed 's/^/  /'; }
     ;;
-  *) echo "usage: $0 [sync|now|pause|resume|status]" >&2; exit 2 ;;
+  check)
+    [ -f "$BLOCKED" ] || exit 0
+    since="$(head -1 "$BLOCKED")"
+    hits="$(tail -n +2 "$BLOCKED" | tr '\n' ' ' | sed 's/ *$//')"
+    pend="$(pending | wc -l | tr -d ' ')"
+    python3 -c 'import json,sys; print(json.dumps({"continue": True, "systemMessage": sys.argv[1]}))' \
+      "team-context memory sync BLOCKED since $since by: $hits. $pend file(s) uncommitted in $TC. Scrub the address from the record, then run: $0 now" \
+      2>/dev/null || true
+    ;;
+  *) echo "usage: $0 [sync|now|pause|resume|status|check]" >&2; exit 2 ;;
 esac
