@@ -99,7 +99,10 @@ cat > "$STUB/ps" <<EOF
 #!/bin/bash
 if [ -f "\$FIXTURE/stale-owner" ]; then
   case "\$*" in
-    *"command="*) printf 'node %s/qwen --continue\\n' "\$FIXTURE"; exit 0 ;;
+    *"command="*)
+      name=qwen
+      [ ! -f "\$FIXTURE/uppercase-owner" ] || name=Qwen
+      printf 'node %s/%s --continue\\n' "\$FIXTURE" "\$name"; exit 0 ;;
   esac
 fi
 exec "$REAL_PS" "\$@"
@@ -473,12 +476,14 @@ sleep 1
 printf '{"active":true,"model":"%s","pid":%d,"source":"qwen","expires_at":%d}\n' \
   "$MODEL" "$holder" "$(( $(date +%s) + 3600 ))" > "$FIXTURE/leases/qwen-$holder.json"
 touch "$FIXTURE/stale-owner"
+touch "$FIXTURE/uppercase-owner"
 out=$(QWEN_STALE_SESSION_SECONDS=999999 run_qwen raw "hello")
+rm -f "$FIXTURE/uppercase-owner"
 kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 case "$out" in
-  *"another Qwen session owns compute"*) pass "an active Qwen owner stays protected" ;;
-  *) fail "an active Qwen owner stays protected" "$out" ;;
+  *"another Qwen session owns compute"*) pass "an active uppercase Qwen owner stays protected" ;;
+  *) fail "an active uppercase Qwen owner stays protected" "$out" ;;
 esac
 
 # `qwen raw` execs `ollama run`, which skips the EXIT trap, so its leases outlive the session; the next

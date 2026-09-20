@@ -84,12 +84,14 @@ class RuntimeTests(unittest.TestCase):
             evidence = proc.stdout + proc.stderr
             self.assertGreater(len(requests), 2, evidence[-5000:])
             model_context = json.dumps(requests)
-            self.assertTrue('no matches' in model_context, evidence[-2500:])
+            self.assertTrue('The search completed with no matches' in model_context, evidence[-2500:])
             self.assertTrue('This inspection already returned the same result twice' in model_context, evidence[-2500:])
             if recover:
                 self.assertEqual((root / 'result.txt').read_text(), 'RECOVERED\n')
                 self.assertEqual(proc.returncode, 0, evidence[-5000:])
                 self.assertIn('Verify recovered output', evidence)
+                last_tool = [m for m in requests[-1]['messages'] if m['role'] == 'tool'][-1]
+                self.assertIn('Exit Code: 0', json.dumps(last_tool['content']))
             else:
                 self.assertIn('Qwen progress guard:', evidence)
                 self.assertLessEqual(len(requests), 5, evidence[-5000:])

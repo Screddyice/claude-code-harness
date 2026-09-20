@@ -257,7 +257,9 @@ inspections, the hook denies another identical inspection and tells the model
 to change its search or proceed to an edit and test. It compares tool arguments
 without descriptions, and result content without call IDs or shell PGIDs, so an
 interleaved malformed call does not reset it. Changing results remain eligible.
-A successful file edit or a new user prompt resets this history.
+A successful file edit or a new user prompt resets this history. Compute-owner
+checks recognize `qwen` and case variants such as `Qwen`, so a capitalized
+launcher keeps the same active-session protection.
 
 For simple `grep`/`rg` commands (including `cd path && grep ...`), the hook
 explains exit code 1 without a reported error as no matches. After two ignored

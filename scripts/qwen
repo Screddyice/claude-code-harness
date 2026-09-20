@@ -445,7 +445,7 @@ preempt_local_compute() {
   for pid in $holders; do
     [ "$pid" = "$$" ] && continue
     command=$(ps -o command= -p "$pid" 2>/dev/null || true)
-    case "$command" in
+    case "$(printf '%s' "$command" | tr '[:upper:]' '[:lower:]')" in
       */ollama|*/ollama\ *|ollama|ollama\ *)
         die "another Ollama session owns compute (pid $pid); close it before starting $MODEL"
         ;;
@@ -476,7 +476,7 @@ preempt_local_compute() {
       for pid in $remaining; do
         [ "$pid" = "$$" ] && continue
         command=$(ps -o command= -p "$pid" 2>/dev/null || true)
-        case "$command" in
+        case "$(printf '%s' "$command" | tr '[:upper:]' '[:lower:]')" in
           */ollama|*/ollama\ *|ollama|ollama\ *)
             die "another Ollama session still owns compute (pid $pid); refusing to force-stop it"
             ;;
