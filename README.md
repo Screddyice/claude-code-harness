@@ -249,6 +249,32 @@ Measure a change the same way: point `OPENAI_BASE_URL` at a stub server that
 saves request bodies, then send the saved `messages` and `tools` to Ollama's
 `/api/chat` with `num_predict: 1` and read `prompt_eval_count`.
 
+### Repeated searches and reads
+
+The launcher installs a progress hook through its system defaults. After the
+same search or file read returns unchanged content twice within the last 12
+inspections, the hook denies another identical inspection and tells the model
+to change its search or proceed to an edit and test. It compares tool arguments
+without descriptions, and result content without call IDs or shell PGIDs, so an
+interleaved malformed call does not reset it. Changing results remain eligible.
+A successful file edit or a new user prompt resets this history. Compute-owner
+checks recognize `qwen` and case variants such as `Qwen`, so a capitalized
+launcher keeps the same active-session protection.
+
+For simple `grep`/`rg` commands (including `cd path && grep ...`), the hook
+explains exit code 1 without a reported error as no matches. After two ignored
+redirects, it stops the turn. A headless `qwen goal` can then use its existing
+fresh-session retry; an interactive session should restart with a bounded
+objective and a checkable completion condition. The hook never grants tool
+permission, runs a replacement command, or changes model sampling. It stores
+only hashes in `~/.cache/qwen/progress/`. Restart Qwen after installing launcher
+changes; an already-running client keeps its loaded hooks.
+
+Run `python3 scripts/test-qwen-progress-guard.py` for the regression suite.
+Set `QWEN_CODE_TEST_BIN` to an installed Qwen Code `cli.js` and run
+`python3 scripts/test-qwen-progress-runtime.py` to verify recovery and stopping
+through the real client against a deterministic local API, without loading a model.
+
 ### Autonomous runs
 
 Give Qwen a Goal and it keeps working until it proves the goal is met:
