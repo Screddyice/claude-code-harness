@@ -656,6 +656,7 @@ for entry in "" agent code; do
   if grep -qxF "$MODEL" "$FIXTURE/qwen-code.argv" &&
      grep -qxF 'http://127.0.0.1:11434/v1' "$FIXTURE/qwen-code.argv" &&
      grep -qxF 'OPENAI_API_KEY=ollama-local' "$FIXTURE/qwen-code.env" &&
+     grep -qxF "QWEN_HARNESS_ROOT=$ROOT" "$FIXTURE/qwen-code.env" &&
      grep -qxF "QWEN_CODE_SYSTEM_DEFAULTS_PATH=$ROOT/config/qwen-code-local.json" "$FIXTURE/qwen-code.env"; then
     pass "${entry:-default} pins local provider and context defaults"
   else

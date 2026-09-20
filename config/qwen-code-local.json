@@ -50,6 +50,44 @@
   },
   "ui": { "enableFollowupSuggestions": false },
   "experimental": { "emitToolUseSummaries": false },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "read_file|grep_search|glob|run_shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QWEN_HARNESS_ROOT}/scripts/qwen-progress-guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "read_file|grep_search|glob|run_shell_command|edit|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QWEN_HARNESS_ROOT}/scripts/qwen-progress-guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QWEN_HARNESS_ROOT}/scripts/qwen-progress-guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
   "telemetry": { "enabled": false, "logPrompts": false },
   "privacy": { "usageStatisticsEnabled": false }
 }
