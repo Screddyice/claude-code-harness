@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import sys
 
 READ_TOOLS = {'read_file', 'grep_search', 'glob'}
@@ -58,7 +59,18 @@ def guarded(name, args):
         return False
     # Only simple searches, optionally preceded by the common `cd path &&`.
     command = re.sub(r'^\s*cd\s+[^;&\n]+&&\s*', '', args['command'], count=1)
-    return bool(re.match(r'^\s*(grep|rg)\s', command)) and not re.search(r'[;&|<>`$\n]', command)
+    if re.search(r'[`$\n]', command):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|<>()')
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    # Tokenize before checking shell operators: a quoted regex such as
+    # "TypeA\|TypeB" is one search argument, not a pipeline.
+    return bool(tokens and tokens[0] in {'grep', 'rg'}) and not any(
+        re.fullmatch(r'[;&|<>()]+', token) for token in tokens[1:])
 
 
 def response_payload(response):

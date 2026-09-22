@@ -263,7 +263,10 @@ checks recognize `qwen` and case variants such as `Qwen`, so a capitalized
 launcher keeps the same active-session protection.
 
 For simple `grep`/`rg` commands (including `cd path && grep ...`), the hook
-explains exit code 1 without a reported error as no matches. After two ignored
+recognizes quoted regex alternatives such as `"TypeA\|TypeB"` as search
+arguments. These searches receive the same repeat protection after successful
+matches; actual shell pipelines and compound commands remain outside this
+guard. The hook explains exit code 1 without a reported error as no matches. After two ignored
 redirects, it stops the turn. A headless `qwen goal` can then use its existing
 fresh-session retry; an interactive session should restart with a bounded
 objective and a checkable completion condition. The hook never grants tool
