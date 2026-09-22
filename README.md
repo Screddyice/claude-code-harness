@@ -257,7 +257,8 @@ inspections, the hook denies another identical inspection and tells the model
 to change its search or proceed to an edit and test. It compares tool arguments
 without descriptions, and result content without call IDs or shell PGIDs, so an
 interleaved malformed call does not reset it. Changing results remain eligible.
-A successful file edit or a new user prompt resets this history. Compute-owner
+A successful file edit or a new user prompt resets this history, but not the
+read coverage described under Re-reading cleared pages. Compute-owner
 checks recognize `qwen` and case variants such as `Qwen`, so a capitalized
 launcher keeps the same active-session protection.
 
@@ -270,10 +271,53 @@ permission, runs a replacement command, or changes model sampling. It stores
 only hashes in `~/.cache/qwen/progress/`. Restart Qwen after installing launcher
 changes; an already-running client keeps its loaded hooks.
 
-Run `python3 scripts/test-qwen-progress-guard.py` for the regression suite.
-Set `QWEN_CODE_TEST_BIN` to an installed Qwen Code `cli.js` and run
-`python3 scripts/test-qwen-progress-runtime.py` to verify recovery and stopping
-through the real client against a deterministic local API, without loading a model.
+### Re-reading cleared pages
+
+The 24,000-char clearing threshold (see the settings table under Autonomous
+runs) leaves each request with your last four tool results. Qwen Code clears
+old output before it adds the newest result, so three survive and the fourth
+arrives fresh. One `read_file` page holds up to 8,000 chars. A 1,065-line
+README takes nine reads, and by the fifth the first page shows as
+`[Old tool result content cleared]`.
+
+On 2026-09-20 a session in `TMN/hypercrawl` spent 70 minutes in that loop. Qwen
+read a 184-line build plan, paged through the README, lost the plan, read the
+plan again, lost the README, and kept going until the user cancelled. The repeat
+guard never stopped it: each pass shifted the offset by a line (`133` then
+`134`, `973` then `974`). When the user wrote "stop inspecting and start
+building", the new prompt reset the guard's history, and the next pass began
+with `package.json`.
+
+The hook now records which lines each `read_file` showed, keyed by a digest of
+the real path plus the file's mtime and size:
+
+- It refuses a page-sized read that starts inside lines this session already
+  saw, whatever the offset or limit. The refusal tells the model to grep for
+  the fact it needs or to make the edit.
+- It refuses a fifth page of one file, because that page would clear the first.
+- After the first page of a file that needs more than four pages, it tells the
+  model to grep instead of paging.
+- It allows reads with a limit of 80 lines or fewer, because an edit needs the
+  exact current text.
+- Editing a file changes its mtime or size, which lets the model read it again.
+- A new user prompt keeps the coverage, since cleared output stays cleared.
+
+Three refusals in a row stop the turn. Any tool that runs between refusals
+resets the count, since running it means the model took the redirect. Replayed
+through the hook, the 2026-09-20 calls draw a refusal at the first README
+re-read and stop at call 12 even if the model ignores every redirect.
+
+Hand Qwen a plan as `@plan.md`. That puts the file in your message, and Qwen
+Code clears only tool output, so the plan stays visible after the pages around
+it are gone. A bare path makes Qwen fetch the file with `read_file`, and that
+output gets cleared like any other.
+
+Run `python3 scripts/test-qwen-progress-guard.py` for the regression suite,
+which includes the 2026-09-20 replay. Set `QWEN_CODE_TEST_BIN` to an installed
+Qwen Code `cli.js` and run `python3 scripts/test-qwen-progress-runtime.py` to
+verify recovery and stopping through the real client against a deterministic
+local API, without loading a model. It covers repeated searches and re-read
+loops, and checks that `@path` content survives clearing.
 
 ### Autonomous runs
 
@@ -335,7 +379,7 @@ Four settings make that loop hold on a 32,768-token window:
 |---|---|
 | No `model.maxToolCallsPerTurn` | Any explicit value is a hard cap. The old `12` halted every turn at call 12; the default halts only on repeated calls, with a backstop at 1,000. |
 | No `model.skipLoopDetection` | `false` enabled the streaming heuristics that halted the run after compaction. Qwen Code's always-on guard against identical repeated calls stays. |
-| `context.clearContextOnIdle.toolResultsTotalCharsThreshold: 24000`, `toolResultsNumToKeep: 3` | Replaces old tool output with a placeholder and keeps the calls, so the model still knows what it ran. The default of 500,000 chars never fires on 32K. |
+| `context.clearContextOnIdle.toolResultsTotalCharsThreshold: 24000`, `toolResultsNumToKeep: 3` | Replaces old tool output with a placeholder and keeps the calls, so the model still knows what it ran. The default of 500,000 chars never fires on 32K. A request shows four file pages at most. The progress hook's `RESULTS_KEPT` must equal `toolResultsNumToKeep`, and a test fails if they drift. |
 | `model.chatCompression.maxRecentFilesToRetain: 1`, `tools.truncateToolOutputThreshold: 8000`, `truncateToolOutputLines: 200` | Summary compaction used to re-attach up to five files at 5K tokens each, which put a session straight back over the trigger. |
 
 Measured on a fixture with six planted bugs and about 8K tokens of source,

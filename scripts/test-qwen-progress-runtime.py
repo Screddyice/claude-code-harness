@@ -19,68 +19,77 @@ BIN = os.environ.get('QWEN_CODE_TEST_BIN')
 
 @unittest.skipUnless(BIN, 'set QWEN_CODE_TEST_BIN to the installed cli.js')
 class RuntimeTests(unittest.TestCase):
+    def run_client(self, root, respond, prompt):
+        """Run real Qwen Code in root against a fixture API; respond(text) scripts each turn.
+
+        respond gets the request's messages as JSON text and returns (tool, args),
+        or (None, None) to finish. Returns the process and every request body.
+        """
+        requests = []
+
+        class API(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                requests.append(body)
+                name, args = respond(json.dumps(body.get('messages', [])))
+                delta = {'role': 'assistant'}
+                if name:
+                    delta['tool_calls'] = [{'index': 0, 'id': 'call_' + str(len(requests)), 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args)}}]
+                else:
+                    delta['content'] = 'Recovered and verified the output.'
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.end_headers()
+                for change, finish in [(delta, None), ({}, 'tool_calls' if name else 'stop')]:
+                    item = {'id': 'fixture', 'object': 'chat.completion.chunk', 'created': 0, 'model': 'fixture', 'choices': [{'index': 0, 'delta': change, 'finish_reason': finish}]}
+                    self.wfile.write(('data: ' + json.dumps(item) + '\n\n').encode())
+                self.wfile.write(b'data: [DONE]\n\n')
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f'http://127.0.0.1:{server.server_port}/v1'
+        cfg = json.loads((ROOT / 'config/qwen-code-local.json').read_text())
+        cfg['modelProviders']['openai'] = [{'id': 'fixture', 'envKey': 'OPENAI_API_KEY', 'baseUrl': url, 'generationConfig': {'contextWindowSize': 32768, 'maxRetries': 0}}]
+        cfg['model']['name'] = 'fixture'
+        cfg['fastModel'] = 'fixture'
+        cfg['model']['maxToolCallsPerTurn'] = 10
+        cfg['security']['folderTrust'] = {'enabled': False}
+        settings = root / 'settings.json'
+        settings.write_text(json.dumps(cfg))
+        env = dict(os.environ, HOME=str(root), QWEN_CODE_SYSTEM_DEFAULTS_PATH=str(settings),
+                   QWEN_HARNESS_ROOT=str(ROOT), QWEN_PROGRESS_STATE_DIR=str(root / 'progress'),
+                   QWEN_DISABLE_AUTO_TITLE='1', OPENAI_API_KEY='fixture',
+                   OPENAI_BASE_URL=url, QWEN_SESSION_MODEL='fixture', QWEN_FAST_MODEL='fixture', QWEN_LOCAL_BASE_URL=url)
+        for key in ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'GOOGLE_API_KEY', 'GEMINI_API_KEY']:
+            env.pop(key, None)
+        proc = subprocess.run(['node', BIN, '--auth-type', 'openai', '--model', 'fixture',
+                               '--openai-base-url', url, '-y', '-p', prompt, '-o', 'stream-json'],
+                              cwd=root, env=env, text=True, capture_output=True, timeout=90)
+        return proc, requests
+
     def run_fixture(self, recover):
         with tempfile.TemporaryDirectory(prefix='qwen-hook-runtime-') as tmp:
             root = Path(tmp)
             (root / 'input.txt').write_text('export const ActualType = 1;\n')
-            requests = []
             stage = [0]
 
-            class API(http.server.BaseHTTPRequestHandler):
-                def log_message(self, *_):
-                    pass
+            def respond(text):
+                if recover and 'This inspection already returned the same result twice' in text:
+                    stage[0] += 1
+                    if stage[0] == 1:
+                        return 'write_file', {'file_path': str(root / 'result.txt'), 'content': 'RECOVERED\n'}
+                    if stage[0] == 2:
+                        return 'run_shell_command', {'command': 'test -f result.txt && grep -qx RECOVERED result.txt', 'description': 'Verify recovered output'}
+                    return None, None
+                return 'run_shell_command', {'command': 'grep -n Missing input.txt', 'description': 'Search attempt ' + str(text.count('"tool"'))}
 
-                def do_POST(self):
-                    body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                    requests.append(body)
-                    text = json.dumps(body.get('messages', []))
-                    if recover and 'This inspection already returned the same result twice' in text:
-                        if stage[0] == 0:
-                            name, args = 'write_file', {'file_path': str(root / 'result.txt'), 'content': 'RECOVERED\n'}
-                            stage[0] = 1
-                        elif stage[0] == 1:
-                            name, args = 'run_shell_command', {'command': 'test -f result.txt && grep -qx RECOVERED result.txt', 'description': 'Verify recovered output'}
-                            stage[0] = 2
-                        else:
-                            name = None
-                    else:
-                        name, args = 'run_shell_command', {'command': 'grep -n Missing input.txt', 'description': 'Search attempt ' + str(len(requests))}
-                    delta = {'role': 'assistant'}
-                    if name:
-                        delta['tool_calls'] = [{'index': 0, 'id': 'call_' + str(len(requests)), 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args)}}]
-                    else:
-                        delta['content'] = 'Recovered and verified the output.'
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/event-stream')
-                    self.end_headers()
-                    for change, finish in [(delta, None), ({}, 'tool_calls' if name else 'stop')]:
-                        item = {'id': 'fixture', 'object': 'chat.completion.chunk', 'created': 0, 'model': 'fixture', 'choices': [{'index': 0, 'delta': change, 'finish_reason': finish}]}
-                        self.wfile.write(('data: ' + json.dumps(item) + '\n\n').encode())
-                    self.wfile.write(b'data: [DONE]\n\n')
-
-            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            self.addCleanup(server.server_close)
-            self.addCleanup(server.shutdown)
-            url = f'http://127.0.0.1:{server.server_port}/v1'
-            cfg = json.loads((ROOT / 'config/qwen-code-local.json').read_text())
-            cfg['modelProviders']['openai'] = [{'id': 'fixture', 'envKey': 'OPENAI_API_KEY', 'baseUrl': url, 'generationConfig': {'contextWindowSize': 32768, 'maxRetries': 0}}]
-            cfg['model']['name'] = 'fixture'
-            cfg['fastModel'] = 'fixture'
-            cfg['model']['maxToolCallsPerTurn'] = 10
-            cfg['security']['folderTrust'] = {'enabled': False}
-            settings = root / 'settings.json'
-            settings.write_text(json.dumps(cfg))
-            env = dict(os.environ, HOME=tmp, QWEN_CODE_SYSTEM_DEFAULTS_PATH=str(settings),
-                       QWEN_HARNESS_ROOT=str(ROOT), QWEN_PROGRESS_STATE_DIR=str(root / 'progress'),
-                       QWEN_DISABLE_AUTO_TITLE='1', OPENAI_API_KEY='fixture',
-                       OPENAI_BASE_URL=url, QWEN_SESSION_MODEL='fixture', QWEN_FAST_MODEL='fixture', QWEN_LOCAL_BASE_URL=url)
-            for key in ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'GOOGLE_API_KEY', 'GEMINI_API_KEY']:
-                env.pop(key, None)
-            proc = subprocess.run(['node', BIN, '--auth-type', 'openai', '--model', 'fixture',
-                                   '--openai-base-url', url, '-y', '-p', 'Inspect input.txt, recover from a repeated search, write result.txt and verify it.', '-o', 'stream-json'],
-                                  cwd=tmp, env=env, text=True, capture_output=True, timeout=90)
+            proc, requests = self.run_client(root, respond, 'Inspect input.txt, recover from a repeated search, write result.txt and verify it.')
             evidence = proc.stdout + proc.stderr
             self.assertGreater(len(requests), 2, evidence[-5000:])
             model_context = json.dumps(requests)
@@ -102,6 +111,51 @@ class RuntimeTests(unittest.TestCase):
 
     def test_ignored_redirect_stops_the_actual_runtime(self):
         self.run_fixture(False)
+
+    def run_reread_fixture(self, recover):
+        """The 2026-09-20 loop: a big file, four more reads, then back to page one."""
+        with tempfile.TemporaryDirectory(prefix='qwen-hook-reread-') as tmp:
+            root = Path(tmp)
+            pad = 'x' * 60
+            (root / 'big.md').write_text(''.join(f'big line {n} {pad}\n' for n in range(1, 1201)))
+            for name in ['a.md', 'b.md', 'c.md', 'd.md']:
+                (root / name).write_text(''.join(f'{name} line {n} {pad}\n' for n in range(1, 131)))
+            (root / 'plan.md').write_text('# Plan\n\nPLAN-MARKER-7731: add the endpoint, then its test.\n')
+            reads = ['big.md', 'a.md', 'b.md', 'c.md', 'd.md', 'big.md', 'big.md', 'big.md', 'big.md']
+            turn = [0]
+
+            def respond(text):
+                turn[0] += 1
+                if recover and 'That is how this session loops' in text:
+                    if not (root / 'result.txt').exists():
+                        return 'write_file', {'file_path': str(root / 'result.txt'), 'content': 'BUILT\n'}
+                    return None, None
+                return 'read_file', {'file_path': str(root / reads[min(turn[0], len(reads)) - 1])}
+
+            proc, requests = self.run_client(root, respond, '@plan.md Build the plan.')
+            evidence = proc.stdout + proc.stderr
+            contexts = [json.dumps(r.get('messages', [])) for r in requests]
+            self.assertGreater(len(requests), 6, evidence[-5000:])
+            self.assertIn('Do not page through the rest', contexts[1], 'paging nudge after the first page')
+            # Qwen clears before adding the newest result, so four 8K pages stay
+            # visible and the fifth clears page one. The @plan content survives.
+            self.assertNotIn('[Old tool result content cleared]', contexts[4])
+            self.assertIn('[Old tool result content cleared]', contexts[5], evidence[-2500:])
+            self.assertIn('PLAN-MARKER-7731', contexts[5], '@path content should survive clearing')
+            self.assertIn('That is how this session loops', contexts[6], evidence[-2500:])
+            if recover:
+                self.assertEqual((root / 'result.txt').read_text(), 'BUILT\n')
+                self.assertEqual(proc.returncode, 0, evidence[-5000:])
+            else:
+                self.assertIn('Qwen progress guard: the model kept re-reading', evidence)
+                self.assertLessEqual(len(requests), 9, evidence[-5000:])
+            print(f'Runtime re-read {"recovery" if recover else "hard stop"}: {len(requests)} model requests, exit {proc.returncode}')
+
+    def test_reread_of_cleared_page_is_redirected_and_model_recovers(self):
+        self.run_reread_fixture(True)
+
+    def test_ignored_reread_redirects_stop_the_actual_runtime(self):
+        self.run_reread_fixture(False)
 
 
 if __name__ == '__main__':
