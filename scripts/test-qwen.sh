@@ -74,6 +74,15 @@ cat > "$STUB/memory_pressure" <<'EOF'
 echo "System-wide memory free percentage: $(cat "$FIXTURE/free_pct")%"
 EOF
 
+cat > "$STUB/vm_stat" <<'EOF'
+#!/bin/bash
+if [ -f "$FIXTURE/vm_stat" ]; then cat "$FIXTURE/vm_stat"; exit; fi
+echo 'Mach Virtual Memory Statistics: (page size of 16384 bytes)'
+echo "Pages free: $((38654705664 * $(cat "$FIXTURE/free_pct") / 100 / 16384))."
+echo 'Pages speculative: 0.'
+echo 'Pages purgeable: 0.'
+EOF
+
 cat > "$STUB/sysctl" <<'EOF'
 #!/bin/bash
 case "$*" in
@@ -163,6 +172,7 @@ chmod +x "$STUB"/*
 MODEL=qwen3.8:27b-obliterated
 
 reset_world() {
+  rm -f "$FIXTURE/vm_stat"
   printf '{"models":[{"name":"%s","size":17716740000,"digest":"heavy"},{"name":"qwen3.5:4b-64k","size":2500000000,"digest":"small"}]}\n' "$MODEL" > "$FIXTURE/tags.json"
   echo '{"models":[]}' > "$FIXTURE/ps.json"
   echo 1 > "$FIXTURE/pressure"
@@ -255,6 +265,32 @@ case "$out" in
   *) fail "too little free memory refuses the load" "$out" ;;
 esac
 
+# The pressure percentage can be high despite too little physical RAM for 27B.
+reset_world
+cat > "$FIXTURE/vm_stat" <<'EOF'
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free: 900000.
+Pages speculative: 20000.
+Pages purgeable: 20000.
+Pages inactive: 900000.
+EOF
+out=$(run_qwen code -p "hello")
+status=$?
+if [ "$status" -ne 0 ] && [ ! -e "$FIXTURE/qwen-code.argv" ] && [[ "$out" == *"needs ~"* ]]; then
+  pass "high pressure percentage cannot admit a physically overcommitted agent"
+else
+  fail "physical memory must gate the agent before launch" "$out"
+fi
+
+reset_world
+echo 'unavailable' > "$FIXTURE/vm_stat"
+out=$(run_qwen code -p "hello")
+if [[ "$out" == *"cannot read host memory"* ]] && [ ! -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "missing physical memory counters fail closed"
+else
+  fail "missing physical memory counters fail closed" "$out"
+fi
+
 # --force is the documented escape hatch, and has to survive both refusals above.
 reset_world
 echo 20 > "$FIXTURE/free_pct"
@@ -321,8 +357,7 @@ else
   pass "--keep-others leaves other models alone"
 fi
 
-# Already resident means this session costs no new memory, so the guard that
-# would otherwise refuse it must not run at all.
+# Already resident does not need the full cold-load budget, but still checks pressure.
 reset_world
 echo 20 > "$FIXTURE/free_pct"
 printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
@@ -331,6 +366,19 @@ case "$out" in
   *"attaching to the resident"*) pass "attaching to a resident model skips the guard" ;;
   *) fail "attaching to a resident model skips the guard" "$out" ;;
 esac
+
+# A resident model must not bypass the host's warning/critical pressure gate.
+for mode in raw code; do
+  reset_world
+  echo 4 > "$FIXTURE/pressure"
+  printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
+  out=$(run_qwen "$mode" "hello")
+  if [[ "$out" == *"memory pressure is elevated"* ]]; then
+    pass "$mode refuses attachment under critical memory pressure"
+  else
+    fail "$mode must check pressure even for a resident model" "$out"
+  fi
+done
 
 # A 4B session remains conservative: it does not preempt another local owner.
 reset_world

@@ -73,10 +73,12 @@ class RuntimeTests(unittest.TestCase):
                               cwd=root, env=env, text=True, capture_output=True, timeout=90)
         return proc, requests
 
-    def run_fixture(self, recover, quoted_search=False):
+    def run_fixture(self, recover, quoted_search=False, git_chain=False):
         with tempfile.TemporaryDirectory(prefix='qwen-hook-runtime-') as tmp:
             root = Path(tmp)
             (root / 'input.txt').write_text('export const ActualType = 1;\n')
+            if git_chain:
+                subprocess.run(['git', 'init', '-q', str(root)], check=True)
             stage = [0]
 
             def respond(text):
@@ -88,13 +90,15 @@ class RuntimeTests(unittest.TestCase):
                         return 'run_shell_command', {'command': 'test -f result.txt && grep -qx RECOVERED result.txt', 'description': 'Verify recovered output'}
                     return None, None
                 command = r'cd . && grep -n "ActualType\|OtherType" input.txt' if quoted_search else 'grep -n Missing input.txt'
+                if git_chain:
+                    command = 'git log --all --oneline -20 && echo "---STATUS---" && git status'
                 return 'run_shell_command', {'command': command, 'description': 'Search attempt ' + str(text.count('"tool"'))}
 
             proc, requests = self.run_client(root, respond, 'Inspect input.txt, recover from a repeated search, write result.txt and verify it.')
             evidence = proc.stdout + proc.stderr
             self.assertGreater(len(requests), 2, evidence[-5000:])
             model_context = json.dumps(requests)
-            if not quoted_search:
+            if not quoted_search and not git_chain:
                 self.assertTrue('The search completed with no matches' in model_context, evidence[-2500:])
             self.assertTrue('This inspection already returned the same result twice' in model_context, evidence[-2500:])
             if recover:
@@ -119,6 +123,12 @@ class RuntimeTests(unittest.TestCase):
 
     def test_successful_quoted_search_stops_when_redirect_ignored(self):
         self.run_fixture(False, quoted_search=True)
+
+    def test_git_chain_can_recover_and_finish(self):
+        self.run_fixture(True, git_chain=True)
+
+    def test_git_chain_stops_when_redirect_ignored(self):
+        self.run_fixture(False, git_chain=True)
 
     def run_reread_fixture(self, recover):
         """The 2026-09-20 loop: a big file, four more reads, then back to page one."""
