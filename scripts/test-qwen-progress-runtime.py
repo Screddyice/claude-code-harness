@@ -73,7 +73,7 @@ class RuntimeTests(unittest.TestCase):
                               cwd=root, env=env, text=True, capture_output=True, timeout=90)
         return proc, requests
 
-    def run_fixture(self, recover):
+    def run_fixture(self, recover, quoted_search=False):
         with tempfile.TemporaryDirectory(prefix='qwen-hook-runtime-') as tmp:
             root = Path(tmp)
             (root / 'input.txt').write_text('export const ActualType = 1;\n')
@@ -87,13 +87,15 @@ class RuntimeTests(unittest.TestCase):
                     if stage[0] == 2:
                         return 'run_shell_command', {'command': 'test -f result.txt && grep -qx RECOVERED result.txt', 'description': 'Verify recovered output'}
                     return None, None
-                return 'run_shell_command', {'command': 'grep -n Missing input.txt', 'description': 'Search attempt ' + str(text.count('"tool"'))}
+                command = r'cd . && grep -n "ActualType\|OtherType" input.txt' if quoted_search else 'grep -n Missing input.txt'
+                return 'run_shell_command', {'command': command, 'description': 'Search attempt ' + str(text.count('"tool"'))}
 
             proc, requests = self.run_client(root, respond, 'Inspect input.txt, recover from a repeated search, write result.txt and verify it.')
             evidence = proc.stdout + proc.stderr
             self.assertGreater(len(requests), 2, evidence[-5000:])
             model_context = json.dumps(requests)
-            self.assertTrue('The search completed with no matches' in model_context, evidence[-2500:])
+            if not quoted_search:
+                self.assertTrue('The search completed with no matches' in model_context, evidence[-2500:])
             self.assertTrue('This inspection already returned the same result twice' in model_context, evidence[-2500:])
             if recover:
                 self.assertEqual((root / 'result.txt').read_text(), 'RECOVERED\n')
@@ -111,6 +113,12 @@ class RuntimeTests(unittest.TestCase):
 
     def test_ignored_redirect_stops_the_actual_runtime(self):
         self.run_fixture(False)
+
+    def test_successful_quoted_search_can_recover_and_finish(self):
+        self.run_fixture(True, quoted_search=True)
+
+    def test_successful_quoted_search_stops_when_redirect_ignored(self):
+        self.run_fixture(False, quoted_search=True)
 
     def run_reread_fixture(self, recover):
         """The 2026-09-20 loop: a big file, four more reads, then back to page one."""

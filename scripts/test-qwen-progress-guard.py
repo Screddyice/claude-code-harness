@@ -38,6 +38,25 @@ class HookCase(unittest.TestCase):
 
 
 class GuardTests(HookCase):
+    def test_quoted_regex_alternation_is_guarded(self):
+        for command in [
+            r'cd ~/projects/example && grep -rn "account-session\|AccountSession" src/account-capture.ts',
+            "rg 'account-session|AccountSession' src/account-capture.ts",
+        ]:
+            with self.subTest(command=command):
+                args = {'command': command}
+                self.executed(args=args); self.executed(args=args)
+                self.assertEqual(self.call(args=args).get('hookSpecificOutput', {}).get('permissionDecision'), 'deny')
+
+    def test_shell_control_operators_remain_outside_guard(self):
+        for command in ['grep x file | head', 'grep x file&& make', 'rg x file>out',
+                        'rg "$(date)" file', 'rg `date` file', 'rg "unterminated',
+                        'rg x file\nmake']:
+            with self.subTest(command=command):
+                args = {'command': command}
+                self.executed(args=args); self.executed(args=args)
+                self.assertEqual(self.call(args=args), {})
+
     def test_same_empty_search_with_interleaved_malformed_call_is_denied(self):
         self.executed()
         self.call(args={'function': 'grep ToolType src/index.ts'})
