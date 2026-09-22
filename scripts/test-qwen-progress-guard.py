@@ -38,6 +38,19 @@ class HookCase(unittest.TestCase):
 
 
 class GuardTests(HookCase):
+    def test_git_inspection_chain_is_guarded(self):
+        args = {'command': 'git log --oneline -20 && echo "---STATUS---" && git status',
+                'directory': '/repo'}
+        self.executed(args=args); self.executed(args=args)
+        self.assertEqual(self.call(args=args)['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_chains_with_mutations_or_builds_are_not_guarded(self):
+        for command in ['git status && git commit -m fix', 'git log && make',
+                        'git log --output=result.txt', 'echo hello', 'rg x file &&']:
+            args = {'command': command}
+            self.executed(args=args); self.executed(args=args)
+            self.assertEqual(self.call(args=args), {})
+
     def test_quoted_regex_alternation_is_guarded(self):
         for command in [
             r'cd ~/projects/example && grep -rn "account-session\|AccountSession" src/account-capture.ts',

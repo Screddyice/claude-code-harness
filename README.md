@@ -266,7 +266,10 @@ For simple `grep`/`rg` commands (including `cd path && grep ...`), the hook
 recognizes quoted regex alternatives such as `"TypeA\|TypeB"` as search
 arguments. These searches receive the same repeat protection after successful
 matches; actual shell pipelines and compound commands remain outside this
-guard. The hook explains exit code 1 without a reported error as no matches. After two ignored
+guard. Read-only `&&` chains of searches, `git log`, and `git status`, with
+`cd` or `echo` separators, also receive repeat protection. Chains containing
+builds or mutations remain outside the guard. The hook explains exit code 1
+without a reported error as no matches. After two ignored
 redirects, it stops the turn. A headless `qwen goal` can then use its existing
 fresh-session retry; an interactive session should restart with a bounded
 objective and a checkable completion condition. The hook never grants tool
@@ -1614,11 +1617,22 @@ So the wrapper does its own arithmetic. Before a load it checks:
 |-----------|--------|-----|
 | No booted iOS Simulator | `pgrep` | 17.6 GB of CoreSimulator measured on this host |
 | Memory pressure at level 1 | `kern.memorystatus_vm_pressure_level` | memguard's own refusal condition |
-| Free memory covers the load plus 2 GiB | `memory_pressure -Q` | the desktop reserve memguard keeps |
+| Physical headroom covers the load plus 4 GiB | `vm_stat` free + speculative + purgeable pages | reserve for the desktop, agent tools, and runner growth |
 | Nothing else resident in Ollama | `/api/ps` | co-residency is what panicked the Mac |
 
 Another resident model gets unloaded rather than tolerated. Pass `--keep-others` to
 leave it alone, or `--force` to load past every check above.
+
+The launcher does not convert `memory_pressure`'s free percentage into bytes.
+That pressure metric can admit a 27B load when physical memory cannot hold it.
+It also excludes inactive pages from the budget because those can contain
+anonymous memory that requires swap to reclaim. Missing physical counters refuse
+the launch. If 27B does not fit, close memory-heavy applications or select the
+smaller model with `QWEN_MODEL=qwen3.5:4b-64k qwen`; overriding the guard with
+`--force` can reproduce the overcommit.
+Attaching to an already-resident model still checks memory pressure, but does
+not charge its loaded weights a second time. This is a launch-time guard, not
+a continuous monitor of other applications or memory allocated by build tools.
 
 The opening estimate is deliberately high, `disk * 1.15 + cells * 45_000` plus the
 1 GiB prompt cache, or about 22.7 GB. Once a load succeeds the wrapper writes what

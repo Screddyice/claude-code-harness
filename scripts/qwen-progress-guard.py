@@ -69,8 +69,29 @@ def guarded(name, args):
         return False
     # Tokenize before checking shell operators: a quoted regex such as
     # "TypeA\|TypeB" is one search argument, not a pipeline.
-    return bool(tokens and tokens[0] in {'grep', 'rg'}) and not any(
-        re.fullmatch(r'[;&|<>()]+', token) for token in tokens[1:])
+    groups = [[]]
+    for token in tokens:
+        if token == '&&':
+            groups.append([])
+        elif re.fullmatch(r'[;&|<>()]+', token):
+            return False
+        else:
+            groups[-1].append(token)
+    inspections = 0
+    for group in groups:
+        if not group:
+            return False
+        if group[0] in {'grep', 'rg'}:
+            inspections += 1
+        elif len(group) >= 2 and group[0] == 'git' and group[1] in {'log', 'status'}:
+            if any(arg.startswith('--output') for arg in group[2:]):
+                return False
+            inspections += 1
+        elif group[0] == 'echo' or (group[0] == 'cd' and len(group) == 2):
+            continue
+        else:
+            return False
+    return inspections > 0
 
 
 def response_payload(response):

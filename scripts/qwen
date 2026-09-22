@@ -80,7 +80,7 @@ case "${1:-}" in
   27b|27B) MODEL="qwen3.8:27b-obliterated"; shift ;;
 esac
 GB=$((1024 ** 3))
-DESKTOP_RESERVE=$((2 * GB))     # matches memguard's headroom reserve
+DESKTOP_RESERVE=$((4 * GB))     # desktop, agent tools, and runner growth
 PROMPT_CACHE_MIB="${QWEN_PROMPT_CACHE_MIB:-1024}"   # LLAMA_ARG_CACHE_RAM on this host
 LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.backdoor/compute-leases}"
 LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
@@ -290,13 +290,25 @@ is_resident() {
 # can deliberately *create* pressure, so -Q is not optional.
 pressure_level() { sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null; }
 
+check_pressure() {
+  local level
+  level=$(pressure_level) || die "cannot read host memory pressure; refusing the launch"
+  [ "$level" = 1 ] || die "host memory pressure is elevated or unknown (level $level); free memory first"
+}
+
 available_bytes() {
-  local total pct
-  total=$(sysctl -n hw.memsize 2>/dev/null) || return 1
-  pct=$(memory_pressure -Q 2>/dev/null |
-    sed -n 's/.*System-wide memory free percentage: *\([0-9]\{1,3\}\)%.*/\1/p')
-  [ -n "$total" ] && [ -n "$pct" ] || return 1
-  printf '%s\n' $(( total * pct / 100 ))
+  # memory_pressure's percentage is a pressure metric, not allocatable bytes.
+  # Count free pages and immediately reclaimable speculative/purgeable pages.
+  # Do not count inactive anonymous pages: reclaiming them can require swap.
+  vm_stat 2>/dev/null | python3 -c '
+import re, sys
+text = sys.stdin.read()
+page = re.search(r"page size of ([0-9]+) bytes", text)
+counts = [re.search(r"^Pages " + name + r":\s+([0-9]+)\.\s*$", text, re.M)
+          for name in ("free", "speculative", "purgeable")]
+if not page or not all(counts) or int(page[1]) not in (4096, 16384):
+    sys.exit(1)
+print(int(page[1]) * sum(int(count[1]) for count in counts))'
 }
 
 simulator_booted() {
@@ -523,20 +535,17 @@ stop_other_models() {
 }
 
 admit() {
-  local level avail need
+  local avail need
   if simulator_booted; then
     die "an iOS Simulator is booted (~17.6 GB resident); quit it, or set LLMJURY_ALLOW_SIMULATOR=1"
   fi
-  level=$(pressure_level || true)
-  if [ -n "$level" ] && [ "$level" != 1 ]; then
-    die "host memory pressure is elevated (level $level); free memory first, or pass --force"
-  fi
+  check_pressure
   [ "$keep_others" = 1 ] || stop_other_models
   need=$(need_bytes) || die "cannot read the model's size from Ollama; is $MODEL pulled?"
   avail=$(available_bytes) || die "cannot read host memory; pass --force to load anyway"
   if [ "$(( avail - DESKTOP_RESERVE ))" -lt "$need" ]; then
     die "$MODEL needs ~$(gb "$need") GB and only $(gb $(( avail - DESKTOP_RESERVE ))) GB is free
-     after the 2 GiB desktop reserve. Close something, or pass --force.
+     after the 4 GiB desktop/runtime reserve. Close something, or use the smaller qwen model.
      A wired over-commit does not fail cleanly here — it panics the host."
   fi
   note "loading $MODEL (~$(gb "$need") GB, $(gb "$avail") GB free)"
@@ -617,6 +626,7 @@ parse_agent_opts() {
 
 agent_admit() {
   if is_resident; then
+    [ "$force" = 1 ] || check_pressure
     note "attaching to the resident $MODEL"
     # Residency does not last a whole agent session: a Goal verification swaps
     # the 27B out for the side-query model, and the diff reviewer or a council
@@ -992,6 +1002,7 @@ if [ -z "$prompt" ] && [ ! -t 0 ]; then prompt="$(cat)"; fi
 start_server || die "Ollama did not come up on $API (launchctl kickstart gui/$(id -u)/$AGENT_LABEL)"
 
 if is_resident; then
+  [ "$force" = 1 ] || check_pressure
   # Already loaded: this session costs no new memory, so it needs no guard, no
   # lease (residency is memguard's own second source of truth) and no lock.
   note "attaching to the resident $MODEL"
