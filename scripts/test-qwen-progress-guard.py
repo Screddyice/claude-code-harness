@@ -10,7 +10,7 @@ import unittest
 SCRIPT = Path(__file__).with_name('qwen-progress-guard.py')
 
 
-class GuardTests(unittest.TestCase):
+class HookCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -36,6 +36,8 @@ class GuardTests(unittest.TestCase):
         self.call(**kwargs)
         return self.call(event='PostToolUse', result=self.result(), **kwargs)
 
+
+class GuardTests(HookCase):
     def test_same_empty_search_with_interleaved_malformed_call_is_denied(self):
         self.executed()
         self.call(args={'function': 'grep ToolType src/index.ts'})
@@ -111,6 +113,143 @@ class GuardTests(unittest.TestCase):
         content = ''.join(p.read_text() for p in Path(self.tmp.name).glob('*.json'))
         self.assertNotIn('ToolType', content)
         self.assertNotIn('Process Group', content)
+
+
+class RereadTests(HookCase):
+    """Qwen Code keeps only the last few tool results, so re-reading cleared pages loops."""
+
+    def setUp(self):
+        super().setUp()
+        self.files = Path(self.tmp.name) / 'repo'
+        self.files.mkdir()
+        self.readme = self.write('README.md', 1065)
+        self.plan = self.write('plan.md', 184)
+        self.pkg = self.write('package.json', 20)
+
+    def write(self, name, lines):
+        path = self.files / name
+        path.write_text(''.join(f'line {n} of {name}\n' for n in range(1, lines + 1)))
+        return str(path)
+
+    def page(self, first, last, total):
+        return f'Showing lines {first}-{last} of {total} total lines.\n\n---\n\nbody'
+
+    def read(self, path, span=None, **args):
+        """Run read_file through the hook like Qwen Code does; returns the Pre decision."""
+        args = dict(args, file_path=path)
+        decision = self.call(name='read_file', args=args)
+        if decision:
+            return decision
+        text = self.page(*span) if span else 'whole file'
+        response = {'response_parts': [{'functionResponse': {'id': 'x', 'name': 'read_file', 'response': {'output': text}}}]}
+        self.post = self.call('PostToolUse', name='read_file', args=args, result=response)
+        return decision
+
+    def denied(self, decision):
+        return decision.get('hookSpecificOutput', {}).get('permissionDecision') == 'deny'
+
+    def test_rereading_a_cleared_page_is_refused_despite_offset_jitter(self):
+        self.read(self.readme, (974, 1065, 1065), offset=973, limit=1065)
+        decision = self.read(self.readme, offset=974, limit=533)
+        self.assertTrue(self.denied(decision))
+        reason = decision['hookSpecificOutput']['permissionDecisionReason']
+        self.assertIn('Old tool result content cleared', reason)
+        self.assertIn('grep_search', reason)
+
+    def test_first_page_reread_without_offset_is_refused(self):
+        self.read(self.readme, (1, 133, 1065))
+        self.assertTrue(self.denied(self.read(self.readme, limit=1065)))
+
+    def test_paging_a_large_file_stops_once_early_pages_are_cleared(self):
+        self.assertFalse(self.denied(self.read(self.readme, (1, 133, 1065))))
+        self.assertIn('1065 lines', self.post['hookSpecificOutput']['additionalContext'])
+        self.assertFalse(self.denied(self.read(self.readme, (134, 232, 1065), offset=133, limit=533)))
+        self.assertFalse(self.denied(self.read(self.readme, (233, 367, 1065), offset=232, limit=533)))
+        self.assertFalse(self.denied(self.read(self.readme, (368, 515, 1065), offset=367, limit=533)))
+        decision = self.read(self.readme, offset=515, limit=533)
+        self.assertTrue(self.denied(decision))
+        self.assertIn('grep_search', decision['hookSpecificOutput']['permissionDecisionReason'])
+
+    def test_a_plan_that_fits_is_read_in_full_without_a_nudge(self):
+        for span, args in [((1, 75, 184), {}), ((76, 170, 184), {'offset': 75, 'limit': 184}),
+                           ((171, 184, 184), {'offset': 170, 'limit': 184})]:
+            self.assertFalse(self.denied(self.read(self.plan, span, **args)))
+            self.assertEqual(self.post, {})
+
+    def test_targeted_read_of_seen_lines_stays_allowed_for_edits(self):
+        self.read(self.readme, (1, 133, 1065))
+        self.assertFalse(self.denied(self.read(self.readme, (40, 79, 1065), offset=39, limit=40)))
+
+    def test_changed_file_can_be_read_again(self):
+        self.read(self.pkg)
+        Path(self.pkg).write_text('{"name": "changed"}\n')
+        self.assertFalse(self.denied(self.read(self.pkg)))
+
+    def test_new_prompt_keeps_read_coverage(self):
+        self.call('UserPromptSubmit', prompt_id='p1', prompt='build it')
+        self.read(self.readme, (1, 133, 1065))
+        self.call('UserPromptSubmit', prompt_id='p2', prompt='stop inspecting and start building')
+        self.assertTrue(self.denied(self.read(self.readme)))
+
+    def test_ignored_reread_redirects_stop_the_turn(self):
+        self.call('UserPromptSubmit', prompt_id='p1', prompt='task')
+        self.read(self.pkg)
+        self.assertTrue(self.denied(self.read(self.pkg)))
+        self.assertTrue(self.denied(self.read(self.pkg)))
+        out = self.read(self.pkg)
+        self.assertIs(out.get('continue'), False)
+        self.assertNotIn('permissionDecision', out.get('hookSpecificOutput', {}))
+        self.assertIn('@', out['stopReason'])
+
+    def test_following_a_redirect_resets_the_stop_count(self):
+        self.read(self.pkg)
+        for n in range(4):
+            self.assertTrue(self.denied(self.read(self.pkg)))
+            self.executed(args={'command': f'grep -n name{n} {self.pkg}'})
+
+    def test_state_does_not_store_file_paths(self):
+        self.read(self.readme, (1, 133, 1065))
+        content = ''.join(p.read_text() for p in Path(self.tmp.name).glob('*.json'))
+        self.assertNotIn('README', content)
+        self.assertNotIn(self.tmp.name, content)
+
+    def test_replay_of_the_hypercrawl_loop_stops_it(self):
+        """The read_file calls of the 2026-09-20 session that looped for 70 minutes."""
+        claude = self.write('CLAUDE.md', 20)
+        replay = [
+            (self.readme, (1, 133, 1065), {}),
+            (claude, None, {}),
+            (self.plan, (1, 75, 184), {}),
+            (self.plan, (76, 170, 184), {'offset': 75, 'limit': 184}),
+            (self.plan, (171, 184, 184), {'offset': 170, 'limit': 184}),
+            (self.pkg, None, {}),
+            (self.readme, (1, 133, 1065), {}),
+            (self.readme, (135, 233, 1065), {'offset': 134, 'limit': 1065}),
+            (self.readme, (235, 369, 1065), {'offset': 234, 'limit': 1065}),
+            (self.readme, (371, 517, 1065), {'offset': 370, 'limit': 1065}),
+            (self.readme, (519, 656, 1065), {'offset': 518, 'limit': 1065}),
+            (self.readme, (739, 838, 1065), {'offset': 738, 'limit': 1065}),
+            (self.readme, (840, 972, 1065), {'offset': 839, 'limit': 1065}),
+            (self.readme, (974, 1065, 1065), {'offset': 973, 'limit': 1065}),
+            (self.plan, (1, 75, 184), {'offset': 0, 'limit': 1065}),
+            (self.plan, (77, 170, 184), {'offset': 76, 'limit': 1065}),
+            (self.plan, (171, 184, 184), {'offset': 170, 'limit': 1065}),
+            (self.pkg, None, {}),
+            (self.readme, (1, 133, 1065), {}),
+        ]
+        self.call('UserPromptSubmit', prompt_id='p1', prompt='Lets proceed with the Hypercrawl build')
+        outcomes = [self.read(path, span, **args) for path, span, args in replay]
+        self.assertEqual([i for i, o in enumerate(outcomes) if o][:1], [6], 'first re-read of README page 1')
+        stops = [i for i, o in enumerate(outcomes) if o.get('continue') is False]
+        self.assertTrue(stops and stops[0] <= 12, outcomes)
+
+    def test_page_budget_matches_the_launcher_config(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('guard', SCRIPT)
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        cfg = json.loads((SCRIPT.parent.parent / 'config/qwen-code-local.json').read_text())
+        self.assertEqual(guard.RESULTS_KEPT, cfg['context']['clearContextOnIdle']['toolResultsNumToKeep'])
 
 
 if __name__ == '__main__':
