@@ -55,7 +55,10 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         url = f'http://127.0.0.1:{server.server_port}/v1'
         cfg = json.loads((ROOT / 'config/qwen-code-local.json').read_text())
-        cfg['modelProviders']['openai'] = [{'id': 'fixture', 'envKey': 'OPENAI_API_KEY', 'baseUrl': url, 'generationConfig': {'contextWindowSize': 32768, 'maxRetries': 0}}]
+        provider = cfg['modelProviders']['openai'][0]
+        provider.update(id='fixture', envKey='OPENAI_API_KEY', baseUrl=url)
+        provider['generationConfig']['maxRetries'] = 0
+        cfg['modelProviders']['openai'] = [provider]
         cfg['model']['name'] = 'fixture'
         cfg['fastModel'] = 'fixture'
         cfg['model']['maxToolCallsPerTurn'] = 10
@@ -72,6 +75,25 @@ class RuntimeTests(unittest.TestCase):
                                '--openai-base-url', url, '-y', '-p', prompt, '-o', 'stream-json'] + (['--append-system-prompt', append_prompt] if append_prompt else []),
                               cwd=root, env=env, text=True, capture_output=True, timeout=90)
         return proc, requests
+
+    def test_main_requests_disable_thinking_across_tool_result(self):
+        with tempfile.TemporaryDirectory(prefix='qwen-thinking-runtime-') as tmp:
+            root = Path(tmp)
+            (root / 'input.txt').write_text('TOOL_RESULT_PRESENT_7831\n')
+            count = [0]
+
+            def respond(text):
+                count[0] += 1
+                if count[0] == 1:
+                    return 'read_file', {'file_path': str(root / 'input.txt')}
+                return None, None
+
+            proc, requests = self.run_client(root, respond, 'Read input.txt and report its contents.')
+            self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+            self.assertGreaterEqual(len(requests), 2)
+            for request in requests:
+                self.assertEqual(request.get('reasoning_effort'), 'none')
+            self.assertIn('TOOL_RESULT_PRESENT_7831', json.dumps(requests[-1]['messages']))
 
     def run_fixture(self, recover, quoted_search=False, git_chain=False, pipeline=False):
         with tempfile.TemporaryDirectory(prefix='qwen-hook-runtime-') as tmp:

@@ -420,6 +420,15 @@ Measured on a fixture with six planted bugs and about 8K tokens of source,
 prompt peaked at 21.9K tokens, tool-result clearing took it from 18.9K to
 15.7K once, and neither summary compaction nor a loop halt fired.
 
+Main coding requests now also send `reasoning_effort: none` through the OpenAI
+API, including requests after tool results. This follows the modified 27B model
+publisher's recommended non-thinking mode; the previous main-provider config
+left thinking enabled. The installed-client regression test checks the actual
+request body and retained tool result against a local API fixture. It does not
+prove that 27B completes a real build without repetition: that comparison remains
+pending sufficient physical memory. Start a new Qwen session to load this setting.
+The model tag, weights, Ollama template, and memory admission guard are unchanged.
+
 The Goal verifier needs a second model. Qwen Code aborts it after a fixed
 30 seconds, in 0.24.0 too, and the 27B reads prompts at about 268 tokens per
 second, so an 11K-token verifier prompt timed out every time. The config sends

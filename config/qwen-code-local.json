@@ -17,7 +17,8 @@
         "timeout": 300000,
         "streamIdleTimeoutMs": 120000,
         "maxRetries": 1,
-        "samplingParams": { "temperature": 0.2, "max_tokens": 4096 }
+        "samplingParams": { "temperature": 0.2, "max_tokens": 4096 },
+        "extra_body": { "reasoning_effort": "none" }
       }
     }, {
       "id": "${QWEN_FAST_MODEL}",
