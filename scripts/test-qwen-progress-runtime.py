@@ -19,7 +19,7 @@ BIN = os.environ.get('QWEN_CODE_TEST_BIN')
 
 @unittest.skipUnless(BIN, 'set QWEN_CODE_TEST_BIN to the installed cli.js')
 class RuntimeTests(unittest.TestCase):
-    def run_client(self, root, respond, prompt):
+    def run_client(self, root, respond, prompt, append_prompt=None):
         """Run real Qwen Code in root against a fixture API; respond(text) scripts each turn.
 
         respond gets the request's messages as JSON text and returns (tool, args),
@@ -55,7 +55,10 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         url = f'http://127.0.0.1:{server.server_port}/v1'
         cfg = json.loads((ROOT / 'config/qwen-code-local.json').read_text())
-        cfg['modelProviders']['openai'] = [{'id': 'fixture', 'envKey': 'OPENAI_API_KEY', 'baseUrl': url, 'generationConfig': {'contextWindowSize': 32768, 'maxRetries': 0}}]
+        provider = cfg['modelProviders']['openai'][0]
+        provider.update(id='fixture', envKey='OPENAI_API_KEY', baseUrl=url)
+        provider['generationConfig']['maxRetries'] = 0
+        cfg['modelProviders']['openai'] = [provider]
         cfg['model']['name'] = 'fixture'
         cfg['fastModel'] = 'fixture'
         cfg['model']['maxToolCallsPerTurn'] = 10
@@ -69,20 +72,46 @@ class RuntimeTests(unittest.TestCase):
         for key in ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'GOOGLE_API_KEY', 'GEMINI_API_KEY']:
             env.pop(key, None)
         proc = subprocess.run(['node', BIN, '--auth-type', 'openai', '--model', 'fixture',
-                               '--openai-base-url', url, '-y', '-p', prompt, '-o', 'stream-json'],
+                               '--openai-base-url', url, '-y', '-p', prompt, '-o', 'stream-json'] + (['--append-system-prompt', append_prompt] if append_prompt else []),
                               cwd=root, env=env, text=True, capture_output=True, timeout=90)
         return proc, requests
 
-    def run_fixture(self, recover, quoted_search=False, git_chain=False):
+    def test_main_requests_disable_thinking_across_tool_result(self):
+        with tempfile.TemporaryDirectory(prefix='qwen-thinking-runtime-') as tmp:
+            root = Path(tmp)
+            (root / 'input.txt').write_text('TOOL_RESULT_PRESENT_7831\n')
+            count = [0]
+
+            def respond(text):
+                count[0] += 1
+                if count[0] == 1:
+                    return 'read_file', {'file_path': str(root / 'input.txt')}
+                return None, None
+
+            proc, requests = self.run_client(root, respond, 'Read input.txt and report its contents.')
+            self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+            self.assertGreaterEqual(len(requests), 2)
+            for request in requests:
+                self.assertEqual(request.get('reasoning_effort'), 'none')
+            self.assertIn('TOOL_RESULT_PRESENT_7831', json.dumps(requests[-1]['messages']))
+
+    def run_fixture(self, recover, quoted_search=False, git_chain=False, pipeline=False):
         with tempfile.TemporaryDirectory(prefix='qwen-hook-runtime-') as tmp:
             root = Path(tmp)
             (root / 'input.txt').write_text('export const ActualType = 1;\n')
             if git_chain:
                 subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            if pipeline:
+                for rel in ['packages/platforms/src/providers/reddit.ts', 'packages/mcp-server/src/index.ts']:
+                    path = root / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('export const reddit = 1;\n')
+            redirect = ('This exact shell command returned unchanged output four times' if pipeline
+                        else 'This inspection already returned the same result twice')
             stage = [0]
 
             def respond(text):
-                if recover and 'This inspection already returned the same result twice' in text:
+                if recover and redirect in text:
                     stage[0] += 1
                     if stage[0] == 1:
                         return 'write_file', {'file_path': str(root / 'result.txt'), 'content': 'RECOVERED\n'}
@@ -92,15 +121,17 @@ class RuntimeTests(unittest.TestCase):
                 command = r'cd . && grep -n "ActualType\|OtherType" input.txt' if quoted_search else 'grep -n Missing input.txt'
                 if git_chain:
                     command = 'git log --all --oneline -20 && echo "---STATUS---" && git status'
+                if pipeline:
+                    command = 'grep -rin "reddit" packages/platforms/src/providers/reddit.ts | head && echo "---mcp-server index reddit lines---" && grep -n "ddit" packages/mcp-server/src/index.ts'
                 return 'run_shell_command', {'command': command, 'description': 'Search attempt ' + str(text.count('"tool"'))}
 
             proc, requests = self.run_client(root, respond, 'Inspect input.txt, recover from a repeated search, write result.txt and verify it.')
             evidence = proc.stdout + proc.stderr
             self.assertGreater(len(requests), 2, evidence[-5000:])
             model_context = json.dumps(requests)
-            if not quoted_search and not git_chain:
+            if not quoted_search and not git_chain and not pipeline:
                 self.assertTrue('The search completed with no matches' in model_context, evidence[-2500:])
-            self.assertTrue('This inspection already returned the same result twice' in model_context, evidence[-2500:])
+            self.assertTrue(redirect in model_context, evidence[-2500:])
             if recover:
                 self.assertEqual((root / 'result.txt').read_text(), 'RECOVERED\n')
                 self.assertEqual(proc.returncode, 0, evidence[-5000:])
@@ -109,7 +140,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIn('Exit Code: 0', json.dumps(last_tool['content']))
             else:
                 self.assertIn('Qwen progress guard:', evidence)
-                self.assertLessEqual(len(requests), 5, evidence[-5000:])
+                self.assertLessEqual(len(requests), 7 if pipeline else 5, evidence[-5000:])
             print(f'Runtime {"recovery" if recover else "hard stop"}: {len(requests)} model requests, exit {proc.returncode}')
 
     def test_model_can_recover_and_finish(self):
@@ -129,6 +160,42 @@ class RuntimeTests(unittest.TestCase):
 
     def test_git_chain_stops_when_redirect_ignored(self):
         self.run_fixture(False, git_chain=True)
+
+    def test_screenshot_pipeline_recovers(self):
+        self.run_fixture(True, pipeline=True)
+
+    def test_screenshot_pipeline_stops(self):
+        self.run_fixture(False, pipeline=True)
+
+    def test_persistent_plan_survives_clearing_and_guides_build(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('plan_context', ROOT / 'scripts/qwen-plan-context.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix='qwen-plan-runtime-') as tmp:
+            root = Path(tmp)
+            plan = root / 'plan with spaces.md'
+            plan.write_text('PLAN_FACT_9123: Write result.txt containing BUILT and verify it.\n')
+            for i in range(5):
+                (root / f'page{i}.txt').write_text('details ' * 850)
+            step = [0]
+            def respond(text):
+                n = step[0]; step[0] += 1
+                if n < 5:
+                    return 'read_file', {'file_path': str(root / f'page{n}.txt')}
+                if n == 5:
+                    return 'write_file', {'file_path': str(root / 'result.txt'), 'content': 'BUILT\n'}
+                if n == 6:
+                    return 'run_shell_command', {'command': 'test "$(cat result.txt)" = BUILT'}
+                return None, None
+            proc, requests = self.run_client(root, respond, 'Implement the retained plan.', module.render(plan))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(any('[Old tool result content cleared]' in json.dumps(r) for r in requests))
+            for request in requests:
+                system = [m for m in request['messages'] if m['role'] == 'system']
+                self.assertIn('PLAN_FACT_9123', json.dumps(system))
+            self.assertEqual((root / 'result.txt').read_text(), 'BUILT\n')
+            self.assertIn('Exit Code: 0', json.dumps(requests[-1]['messages'][-1]))
 
     def run_reread_fixture(self, recover):
         """The 2026-09-20 loop: a big file, four more reads, then back to page one."""

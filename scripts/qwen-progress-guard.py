@@ -21,6 +21,10 @@ REDIRECT = ('This inspection already returned the same result twice. Do not repe
             'Use a different search pattern or path, inspect an import or definition, '
             'or make the next supported edit and run its test. A grep/rg exit code 1 '
             'with no error means no matches; it is not a tool failure.')
+SHELL_REDIRECT = ('This exact shell command returned unchanged output four times without an intervening '
+                  'successful file edit. Do not repeat it. Use the results already available to make '
+                  'the next supported edit, change the investigation, or report the concrete blocker. '
+                  'If this was polling, stop polling this unchanged state in this turn.')
 
 # Qwen Code replaces all but the newest tool results with a placeholder once
 # they pass 24,000 chars (config/qwen-code-local.json). It clears before it adds
@@ -242,13 +246,16 @@ def decide(data, state):
         decision = reread_decision(data, state, args)
         if decision:
             return decision
-    if not guarded(name, args):
+    inspection = guarded(name, args)
+    shell = name == 'run_shell_command' and isinstance(args.get('command'), str)
+    if not inspection and not shell:
         return {}
+    threshold = 2 if inspection else 4
     key = digest([name, {k: v for k, v in args.items() if k != 'description'}])
     history = state.setdefault('history', [])
     denials = state.setdefault('denials', {})
     prior = [item[1] for item in history if item[0] == key]
-    if event == 'PreToolUse' and len(prior) >= 2 and prior[-1] == prior[-2]:
+    if event == 'PreToolUse' and len(prior) >= threshold and len(set(prior[-threshold:])) == 1:
         denials[key] = denials.get(key, 0) + 1
         if denials[key] >= 3:
             # Do not include permissionDecision=deny: Qwen handles that before
@@ -256,7 +263,7 @@ def decide(data, state):
             state['halted'] = True
             return {'continue': False, 'stopReason': STOP_REASON}
         return {'hookSpecificOutput': {'hookEventName': event,
-                'permissionDecision': 'deny', 'permissionDecisionReason': REDIRECT}}
+                'permissionDecision': 'deny', 'permissionDecisionReason': REDIRECT if inspection else SHELL_REDIRECT}}
     if event == 'PostToolUse':
         payload = response_payload(response)
         fingerprint = digest(payload)
@@ -266,7 +273,7 @@ def decide(data, state):
         del history[:-WINDOW]
         active = {item[0] for item in history}
         state['denials'] = {k: v for k, v in denials.items() if k in active}
-        if name == 'run_shell_command' and re.search(r'Exit Code: 1(?:\\n|\n|$)', payload) and 'Error: (none)' in payload:
+        if inspection and name == 'run_shell_command' and re.search(r'Exit Code: 1(?:\\n|\n|$)', payload) and 'Error: (none)' in payload:
             return {'hookSpecificOutput': {'hookEventName': event, 'additionalContext':
                     'The search completed with no matches (exit code 1). Change the pattern or search scope; do not retry the identical command.'}}
         if name == 'read_file':

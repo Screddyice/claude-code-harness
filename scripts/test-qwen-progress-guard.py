@@ -38,6 +38,28 @@ class HookCase(unittest.TestCase):
 
 
 class GuardTests(HookCase):
+    def test_pipeline_and_unknown_shell_commands_have_a_backstop(self):
+        commands = [
+            'grep -rin "reddit" src/reddit.ts | head && echo "---index---" && grep -n "ddit" src/index.ts',
+            'custom-inspector --summary', 'npm test',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                args = {'command': command}
+                for _ in range(4):
+                    self.assertEqual(self.call(args=args), {})
+                    self.call('PostToolUse', args=args, result=self.result())
+                out = self.call(args=args)
+                self.assertEqual(out.get('hookSpecificOutput', {}).get('permissionDecision'), 'deny')
+                self.call(args=args)
+                self.assertIs(self.call(args=args).get('continue'), False)
+
+    def test_generic_backstop_requires_four_unchanged_results(self):
+        args = {'command': 'custom-status | head'}
+        for n in range(8):
+            self.assertEqual(self.call(args=args), {})
+            self.call('PostToolUse', args=args, result=self.result(text=str(n // 3)))
+
     def test_git_inspection_chain_is_guarded(self):
         args = {'command': 'git log --oneline -20 && echo "---STATUS---" && git status',
                 'directory': '/repo'}
@@ -125,7 +147,7 @@ class GuardTests(HookCase):
         self.assertEqual(self.call(args={'command': 'rg ToolType src/'}), {})
 
     def test_non_search_commands_are_not_guarded_or_approved(self):
-        for _ in range(5):
+        for _ in range(3):
             self.executed(args={'command': 'pytest -q'})
             self.assertEqual(self.call(args={'command': 'pytest -q'}), {})
 

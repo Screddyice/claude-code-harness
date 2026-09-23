@@ -265,10 +265,9 @@ launcher keeps the same active-session protection.
 For simple `grep`/`rg` commands (including `cd path && grep ...`), the hook
 recognizes quoted regex alternatives such as `"TypeA\|TypeB"` as search
 arguments. These searches receive the same repeat protection after successful
-matches; actual shell pipelines and compound commands remain outside this
-guard. Read-only `&&` chains of searches, `git log`, and `git status`, with
+matches. Read-only `&&` chains of searches, `git log`, and `git status`, with
 `cd` or `echo` separators, also receive repeat protection. Chains containing
-builds or mutations remain outside the guard. The hook explains exit code 1
+builds or mutations use the general shell backstop below. The hook explains exit code 1
 without a reported error as no matches. After two ignored
 redirects, it stops the turn. A headless `qwen goal` can then use its existing
 fresh-session retry; an interactive session should restart with a bounded
@@ -276,6 +275,15 @@ objective and a checkable completion condition. The hook never grants tool
 permission, runs a replacement command, or changes model sampling. It stores
 only hashes in `~/.cache/qwen/progress/`. Restart Qwen after installing launcher
 changes; an already-running client keeps its loaded hooks.
+
+All other shell commands, including pipelines, have a four-result backstop.
+Four unchanged outputs for identical arguments within the recent window cause
+a redirect before the fifth execution. Two ignored redirects stop the turn.
+This covers `grep ... | head && echo ... && grep ...` without requiring the
+hook to recognize its syntax. A changed result breaks the identical-output run;
+a successful `edit`/`write_file` or a new user prompt resets history. Deliberate
+unchanged polling and repeated identical builds can also trigger this limit.
+This bounds repetition; it does not prove the model can complete the task.
 
 ### Re-reading cleared pages
 
@@ -326,6 +334,25 @@ local API, without loading a model. It covers repeated searches and re-read
 loops, and checks that `@path` content survives clearing.
 
 ### Autonomous runs
+
+For plan-driven work, retain the plan outside disposable tool results:
+
+```bash
+qwen --plan "/path/to/build-plan.md"
+# or a bounded headless task:
+qwen code --plan "/path/to/build-plan.md" -p "Implement the first unfinished step and run its focused test."
+```
+
+`--plan` appends a startup snapshot as labeled reference data to persistent
+session context. The installed client retains it when old tool output clears.
+It also directs the agent to implement and verify one supported step before
+expanding scope. Files must be nonempty UTF-8 text, at most 24,000 bytes; larger
+plans need a phase-sized excerpt. Missing or invalid plans refuse startup before
+loading a model. Put this launcher option before client options such as `-p`.
+Plan edits after startup require a fresh session or an explicit reread. This mode
+supports the normal/code/agent entry points; it does not change `qwen goal`.
+The memory guard still applies. Persistent context fixes plan eviction; it does
+not guarantee that a model will complete an arbitrary build.
 
 Give Qwen a Goal and it keeps working until it proves the goal is met:
 
@@ -392,6 +419,15 @@ Measured on a fixture with six planted bugs and about 8K tokens of source,
 27B headless: the run fixed every test in 16 tool calls and 7 minutes. The
 prompt peaked at 21.9K tokens, tool-result clearing took it from 18.9K to
 15.7K once, and neither summary compaction nor a loop halt fired.
+
+Main coding requests now also send `reasoning_effort: none` through the OpenAI
+API, including requests after tool results. This follows the modified 27B model
+publisher's recommended non-thinking mode; the previous main-provider config
+left thinking enabled. The installed-client regression test checks the actual
+request body and retained tool result against a local API fixture. It does not
+prove that 27B completes a real build without repetition: that comparison remains
+pending sufficient physical memory. Start a new Qwen session to load this setting.
+The model tag, weights, Ollama template, and memory admission guard are unchanged.
 
 The Goal verifier needs a second model. Qwen Code aborts it after a fixed
 30 seconds, in 0.24.0 too, and the 27B reads prompts at about 268 tokens per
@@ -1617,7 +1653,7 @@ So the wrapper does its own arithmetic. Before a load it checks:
 |-----------|--------|-----|
 | No booted iOS Simulator | `pgrep` | 17.6 GB of CoreSimulator measured on this host |
 | Memory pressure at level 1 | `kern.memorystatus_vm_pressure_level` | memguard's own refusal condition |
-| Physical headroom covers the load plus 4 GiB | `vm_stat` free + speculative + purgeable pages | reserve for the desktop, agent tools, and runner growth |
+| Physical headroom covers the load plus 4 GiB | `vm_stat` free + max(file-backed, speculative + purgeable) pages | reserve for the desktop, agent tools, and runner growth |
 | Nothing else resident in Ollama | `/api/ps` | co-residency is what panicked the Mac |
 
 Another resident model gets unloaded rather than tolerated. Pass `--keep-others` to
@@ -1625,8 +1661,13 @@ leave it alone, or `--force` to load past every check above.
 
 The launcher does not convert `memory_pressure`'s free percentage into bytes.
 That pressure metric can admit a 27B load when physical memory cannot hold it.
-It also excludes inactive pages from the budget because those can contain
-anonymous memory that requires swap to reclaim. Missing physical counters refuse
+It includes file-backed cache that macOS can reclaim. It takes the larger of
+file-backed pages and speculative + purgeable pages, rather than adding overlapping
+counters. The estimate includes potentially active or dirty file pages, so it is
+not a promise of immediately free RAM; normal pressure and the 4 GiB reserve still
+apply. It excludes the inactive-page total because that can contain anonymous
+memory requiring swap. Compressor and swap capacity do not add to the budget.
+Refusals report estimated headroom before/after the reserve, clamped at zero. Missing physical counters refuse
 the launch. If 27B does not fit, close memory-heavy applications or select the
 smaller model with `QWEN_MODEL=qwen3.5:4b-64k qwen`; overriding the guard with
 `--force` can reproduce the overcommit.
