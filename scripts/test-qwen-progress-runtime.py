@@ -73,16 +73,23 @@ class RuntimeTests(unittest.TestCase):
                               cwd=root, env=env, text=True, capture_output=True, timeout=90)
         return proc, requests
 
-    def run_fixture(self, recover, quoted_search=False, git_chain=False):
+    def run_fixture(self, recover, quoted_search=False, git_chain=False, pipeline=False):
         with tempfile.TemporaryDirectory(prefix='qwen-hook-runtime-') as tmp:
             root = Path(tmp)
             (root / 'input.txt').write_text('export const ActualType = 1;\n')
             if git_chain:
                 subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            if pipeline:
+                for rel in ['packages/platforms/src/providers/reddit.ts', 'packages/mcp-server/src/index.ts']:
+                    path = root / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('export const reddit = 1;\n')
+            redirect = ('This exact shell command returned unchanged output four times' if pipeline
+                        else 'This inspection already returned the same result twice')
             stage = [0]
 
             def respond(text):
-                if recover and 'This inspection already returned the same result twice' in text:
+                if recover and redirect in text:
                     stage[0] += 1
                     if stage[0] == 1:
                         return 'write_file', {'file_path': str(root / 'result.txt'), 'content': 'RECOVERED\n'}
@@ -92,15 +99,17 @@ class RuntimeTests(unittest.TestCase):
                 command = r'cd . && grep -n "ActualType\|OtherType" input.txt' if quoted_search else 'grep -n Missing input.txt'
                 if git_chain:
                     command = 'git log --all --oneline -20 && echo "---STATUS---" && git status'
+                if pipeline:
+                    command = 'grep -rin "reddit" packages/platforms/src/providers/reddit.ts | head && echo "---mcp-server index reddit lines---" && grep -n "ddit" packages/mcp-server/src/index.ts'
                 return 'run_shell_command', {'command': command, 'description': 'Search attempt ' + str(text.count('"tool"'))}
 
             proc, requests = self.run_client(root, respond, 'Inspect input.txt, recover from a repeated search, write result.txt and verify it.')
             evidence = proc.stdout + proc.stderr
             self.assertGreater(len(requests), 2, evidence[-5000:])
             model_context = json.dumps(requests)
-            if not quoted_search and not git_chain:
+            if not quoted_search and not git_chain and not pipeline:
                 self.assertTrue('The search completed with no matches' in model_context, evidence[-2500:])
-            self.assertTrue('This inspection already returned the same result twice' in model_context, evidence[-2500:])
+            self.assertTrue(redirect in model_context, evidence[-2500:])
             if recover:
                 self.assertEqual((root / 'result.txt').read_text(), 'RECOVERED\n')
                 self.assertEqual(proc.returncode, 0, evidence[-5000:])
@@ -109,7 +118,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIn('Exit Code: 0', json.dumps(last_tool['content']))
             else:
                 self.assertIn('Qwen progress guard:', evidence)
-                self.assertLessEqual(len(requests), 5, evidence[-5000:])
+                self.assertLessEqual(len(requests), 7 if pipeline else 5, evidence[-5000:])
             print(f'Runtime {"recovery" if recover else "hard stop"}: {len(requests)} model requests, exit {proc.returncode}')
 
     def test_model_can_recover_and_finish(self):
@@ -129,6 +138,12 @@ class RuntimeTests(unittest.TestCase):
 
     def test_git_chain_stops_when_redirect_ignored(self):
         self.run_fixture(False, git_chain=True)
+
+    def test_screenshot_pipeline_recovers(self):
+        self.run_fixture(True, pipeline=True)
+
+    def test_screenshot_pipeline_stops(self):
+        self.run_fixture(False, pipeline=True)
 
     def run_reread_fixture(self, recover):
         """The 2026-09-20 loop: a big file, four more reads, then back to page one."""

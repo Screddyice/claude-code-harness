@@ -265,10 +265,9 @@ launcher keeps the same active-session protection.
 For simple `grep`/`rg` commands (including `cd path && grep ...`), the hook
 recognizes quoted regex alternatives such as `"TypeA\|TypeB"` as search
 arguments. These searches receive the same repeat protection after successful
-matches; actual shell pipelines and compound commands remain outside this
-guard. Read-only `&&` chains of searches, `git log`, and `git status`, with
+matches. Read-only `&&` chains of searches, `git log`, and `git status`, with
 `cd` or `echo` separators, also receive repeat protection. Chains containing
-builds or mutations remain outside the guard. The hook explains exit code 1
+builds or mutations use the general shell backstop below. The hook explains exit code 1
 without a reported error as no matches. After two ignored
 redirects, it stops the turn. A headless `qwen goal` can then use its existing
 fresh-session retry; an interactive session should restart with a bounded
@@ -276,6 +275,15 @@ objective and a checkable completion condition. The hook never grants tool
 permission, runs a replacement command, or changes model sampling. It stores
 only hashes in `~/.cache/qwen/progress/`. Restart Qwen after installing launcher
 changes; an already-running client keeps its loaded hooks.
+
+All other shell commands, including pipelines, have a four-result backstop.
+Four unchanged outputs for identical arguments within the recent window cause
+a redirect before the fifth execution. Two ignored redirects stop the turn.
+This covers `grep ... | head && echo ... && grep ...` without requiring the
+hook to recognize its syntax. A changed result breaks the identical-output run;
+a successful `edit`/`write_file` or a new user prompt resets history. Deliberate
+unchanged polling and repeated identical builds can also trigger this limit.
+This bounds repetition; it does not prove the model can complete the task.
 
 ### Re-reading cleared pages
 
