@@ -19,7 +19,7 @@ BIN = os.environ.get('QWEN_CODE_TEST_BIN')
 
 @unittest.skipUnless(BIN, 'set QWEN_CODE_TEST_BIN to the installed cli.js')
 class RuntimeTests(unittest.TestCase):
-    def run_client(self, root, respond, prompt):
+    def run_client(self, root, respond, prompt, append_prompt=None):
         """Run real Qwen Code in root against a fixture API; respond(text) scripts each turn.
 
         respond gets the request's messages as JSON text and returns (tool, args),
@@ -69,7 +69,7 @@ class RuntimeTests(unittest.TestCase):
         for key in ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'GOOGLE_API_KEY', 'GEMINI_API_KEY']:
             env.pop(key, None)
         proc = subprocess.run(['node', BIN, '--auth-type', 'openai', '--model', 'fixture',
-                               '--openai-base-url', url, '-y', '-p', prompt, '-o', 'stream-json'],
+                               '--openai-base-url', url, '-y', '-p', prompt, '-o', 'stream-json'] + (['--append-system-prompt', append_prompt] if append_prompt else []),
                               cwd=root, env=env, text=True, capture_output=True, timeout=90)
         return proc, requests
 
@@ -144,6 +144,36 @@ class RuntimeTests(unittest.TestCase):
 
     def test_screenshot_pipeline_stops(self):
         self.run_fixture(False, pipeline=True)
+
+    def test_persistent_plan_survives_clearing_and_guides_build(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('plan_context', ROOT / 'scripts/qwen-plan-context.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix='qwen-plan-runtime-') as tmp:
+            root = Path(tmp)
+            plan = root / 'plan with spaces.md'
+            plan.write_text('PLAN_FACT_9123: Write result.txt containing BUILT and verify it.\n')
+            for i in range(5):
+                (root / f'page{i}.txt').write_text('details ' * 850)
+            step = [0]
+            def respond(text):
+                n = step[0]; step[0] += 1
+                if n < 5:
+                    return 'read_file', {'file_path': str(root / f'page{n}.txt')}
+                if n == 5:
+                    return 'write_file', {'file_path': str(root / 'result.txt'), 'content': 'BUILT\n'}
+                if n == 6:
+                    return 'run_shell_command', {'command': 'test "$(cat result.txt)" = BUILT'}
+                return None, None
+            proc, requests = self.run_client(root, respond, 'Implement the retained plan.', module.render(plan))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(any('[Old tool result content cleared]' in json.dumps(r) for r in requests))
+            for request in requests:
+                system = [m for m in request['messages'] if m['role'] == 'system']
+                self.assertIn('PLAN_FACT_9123', json.dumps(system))
+            self.assertEqual((root / 'result.txt').read_text(), 'BUILT\n')
+            self.assertIn('Exit Code: 0', json.dumps(requests[-1]['messages'][-1]))
 
     def run_reread_fixture(self, recover):
         """The 2026-09-20 loop: a big file, four more reads, then back to page one."""

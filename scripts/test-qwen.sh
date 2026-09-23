@@ -224,6 +224,23 @@ claude_argv_has() { grep -qxF -- "$1" "$FIXTURE/claude.argv"; }
 # --- cases ------------------------------------------------------------------
 
 reset_world
+printf 'PLAN_KEEP_7731: implement one step and verify it.\n' > "$FIXTURE/plan with spaces.md"
+run_qwen code --plan "$FIXTURE/plan with spaces.md" -p 'Build it' >/dev/null
+if grep -q 'PLAN_KEEP_7731' "$FIXTURE/qwen-code.argv" && grep -qx -- '--append-system-prompt' "$FIXTURE/qwen-code.argv"; then
+  pass "selected plan is passed as persistent context"
+else
+  fail "selected plan is passed as persistent context" "missing plan argument"
+fi
+reset_world
+out=$(run_qwen code --plan "$FIXTURE/missing-plan.md" -p 'Build it')
+if [[ "$out" == *"could not retain"* ]] && [ ! -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "missing plan refuses launch before client starts"
+else
+  fail "missing plan refuses launch" "$out"
+fi
+
+
+reset_world
 out=$(run_qwen --help)
 case "$out" in
   *"qwen status"*) pass "--help prints usage without touching Ollama" ;;

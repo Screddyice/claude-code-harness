@@ -335,6 +335,25 @@ loops, and checks that `@path` content survives clearing.
 
 ### Autonomous runs
 
+For plan-driven work, retain the plan outside disposable tool results:
+
+```bash
+qwen --plan "/path/to/build-plan.md"
+# or a bounded headless task:
+qwen code --plan "/path/to/build-plan.md" -p "Implement the first unfinished step and run its focused test."
+```
+
+`--plan` appends a startup snapshot as labeled reference data to persistent
+session context. The installed client retains it when old tool output clears.
+It also directs the agent to implement and verify one supported step before
+expanding scope. Files must be nonempty UTF-8 text, at most 24,000 bytes; larger
+plans need a phase-sized excerpt. Missing or invalid plans refuse startup before
+loading a model. Put this launcher option before client options such as `-p`.
+Plan edits after startup require a fresh session or an explicit reread. This mode
+supports the normal/code/agent entry points; it does not change `qwen goal`.
+The memory guard still applies. Persistent context fixes plan eviction; it does
+not guarantee that a model will complete an arbitrary build.
+
 Give Qwen a Goal and it keeps working until it proves the goal is met:
 
 ```bash
