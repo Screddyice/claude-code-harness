@@ -299,17 +299,20 @@ check_pressure() {
 
 available_bytes() {
   # memory_pressure's percentage is a pressure metric, not allocatable bytes.
-  # Count free pages and immediately reclaimable speculative/purgeable pages.
-  # Do not count inactive anonymous pages: reclaiming them can require swap.
+  # Include file cache, but do not add overlapping cache/reclaimable counters.
+  # This estimates reclaimable capacity, not guaranteed immediately free RAM.
+  # Inactive anonymous pages and compressed/swap capacity are not counted.
   vm_stat 2>/dev/null | python3 -c '
 import re, sys
 text = sys.stdin.read()
 page = re.search(r"page size of ([0-9]+) bytes", text)
 counts = [re.search(r"^Pages " + name + r":\s+([0-9]+)\.\s*$", text, re.M)
           for name in ("free", "speculative", "purgeable")]
-if not page or not all(counts) or int(page[1]) not in (4096, 16384):
+file_pages = re.search(r"^File-backed pages:\s+([0-9]+)\.\s*$", text, re.M)
+if not page or not all(counts) or not file_pages or int(page[1]) not in (4096, 16384):
     sys.exit(1)
-print(int(page[1]) * sum(int(count[1]) for count in counts))'
+free, speculative, purgeable = (int(count[1]) for count in counts)
+print(int(page[1]) * (free + max(int(file_pages[1]), speculative + purgeable)))'
 }
 
 simulator_booted() {
@@ -536,7 +539,7 @@ stop_other_models() {
 }
 
 admit() {
-  local avail need
+  local avail need budget
   if simulator_booted; then
     die "an iOS Simulator is booted (~17.6 GB resident); quit it, or set LLMJURY_ALLOW_SIMULATOR=1"
   fi
@@ -544,12 +547,14 @@ admit() {
   [ "$keep_others" = 1 ] || stop_other_models
   need=$(need_bytes) || die "cannot read the model's size from Ollama; is $MODEL pulled?"
   avail=$(available_bytes) || die "cannot read host memory; pass --force to load anyway"
-  if [ "$(( avail - DESKTOP_RESERVE ))" -lt "$need" ]; then
-    die "$MODEL needs ~$(gb "$need") GB and only $(gb $(( avail - DESKTOP_RESERVE ))) GB is free
-     after the 4 GiB desktop/runtime reserve. Close something, or use the smaller qwen model.
+  budget=$(( avail - DESKTOP_RESERVE ))
+  [ "$budget" -ge 0 ] || budget=0
+  if [ "$budget" -lt "$need" ]; then
+    die "$MODEL needs ~$(gb "$need") GiB; $(gb "$budget") GiB estimated headroom
+     after the 4 GiB desktop/runtime reserve ($(gb "$avail") GiB before reserve). Close something, or use the smaller qwen model.
      A wired over-commit does not fail cleanly here — it panics the host."
   fi
-  note "loading $MODEL (~$(gb "$need") GB, $(gb "$avail") GB free)"
+  note "loading $MODEL (~$(gb "$need") GB, $(gb "$avail") GiB estimated available)"
 }
 
 # --- subcommands ------------------------------------------------------------

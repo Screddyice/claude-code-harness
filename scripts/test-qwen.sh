@@ -81,6 +81,7 @@ echo 'Mach Virtual Memory Statistics: (page size of 16384 bytes)'
 echo "Pages free: $((38654705664 * $(cat "$FIXTURE/free_pct") / 100 / 16384))."
 echo 'Pages speculative: 0.'
 echo 'Pages purgeable: 0.'
+echo 'File-backed pages: 0.'
 EOF
 
 cat > "$STUB/sysctl" <<'EOF'
@@ -290,6 +291,7 @@ Pages free: 900000.
 Pages speculative: 20000.
 Pages purgeable: 20000.
 Pages inactive: 900000.
+File-backed pages: 0.
 EOF
 out=$(run_qwen code -p "hello")
 status=$?
@@ -297,6 +299,51 @@ if [ "$status" -ne 0 ] && [ ! -e "$FIXTURE/qwen-code.argv" ] && [[ "$out" == *"n
   pass "high pressure percentage cannot admit a physically overcommitted agent"
 else
   fail "physical memory must gate the agent before launch" "$out"
+fi
+
+reset_world
+cat > "$FIXTURE/vm_stat" <<'EOF'
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free: 65536.
+Pages speculative: 65536.
+Pages purgeable: 65536.
+File-backed pages: 655360.
+EOF
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen code -p "hello")
+if [ -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "reclaimable file cache admits 4B despite low unused RAM"
+else
+  fail "reclaimable file cache admits 4B despite low unused RAM" "$out"
+fi
+
+reset_world
+cat > "$FIXTURE/vm_stat" <<'EOF'
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free: 0.
+Pages speculative: 0.
+Pages purgeable: 0.
+File-backed pages: 0.
+EOF
+out=$(run_qwen code -p "hello")
+if [[ "$out" == *"0.0 GiB estimated headroom"* ]] && [[ "$out" != *"-4.0"* ]]; then
+  pass "exhausted reserve reports zero headroom"
+else
+  fail "exhausted reserve reports zero headroom" "$out"
+fi
+
+reset_world
+cat > "$FIXTURE/vm_stat" <<'EOF'
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free: 262144.
+Pages speculative: 524288.
+Pages purgeable: 524288.
+File-backed pages: 1572864.
+EOF
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen code -p "hello")
+if [ ! -e "$FIXTURE/qwen-code.argv" ] && [[ "$out" == *"3.0 GiB estimated headroom"* ]]; then
+  pass "4K pages do not double count overlapping reclaimable counters"
+else
+  fail "4K pages do not double count overlapping reclaimable counters" "$out"
 fi
 
 reset_world

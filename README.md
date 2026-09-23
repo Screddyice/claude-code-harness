@@ -1653,7 +1653,7 @@ So the wrapper does its own arithmetic. Before a load it checks:
 |-----------|--------|-----|
 | No booted iOS Simulator | `pgrep` | 17.6 GB of CoreSimulator measured on this host |
 | Memory pressure at level 1 | `kern.memorystatus_vm_pressure_level` | memguard's own refusal condition |
-| Physical headroom covers the load plus 4 GiB | `vm_stat` free + speculative + purgeable pages | reserve for the desktop, agent tools, and runner growth |
+| Physical headroom covers the load plus 4 GiB | `vm_stat` free + max(file-backed, speculative + purgeable) pages | reserve for the desktop, agent tools, and runner growth |
 | Nothing else resident in Ollama | `/api/ps` | co-residency is what panicked the Mac |
 
 Another resident model gets unloaded rather than tolerated. Pass `--keep-others` to
@@ -1661,8 +1661,13 @@ leave it alone, or `--force` to load past every check above.
 
 The launcher does not convert `memory_pressure`'s free percentage into bytes.
 That pressure metric can admit a 27B load when physical memory cannot hold it.
-It also excludes inactive pages from the budget because those can contain
-anonymous memory that requires swap to reclaim. Missing physical counters refuse
+It includes file-backed cache that macOS can reclaim. It takes the larger of
+file-backed pages and speculative + purgeable pages, rather than adding overlapping
+counters. The estimate includes potentially active or dirty file pages, so it is
+not a promise of immediately free RAM; normal pressure and the 4 GiB reserve still
+apply. It excludes the inactive-page total because that can contain anonymous
+memory requiring swap. Compressor and swap capacity do not add to the budget.
+Refusals report estimated headroom before/after the reserve, clamped at zero. Missing physical counters refuse
 the launch. If 27B does not fit, close memory-heavy applications or select the
 smaller model with `QWEN_MODEL=qwen3.5:4b-64k qwen`; overriding the guard with
 `--force` can reproduce the overcommit.
