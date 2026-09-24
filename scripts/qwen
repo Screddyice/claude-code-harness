@@ -776,7 +776,7 @@ cmd_codex() {
   local -a extra=(
     -c "model_providers.qwen.name=Qwen (local Ollama)"
     -c "model_providers.qwen.base_url=$API/v1"
-    -c "model_providers.qwen.wire_api=chat"
+    -c "model_providers.qwen.wire_api=responses"
     -c "model_provider=qwen"
     -m "$MODEL"
   )

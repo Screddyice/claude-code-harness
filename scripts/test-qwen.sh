@@ -681,6 +681,7 @@ reset_world
 run_qwen codex >/dev/null
 if grep -qxF "model_provider=qwen" "$FIXTURE/codex.argv" &&
    grep -qxF "model_providers.qwen.base_url=http://127.0.0.1:11434/v1" "$FIXTURE/codex.argv" &&
+   grep -qxF "model_providers.qwen.wire_api=responses" "$FIXTURE/codex.argv" &&
    grep -qxF "$MODEL" "$FIXTURE/codex.argv"; then
   pass "codex is pointed at Ollama's OpenAI wire with the real tag"
 else
