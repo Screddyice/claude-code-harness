@@ -1713,8 +1713,9 @@ qwen 27b codex                 Codex on the obliterated 27B, cmem wired in
 
 Ollama 0.32 serves the Anthropic Messages API at `/v1/messages`: correct envelope,
 `tool_use` blocks, thinking blocks, SSE streaming, and it ignores the auth headers.
-Codex goes over the OpenAI-compatible `/v1` instead. Neither needs the translation
-proxy Backdoor's `:8083` provided, so nothing gets rebuilt.
+Codex goes over Ollama's OpenAI-compatible `/v1/responses` endpoint. The wrapper
+sets `model_providers.qwen.wire_api=responses`, which current Codex requires. Neither
+client needs the translation proxy Backdoor's `:8083` provided, so nothing gets rebuilt.
 
 #### The model id is the catch
 
