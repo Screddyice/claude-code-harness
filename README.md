@@ -1987,6 +1987,32 @@ Tests: `scripts/test-set-gui-env.sh` (13 assertions, stubs `launchctl` so it nev
 real domain and a fixture plist so the derived value never depends on this host's Ollama setup,
 and asserts the secret value is never printed).
 
+## MCP auth headers without a stored value (`scripts/mcp-headers.py`)
+
+Claude Code runs an http MCP server's `headersHelper` command at connect time and sends the JSON
+object it prints as request headers. This helper prints one header whose value it reads from the
+process environment, then the GUI launchd domain, then `~/projects/.env`
+(`MCP_HEADERS_ENV_FILE` overrides the path). The MCP config names a variable and never holds the
+secret, and the lookup works in a Dock-launched session that `set-gui-env.sh` never covered.
+
+```bash
+install -m 755 scripts/mcp-headers.py ~/.claude/scripts/mcp-headers.py
+claude mcp add-json --scope user cmem \
+  '{"type":"http","url":"https://cmem.ai/api/mcp","headersHelper":"/Users/screddy/.claude/scripts/mcp-headers.py Authorization CMEM_PRO_TOKEN Bearer"}'
+claude mcp get cmem        # Status: ✔ Connected
+```
+
+Arguments are `HEADER VAR [SCHEME]`. A missing variable exits 1 and names the variable, so Claude
+Code reports the server as needing authentication instead of connecting without credentials.
+
+Since 2026-09-26 the Team Nebula config (`~/TeamNebula/team-context/.claude.json`, the file a
+session reads when `CLAUDE_CONFIG_DIR` points there) uses it for `cmem` (`CMEM_PRO_TOKEN`),
+`srcos` (`NEBOS_OS_BEARER_TOKEN`) and both Composio servers (`TMN_COMPOSIO_API_KEY`, which
+`set-gui-env.sh` does not publish). `~/.claude.json` still carries those values inline.
+
+Tests: `scripts/test-mcp-headers.sh` (9 assertions; stubs `launchctl` and uses a fixture env
+file, and checks that the value never reaches stderr).
+
 ## Creating agent worktrees safely (`scripts/agent-worktree.sh`)
 
 On 2026-09-05 an agent ran this shape against a branch that was already checked out
