@@ -2007,7 +2007,7 @@ Code reports the server as needing authentication instead of connecting without 
 
 Since 2026-09-26 the Team Nebula config (`~/TeamNebula/team-context/.claude.json`, the file a
 session reads when `CLAUDE_CONFIG_DIR` points there) uses it for `cmem` (`CMEM_PRO_TOKEN`),
-`srcos` (`NEBOS_OS_BEARER_TOKEN`) and both Composio servers (`TMN_COMPOSIO_MCP_API_KEY`, which
+`srcos` (`NEBOS_OS_BEARER_TOKEN`) and both Composio servers (`TMN_COMPOSIO_API_KEY`, which
 `set-gui-env.sh` does not publish). `~/.claude.json` still carries those values inline.
 
 Tests: `scripts/test-mcp-headers.sh` (9 assertions; stubs `launchctl` and uses a fixture env
