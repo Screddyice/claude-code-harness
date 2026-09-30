@@ -174,10 +174,10 @@ MODEL=qwen3.8:27b-obliterated
 
 reset_world() {
   rm -f "$FIXTURE/vm_stat"
-  printf '{"models":[{"name":"%s","size":17716740000,"digest":"heavy"},{"name":"qwen3.5:4b-64k","size":2500000000,"digest":"small"}]}\n' "$MODEL" > "$FIXTURE/tags.json"
+  printf '{"models":[{"name":"%s","size":17716740000,"digest":"heavy"},{"name":"qwen3.5:4b-64k","size":2500000000,"digest":"small"},{"name":"qwen3.5:4b-256k","size":2500000000,"digest":"small"}]}\n' "$MODEL" > "$FIXTURE/tags.json"
   echo '{"models":[]}' > "$FIXTURE/ps.json"
   echo 1 > "$FIXTURE/pressure"
-  echo 80 > "$FIXTURE/free_pct"
+  echo 95 > "$FIXTURE/free_pct"
   rm -f "$FIXTURE/simulator" "$FIXTURE/ollama.log" \
         "$FIXTURE/stop-fails" "$FIXTURE/stop-keeps-resident" \
         "$FIXTURE/claude.argv" "$FIXTURE/claude.env" \
@@ -791,9 +791,9 @@ if jq -e '
   .tools.truncateToolOutputThreshold == 8000 and
   .tools.truncateToolOutputLines == 200
 ' "$ROOT/config/qwen-code-local.json" >/dev/null; then
-  pass "standalone Qwen defaults let a turn run and fit a 32K window"
+  pass "standalone Qwen defaults let a turn run and fit a 256K window"
 else
-  fail "standalone Qwen defaults let a turn run and fit a 32K window"
+  fail "standalone Qwen defaults let a turn run and fit a 256K window"
 fi
 if jq -e '
   .fastModel == "${QWEN_FAST_MODEL}" and
@@ -887,7 +887,7 @@ fi
 # --- side-query model ----------------------------------------------------------
 reset_world
 run_qwen code >/dev/null
-if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-64k' "$FIXTURE/qwen-code.env" &&
+if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-256k' "$FIXTURE/qwen-code.env" &&
    grep -qxF 'QWEN_DISABLE_AUTO_TITLE=1' "$FIXTURE/qwen-code.env"; then
   pass "27B Qwen Code sends side queries to the 4B, with auto titles off"
 else
@@ -938,8 +938,8 @@ fi
 
 reset_world
 TEST_QWEN_MODEL= run_qwen code >/dev/null
-if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-64k' "$FIXTURE/qwen-code.env" &&
-   grep -qxF 'QWEN_SESSION_MODEL=qwen3.5:4b-64k' "$FIXTURE/qwen-code.env"; then
+if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-256k' "$FIXTURE/qwen-code.env" &&
+   grep -qxF 'QWEN_SESSION_MODEL=qwen3.5:4b-256k' "$FIXTURE/qwen-code.env"; then
   pass "a 4B session is its own side-query model"
 else
   fail "a 4B session is its own side-query model" "$(grep -E 'QWEN_(FAST|SESSION)_MODEL' "$FIXTURE/qwen-code.env")"
@@ -1082,11 +1082,24 @@ esac
 
 reset_world
 TEST_QWEN_MODEL= run_qwen 'build this project' >/dev/null
-if grep -qxF 'qwen3.5:4b-64k' "$FIXTURE/qwen-code.argv" &&
+if grep -qxF 'qwen3.5:4b-256k' "$FIXTURE/qwen-code.argv" &&
    grep -qxF 'build this project' "$FIXTURE/qwen-code.argv"; then
   pass "unconfigured qwen selects 4B and preserves the prompt"
 else
   fail "unconfigured qwen selects 4B"
+fi
+if jq -e '[.modelProviders.openai[].generationConfig.contextWindowSize] == [262144, 262144]' \
+  "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "Qwen Code gives both 4B routes a 256K context window"
+else
+  fail "Qwen Code context window is 256K"
+fi
+reset_world
+TEST_QWEN_MODEL= run_qwen claude >/dev/null
+if [ "$(claude_env CLAUDE_CODE_MAX_CONTEXT_TOKENS)" = "262144" ]; then
+  pass "Claude sees the selected 4B model's 256K window"
+else
+  fail "Claude context window is 256K"
 fi
 
 for entry in '' code agent claude codex raw; do
@@ -1112,8 +1125,8 @@ fi
 reset_world
 set_alias "$MODEL"
 TEST_QWEN_MODEL= run_qwen claude >/dev/null
-if grep -qxF "cp qwen3.5:4b-64k $ALIAS" "$FIXTURE/ollama.log" &&
-   [ "$(claude_env QWEN_SESSION_MODEL)" = 'qwen3.5:4b-64k' ]; then
+if grep -qxF "cp qwen3.5:4b-256k $ALIAS" "$FIXTURE/ollama.log" &&
+   [ "$(claude_env QWEN_SESSION_MODEL)" = 'qwen3.5:4b-256k' ]; then
   pass "Claude refreshes an idle 27B alias to 4B"
 else
   fail "Claude refreshes an idle stale alias"
@@ -1135,7 +1148,7 @@ set_alias "$MODEL"
 printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
 out=$(TEST_QWEN_MODEL= run_qwen status)
 case "$out" in
-  *"qwen3.5:4b-64k"*"not loaded"*"also resident: $ALIAS"*) pass "4B status does not claim a resident 27B alias" ;;
+  *"qwen3.5:4b-256k"*"not loaded"*"also resident: $ALIAS"*) pass "4B status does not claim a resident 27B alias" ;;
   *) fail "4B status distinguishes a foreign alias" "$out" ;;
 esac
 TEST_QWEN_MODEL= run_qwen stop >/dev/null
@@ -1154,9 +1167,11 @@ case "$out" in
   *"needs ~"*) pass "27B admission does not reuse a smaller 4B measurement" ;;
   *) fail "resident measurements are model-specific" "$out" ;;
 esac
+mkdir -p "$FIXTURE/state/qwen3.5_4b-256k"
+echo 1 > "$FIXTURE/state/qwen3.5_4b-256k/resident-bytes"
 out=$(TEST_QWEN_MODEL= run_qwen raw hello)
 case "$out" in
-  *"RAN run qwen3.5:4b-64k hello"*) pass "4B admission uses its own recorded measurement" ;;
+  *"RAN run qwen3.5:4b-256k hello"*) pass "4B admission uses its own recorded measurement" ;;
   *) fail "4B measurement is usable" "$out" ;;
 esac
 

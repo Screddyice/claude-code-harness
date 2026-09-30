@@ -69,12 +69,12 @@
 #   straight through.
 set -euo pipefail
 
-MODEL="${QWEN_MODEL:-qwen3.5:4b-64k}"
+MODEL="${QWEN_MODEL:-qwen3.5:4b-256k}"
 # Qwen Code sends side queries (the Goal completion verifier, follow-up
 # suggestions) to this model. The verifier aborts after a fixed 30 s, and a cold
 # 11K-token verifier prompt takes the 27B ~40 s to read, so a 27B Goal could
 # never finish verified. The 4B reads it in seconds.
-FAST_MODEL="${QWEN_FAST_MODEL:-qwen3.5:4b-64k}"
+FAST_MODEL="${QWEN_FAST_MODEL:-qwen3.5:4b-256k}"
 # Consume the model selector before dispatching an agent or passing a prompt.
 # An explicit CLI selection wins over a saved QWEN_MODEL override.
 case "${1:-}" in
@@ -88,6 +88,14 @@ LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
 STALE_SESSION_SECONDS="${QWEN_STALE_SESSION_SECONDS:-1800}"
 MODEL_KEY="$(printf '%s' "$MODEL" | tr -c '[:alnum:]_.-' '_')"
 MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/$MODEL_KEY/resident-bytes"
+# Match the selected tag's baked context when estimating KV memory and telling
+# Claude Code its window. Smaller tags keep the previous 32K default.
+model_context() {
+  case "$MODEL" in
+    qwen3.5:4b-256k) printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-262144}" ;;
+    *) printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-32768}" ;;
+  esac
+}
 AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
 # Claude Code refuses any model id outside its compiled catalog, whatever
 # ANTHROPIC_BASE_URL points at, so the local weights are served under a catalog id.
@@ -333,7 +341,7 @@ need_bytes() {
   disk=$(disk_bytes) || true
   [ -n "${disk:-}" ] || return 1
   slots="${LLMJURY_OLLAMA_PARALLEL:-${OLLAMA_NUM_PARALLEL:-2}}"
-  ctx="${OLLAMA_CONTEXT_LENGTH:-32768}"
+  ctx=$(model_context)
   cells=$(( ctx * slots ))
   # weights ~ disk * 1.15, and ~45 KB per KV cell at q8_0 (about half of f16).
   printf '%s\n' $(( disk * 115 / 100 + cells * 45000 + PROMPT_CACHE_MIB * 1024 * 1024 ))
@@ -680,7 +688,8 @@ cmd_claude() {
   ensure_alias
   agent_admit
 
-  local ctx="${OLLAMA_CONTEXT_LENGTH:-32768}"
+  local ctx
+  ctx=$(model_context)
   local -a extra=()
 
   # QWEN_MEMORY=0 is the true-offline switch: no recall server, and nothing
