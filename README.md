@@ -228,8 +228,8 @@ in charge (see "Autonomous runs" below). These are system defaults: Qwen Code
 user/project settings can override them. No
 cloud fallback is configured. The installed 4B tag also sets `num_ctx` to
 262,144. The launcher estimates KV memory for that window before loading it and
-may refuse a session when the Mac lacks headroom. `QWEN_MODEL` selects a local model; an explicit `27b` selector
-overrides that environment setting.
+may refuse a session when the Mac lacks headroom. An explicit `27b` selector
+keeps its 32K client window and overrides `QWEN_MODEL`.
 `QWEN_CODE_BIN` overrides the installed executable path.
 
 The same file keeps Qwen Code's startup prompt near 11K tokens. With stock

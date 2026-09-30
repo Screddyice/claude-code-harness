@@ -775,7 +775,7 @@ for entry in "" agent code; do
      grep -qxF 'http://127.0.0.1:11434/v1' "$FIXTURE/qwen-code.argv" &&
      grep -qxF 'OPENAI_API_KEY=ollama-local' "$FIXTURE/qwen-code.env" &&
      grep -qxF "QWEN_HARNESS_ROOT=$ROOT" "$FIXTURE/qwen-code.env" &&
-     grep -qxF "QWEN_CODE_SYSTEM_DEFAULTS_PATH=$ROOT/config/qwen-code-local.json" "$FIXTURE/qwen-code.env"; then
+     grep -q '^QWEN_CODE_SYSTEM_DEFAULTS_PATH=' "$FIXTURE/qwen-code.env"; then
     pass "${entry:-default} pins local provider and context defaults"
   else
     fail "${entry:-default} pins local provider and context defaults"
@@ -820,17 +820,19 @@ reset_world
 TEST_QWEN_MODEL= run_qwen code >/dev/null
 cfg=$(grep '^QWEN_CODE_SYSTEM_DEFAULTS_PATH=' "$FIXTURE/qwen-code.env" | cut -d= -f2-)
 if [ -s "$cfg" ] && [ "$(jq '.modelProviders.openai | length' "$cfg")" = 1 ] &&
-   [ "$(jq -r '.modelProviders.openai[0].id' "$cfg")" = '${QWEN_SESSION_MODEL}' ]; then
+   [ "$(jq -r '.modelProviders.openai[0].id' "$cfg")" = '${QWEN_SESSION_MODEL}' ] &&
+   [ "$(jq -r '.modelProviders.openai[0].generationConfig.contextWindowSize' "$cfg")" = 262144 ]; then
   pass "a 4B session registers its model once"
 else
   fail "a 4B session registers its model once" "config=$cfg $(jq -c '[.modelProviders.openai[].id]' "$cfg" 2>&1)"
 fi
 reset_world
 run_qwen code >/dev/null
-if grep -qxF "QWEN_CODE_SYSTEM_DEFAULTS_PATH=$ROOT/config/qwen-code-local.json" "$FIXTURE/qwen-code.env"; then
-  pass "a 27B session uses the checked-in two-provider config"
+cfg=$(grep '^QWEN_CODE_SYSTEM_DEFAULTS_PATH=' "$FIXTURE/qwen-code.env" | cut -d= -f2-)
+if jq -e '[.modelProviders.openai[].generationConfig.contextWindowSize] == [32768, 262144]' "$cfg" >/dev/null; then
+  pass "a 27B session keeps its 32K window and uses 256K for side queries"
 else
-  fail "a 27B session uses the checked-in two-provider config" "$(grep QWEN_CODE_SYSTEM_DEFAULTS_PATH "$FIXTURE/qwen-code.env")"
+  fail "a 27B session uses its selected context window"
 fi
 
 # --- qwen goal ------------------------------------------------------------------

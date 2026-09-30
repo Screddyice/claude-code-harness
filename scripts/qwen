@@ -90,12 +90,13 @@ MODEL_KEY="$(printf '%s' "$MODEL" | tr -c '[:alnum:]_.-' '_')"
 MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/$MODEL_KEY/resident-bytes"
 # Match the selected tag's baked context when estimating KV memory and telling
 # Claude Code its window. Smaller tags keep the previous 32K default.
-model_context() {
-  case "$MODEL" in
+model_context_for() {
+  case "$1" in
     qwen3.5:4b-256k) printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-262144}" ;;
     *) printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-32768}" ;;
   esac
 }
+model_context() { model_context_for "$MODEL"; }
 AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
 # Claude Code refuses any model id outside its compiled catalog, whatever
 # ANTHROPIC_BASE_URL points at, so the local weights are served under a catalog id.
@@ -829,16 +830,23 @@ code_prepare() {
     note "side-query model $FAST_MODEL is not pulled; side queries use $MODEL"
     FAST_MODEL="$MODEL"
   fi
-  # When the session model answers its own side queries, the checked-in config
-  # would register one id twice, and the side-query entry turns reasoning off.
-  # The derived single-provider copy lives at a fixed path so `exec` needs no
-  # cleanup; it is rewritten atomically on every launch.
+  # Derive context accounting for the selected tags. The checked-in config is
+  # the 256K 4B default; explicit 27B and smaller tags use their own window.
+  # A single-model session registers its provider once.
   CODE_CONFIG_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json"
-  if [ "$FAST_MODEL" = "$MODEL" ]; then
-    local state="${QWEN_STATE_DIR:-$HOME/.cache/qwen}"
+  if [ "$FAST_MODEL" = "$MODEL" ] || [ "$MODEL" != qwen3.5:4b-256k ] ||
+     [ "$FAST_MODEL" != qwen3.5:4b-256k ]; then
+    local state="${QWEN_STATE_DIR:-$HOME/.cache/qwen}" fast_key
+    fast_key=$(printf '%s' "$FAST_MODEL" | tr -c '[:alnum:]_.-' '_')
     mkdir -p "$state"
-    CODE_CONFIG_PATH="$state/qwen-code-local.single-model.json"
-    jq '.modelProviders.openai |= .[:1]' "$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
+    CODE_CONFIG_PATH="$state/qwen-code-local.${MODEL_KEY}.${fast_key}.json"
+    jq --argjson session_ctx "$(model_context)" \
+       --argjson fast_ctx "$(model_context_for "$FAST_MODEL")" \
+       --argjson single "$([ "$FAST_MODEL" = "$MODEL" ] && echo true || echo false)" \
+       '.modelProviders.openai[0].generationConfig.contextWindowSize = $session_ctx |
+        .modelProviders.openai[1].generationConfig.contextWindowSize = $fast_ctx |
+        if $single then .modelProviders.openai |= .[:1] else . end' \
+       "$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
       > "$CODE_CONFIG_PATH.$$" && mv -f "$CODE_CONFIG_PATH.$$" "$CODE_CONFIG_PATH" ||
       die "could not write $CODE_CONFIG_PATH"
   fi
