@@ -198,7 +198,7 @@ while sharing one Codex setup.
 `qwen` starts **Qwen Code**, an independent coding agent connected to the local
 Ollama model. It can read and edit files, execute terminal commands, run builds,
 and retain sessions without launching Claude Code or Codex. Run it from the
-project directory. The default model is `qwen3.5:4b-64k`. Type `qwen 27b`
+project directory. The default model is `qwen3.5:4b-256k`. Type `qwen 27b`
 to select **`qwen3.8:27b-obliterated`**; the 27B selector never chooses a stock
 model. `qwen raw` provides plain chat without execution tools.
 
@@ -221,14 +221,15 @@ the guarded `~/.local/bin/qwen` launcher.
 
 The launcher reuses the existing model admission guard and compute lease. It
 sets the local OpenAI-compatible endpoint and a placeholder key. The checked-in
-`config/qwen-code-local.json` supplies 32,768-token context accounting, a
+`config/qwen-code-local.json` supplies 262,144-token context accounting, a
 4,096-token response cap, local-provider timeouts and disabled telemetry. It
 compacts at 80% of the provider window and leaves Qwen Code's own turn guards
 in charge (see "Autonomous runs" below). These are system defaults: Qwen Code
 user/project settings can override them. No
-cloud fallback is configured. The client retains its conservative 32K budget
-on the 64K 4B tag. `QWEN_MODEL` selects a local model; an explicit `27b` selector
-overrides that environment setting.
+cloud fallback is configured. The installed 4B tag also sets `num_ctx` to
+262,144. The launcher estimates KV memory for that window before loading it and
+may refuse a session when the Mac lacks headroom. An explicit `27b` selector
+keeps its 32K client window and overrides `QWEN_MODEL`.
 `QWEN_CODE_BIN` overrides the installed executable path.
 
 The same file keeps Qwen Code's startup prompt near 11K tokens. With stock
@@ -406,13 +407,13 @@ Ollama's OpenAI endpoint has no per-request `repeat_penalty` anyway, and the
 tag is also Backdoor's failover model. The fresh-session retry in `qwen goal` is
 what absorbs these slips.
 
-Four settings make that loop hold on a 32,768-token window:
+Four settings let that loop continue within the configured window:
 
 | Setting | Why |
 |---|---|
 | No `model.maxToolCallsPerTurn` | Any explicit value is a hard cap. The old `12` halted every turn at call 12; the default halts only on repeated calls, with a backstop at 1,000. |
 | No `model.skipLoopDetection` | `false` enabled the streaming heuristics that halted the run after compaction. Qwen Code's always-on guard against identical repeated calls stays. |
-| `context.clearContextOnIdle.toolResultsTotalCharsThreshold: 24000`, `toolResultsNumToKeep: 3` | Replaces old tool output with a placeholder and keeps the calls, so the model still knows what it ran. The default of 500,000 chars never fires on 32K. A request shows four file pages at most. The progress hook's `RESULTS_KEPT` must equal `toolResultsNumToKeep`, and a test fails if they drift. |
+| `context.clearContextOnIdle.toolResultsTotalCharsThreshold: 24000`, `toolResultsNumToKeep: 3` | Replaces old tool output with a placeholder and keeps the calls, so the model still knows what it ran. The default of 500,000 chars retains much more tool output. A request shows four file pages at most. The progress hook's `RESULTS_KEPT` must equal `toolResultsNumToKeep`, and a test fails if they drift. |
 | `model.chatCompression.maxRecentFilesToRetain: 1`, `tools.truncateToolOutputThreshold: 8000`, `truncateToolOutputLines: 200` | Summary compaction used to re-attach up to five files at 5K tokens each, which put a session straight back over the trigger. |
 
 Measured on a fixture with six planted bugs and about 8K tokens of source,
@@ -432,7 +433,7 @@ The model tag, weights, Ollama template, and memory admission guard are unchange
 The Goal verifier needs a second model. Qwen Code aborts it after a fixed
 30 seconds, in 0.24.0 too, and the 27B reads prompts at about 268 tokens per
 second, so an 11K-token verifier prompt timed out every time. The config sends
-side queries to `QWEN_FAST_MODEL` (default `qwen3.5:4b-64k`) with
+side queries to `QWEN_FAST_MODEL` (default `qwen3.5:4b-256k`) with
 `reasoning_effort: none`: the 4B answered a verifier-shaped request in 1.0 s
 against 9.5 s with thinking on, and Ollama ignores the `enable_thinking: false`
 that Qwen Code sends. In a test run the 4B verifier rejected a completion claim
@@ -501,7 +502,7 @@ Normal approval prompts remain enabled. Use Qwen Code's native MCP commands to
 add integrations; `--mcp cmem` and `--tools lean` are alternate-client options.
 File, shell, search, skill and fetch tools load at startup. Qwen Code can discover
 other registered tools through `tool_search`, keeping their schemas out of the
-initial 32K context without removing their capabilities.
+initial context without removing their capabilities.
 
 Run `bash scripts/test-qwen.sh` to check routing and admission without loading a
 model. Verify real tool execution with a small disposable project before relying
@@ -594,7 +595,7 @@ so `gh repo clone` and `gh api` work with no credential prompt. The brief says s
 because "pull the latest X and evaluate it" is a task the model can actually complete —
 clone it, then read what you cloned — and the failure being fixed here was describing that
 instead of doing it. The brief costs about **428
-tokens, 1.3% of a 32K window** — cheap against one confidently invented answer.
+tokens against the model's 256K window** — cheap against one confidently invented answer.
 
 It states two rules plainly: never claim an action without calling a tool, and read the
 file rather than answering from memory about a specific codebase. Then a short table of
@@ -1749,7 +1750,7 @@ still resident, and keeps status and stop scoped to the matching alias. Reportin
 matching alias as "not loaded" is how you end up holding memory you believe is free;
 unloading a stale resident alias is how you evict another session.
 
-#### Keeping 32k tokens usable
+#### Keeping the context usable
 
 Tool schemas are the largest thing competing with your actual work for this window,
 so both defaults are narrow:

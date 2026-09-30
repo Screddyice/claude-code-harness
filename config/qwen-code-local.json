@@ -13,7 +13,7 @@
       "envKey": "OPENAI_API_KEY",
       "baseUrl": "${QWEN_LOCAL_BASE_URL}",
       "generationConfig": {
-        "contextWindowSize": 32768,
+        "contextWindowSize": 262144,
         "timeout": 300000,
         "streamIdleTimeoutMs": 120000,
         "maxRetries": 1,
@@ -26,7 +26,7 @@
       "envKey": "OPENAI_API_KEY",
       "baseUrl": "${QWEN_LOCAL_BASE_URL}",
       "generationConfig": {
-        "contextWindowSize": 32768,
+        "contextWindowSize": 262144,
         "timeout": 120000,
         "maxRetries": 1,
         "samplingParams": { "temperature": 0.2, "max_tokens": 4096 },
