@@ -57,10 +57,11 @@
 #   It connects directly to Ollama and does not launch Claude Code or Codex.
 #   Only `qwen raw` is chat-only: its descriptions of actions do not execute.
 #
-#   --mcp cmem|none|all        MCP servers for claude/codex (default: cmem)
+#   --mcp cmem|none|all        MCP selection (clients: cmem; Qwen Code: all)
 #   --tools mcp|lean|all       built-in tools for claude/codex (default: lean)
 #   qwen code --help           Qwen Code options, including MCP and approvals
 #   QWEN_MEMORY=0              disable claude-client memory integration
+#   QWEN_JEV=0 / QWEN_OFFLINE=1 skip the optional OpenRouter JEV sidecar
 #
 #   --force         load even if the memory guard objects (it is advisory, not law)
 #   --keep-others   leave other resident Ollama models alone (default: unload them)
@@ -524,7 +525,7 @@ acquire_compute_lock() {
   take_lock || die "another local council or background review owns compute; retry when it finishes"
 }
 
-cleanup() { lease_close; }
+cleanup() { lease_close; if [ -n "${session_config:-}" ]; then rm -f "$session_config"; fi; }
 trap cleanup EXIT INT TERM
 
 # --- admission --------------------------------------------------------------
@@ -626,6 +627,51 @@ tools_mode="lean"
 QWEN_SOURCE_DIR="$(cd -- "$(dirname -- "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")/.." && pwd -P)"
 
 
+# JEV is an optional online decision tool; inference remains on Ollama.
+# Never copy a credential into generated settings or command-line arguments.
+jev_ready=0
+jev_command="${QWEN_JEV_COMMAND:-$HOME/.local/bin/jev-mcp}"
+jev_brief="JEV is unavailable or disabled in this session. Skip JEV and use the local model for semantic judgments. Do not retry failed JEV requests."
+prepare_jev() {
+  jev_ready=0
+  [ "$mcp_spec" != none ] || return 0
+  [ "${QWEN_JEV:-1}" != 0 ] && [ "${QWEN_OFFLINE:-0}" != 1 ] || return 0
+  [ -x "$jev_command" ] || return 0
+  # A missing or unsafe runtime credential should not break a local session.
+  python3 - <<'PYJEV' || return 0
+import os, stat, sys
+from pathlib import Path
+key = os.environ.get("JEV_OPENROUTER_API_KEY", "").strip()
+if key and not (key.startswith("${") and key.endswith("}")):
+    sys.exit(0)
+p = Path.home() / ".config/jev/runtime.env"
+try:
+    info, parent = p.lstat(), p.parent.stat()
+    ok = (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+          and stat.S_IMODE(info.st_mode) == 0o600
+          and parent.st_uid == os.getuid() and stat.S_IMODE(parent.st_mode) == 0o700)
+    # Only inspect presence. The launcher owns credential loading.
+    sys.exit(0 if ok and info.st_size else 1)
+except OSError:
+    sys.exit(1)
+PYJEV
+  # No credentials or task data in this public HEAD request. Bound DNS, connect
+  # and TLS together, and never retry. Offline startup costs at most two seconds.
+  curl -IfsS --connect-timeout 1 --max-time 2 --retry 0 \
+    https://openrouter.ai/api/v1/models -o /dev/null 2>/dev/null || {
+      note "JEV connection unavailable; continuing with local judgments"
+      return 0
+    }
+  jev_ready=1
+  jev_brief=$(cat "$QWEN_SOURCE_DIR/prompts/qwen-jev.md")
+}
+
+jev_json() {
+  jq -nc --arg command "$jev_command" \
+    '{command:$command,args:[],trust:true,timeout:35000}'
+}
+
+
 parse_agent_opts() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -700,13 +746,22 @@ cmd_claude() {
     note "QWEN_MEMORY=0: no claude-mem recall in this session"
   fi
 
+  prepare_jev
   case "$mcp_spec" in
     none) extra+=(--strict-mcp-config --mcp-config '{"mcpServers":{}}') ;;
-    all)  note "loading every MCP server in ~/.claude.json; their tool schemas will crowd a ${ctx}-token window" ;;
+    all)
+      note "loading every MCP server in ~/.claude.json; their tool schemas will crowd a ${ctx}-token window"
+      if [ "$jev_ready" = 1 ]; then
+        extra+=(--mcp-config "$(jq -nc --argjson jev "$(jev_json)" '{mcpServers:{jev:$jev}}')")
+      else
+        extra+=(--disallowed-tools 'mcp__jev__*')
+      fi ;;
     cmem)
       ensure_cmem_token || die "CMEM_PRO_TOKEN is not set and not readable from ~/projects/.env; use --mcp none or --mcp all"
       extra+=(--strict-mcp-config --mcp-config
-        "$(jq -nc --arg u "$CMEM_URL" '{mcpServers:{cmem:{type:"http",url:$u,headers:{Authorization:"Bearer ${CMEM_PRO_TOKEN}"}}}}')") ;;
+        "$(jq -nc --arg u "$CMEM_URL" --argjson ready "$jev_ready" --argjson jev "$(jev_json)" \
+          '{mcpServers:({cmem:{type:"http",url:$u,headers:{Authorization:"Bearer ${CMEM_PRO_TOKEN}"}}} +
+            if $ready == 1 then {jev:$jev} else {} end)}')") ;;
     *) die "--mcp takes cmem, none or all (got \"$mcp_spec\")" ;;
   esac
 
@@ -732,10 +787,13 @@ cmd_claude() {
   # tool call behind it -- because nothing in its context says the tools
   # execute. Roughly 400 tokens against a 32K window, which is cheap next to a
   # confidently invented answer.
-  local tools_brief="$QWEN_SOURCE_DIR/prompts/qwen-tools.md"
+  local tools_brief="$QWEN_SOURCE_DIR/prompts/qwen-tools.md" combined_brief="$jev_brief"
   if [ "$tools_mode" != "mcp" ] && [ -r "$tools_brief" ]; then
-    extra+=(--append-system-prompt "$(cat "$tools_brief")")
+    combined_brief="$(cat "$tools_brief")
+
+$jev_brief"
   fi
+  extra+=(--append-system-prompt "$combined_brief")
 
   note "claude on $MODEL as $CLAUDE_MODEL_ID, ${ctx}-token window, mcp=$mcp_spec tools=$tools_mode"
   note "no failover: this session stays local until you quit it"
@@ -796,14 +854,70 @@ cmd_codex() {
     -c "model_provider=qwen"
     -m "$MODEL"
   )
+  prepare_jev
+  local -a disabled_mcp=()
+  # Codex merges table overrides into its saved MCP config. Disable excluded
+  # saved entries explicitly; an empty mcp_servers table does not remove them.
+  if [ "$mcp_spec" != all ]; then
+    local saved_name saved_transport saved_names
+    saved_names=$(python3 - "$codex_bin" <<'PYMCP'
+import json, re, subprocess, sys
+try:
+    result = subprocess.run([sys.argv[1], "mcp", "list", "--json"],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        sys.exit(1)
+    for server in json.loads(result.stdout):
+        if not server.get("enabled", True):
+            continue
+        name = server["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            sys.exit(1)
+        kind = server["transport"]["type"]
+        if kind not in ("stdio", "streamable_http"):
+            sys.exit(1)
+        print(name + "\t" + kind)
+except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+    sys.exit(1)
+PYMCP
+) || die "could not read saved Codex MCP names; refusing an unfiltered session"
+    while IFS=$'\t' read -r saved_name saved_transport; do
+      [ -n "$saved_name" ] || continue
+      if [ "$mcp_spec" = cmem ] && { [ "$saved_name" = cmem ] || { [ "$saved_name" = jev ] && [ "$jev_ready" = 1 ]; }; }; then
+        continue
+      fi
+      # Plugin-provided entries need a valid transport in the override layer.
+      # Use inert endpoints, then disable them; no inherited credential values
+      # are copied into arguments and no excluded server starts.
+      if [ "$saved_transport" = stdio ]; then
+        disabled_mcp+=(-c "mcp_servers.$saved_name.command=\"/usr/bin/true\"")
+      else
+        disabled_mcp+=(-c "mcp_servers.$saved_name.url=\"https://example.invalid/mcp\"")
+      fi
+      disabled_mcp+=(-c "mcp_servers.$saved_name.enabled=false")
+    done <<< "$saved_names"
+  fi
   case "$mcp_spec" in
-    none) extra+=(-c 'mcp_servers={}') ;;
-    all)  note "keeping every MCP server in ~/.codex/config.toml; their schemas will crowd the window" ;;
+    none) ;;
+    all)
+      note "keeping every MCP server in ~/.codex/config.toml; their schemas will crowd the window"
+      if [ "$jev_ready" = 1 ]; then
+        extra+=(-c "mcp_servers.jev.command=$(jq -Rn --arg c "$jev_command" '$c')" -c 'mcp_servers.jev.env_vars=["JEV_OPENROUTER_API_KEY"]' -c 'mcp_servers.jev.enabled=true')
+      else
+        extra+=(-c 'mcp_servers.jev.enabled=false')
+      fi ;;
     cmem)
       ensure_cmem_token || die "CMEM_PRO_TOKEN is not set and not readable from ~/projects/.env; use --mcp none or --mcp all"
-      extra+=(-c "mcp_servers={\"cmem\":{\"url\":\"$CMEM_URL\",\"bearer_token_env_var\":\"CMEM_PRO_TOKEN\"}}") ;;
+      local mcp_inline="cmem = { url = $(jq -Rn --arg u "$CMEM_URL" '$u'), bearer_token_env_var = \"CMEM_PRO_TOKEN\" }"
+      if [ "$jev_ready" = 1 ]; then
+        mcp_inline="$mcp_inline, jev = { command = $(jq -Rn --arg c "$jev_command" '$c'), env_vars = [\"JEV_OPENROUTER_API_KEY\"], enabled = true }"
+      fi
+      extra+=(-c "mcp_servers={$mcp_inline}") ;;
     *) die "--mcp takes cmem, none or all (got \"$mcp_spec\")" ;;
   esac
+
+  extra+=(${disabled_mcp[@]+"${disabled_mcp[@]}"})
+  extra+=(-c "developer_instructions=$(jq -Rn --arg brief "$jev_brief" '$brief')")
 
   note "codex on $MODEL, mcp=$mcp_spec; no failover, and ~/.codex/config.toml is untouched"
   exec "$codex_bin" "${extra[@]}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
@@ -851,6 +965,17 @@ code_prepare() {
       die "could not write $CODE_CONFIG_PATH"
   fi
   agent_admit
+  prepare_jev
+  session_config="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/jev-session-$$.json"
+  mkdir -p "$(dirname "$session_config")"
+  jq --argjson ready "$jev_ready" --argjson jev "$(jev_json)" --arg selection "$mcp_spec" '
+    if $ready == 1 then .mcpServers.jev = $jev | .tools.visible = ((.tools.visible // []) + ["mcp__jev__jev_decide"] | unique)
+    else del(.mcpServers.jev) | .mcp.excluded = ((.mcp.excluded // []) + ["jev"] | unique) end |
+    if $selection == "none" then .mcp.allowed = []
+    elif $selection == "cmem" then .mcp.allowed = (["cmem"] + if $ready == 1 then ["jev"] else [] end)
+    else . end' "$CODE_CONFIG_PATH" > "$session_config" || die "could not prepare optional JEV settings"
+  CODE_CONFIG_PATH="$session_config"
+  CODE_JEV_ARGS=(--append-system-prompt "$jev_brief")
   # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
   CODE_ENV=(
     OPENAI_API_KEY=ollama-local OPENAI_BASE_URL="$API/v1" OPENAI_MODEL="$MODEL"
@@ -863,8 +988,8 @@ code_prepare() {
 }
 
 cmd_code() {
+  mcp_spec=all
   local bin plan_file="" plan_context=""
-  local plan_args=()
   bin=$(code_bin) || exit 1
   case "${1:-}" in
     --help|-h|--version|-v) exec "$bin" "$@" ;;
@@ -873,6 +998,7 @@ cmd_code() {
     case "$1" in
       --force) force=1; shift ;;
       --keep-others) keep_others=1; shift ;;
+      --mcp) [ $# -ge 2 ] || die "--mcp needs cmem, none or all"; mcp_spec=$2; shift 2 ;;
       --plan)
         [ $# -ge 2 ] || die "--plan needs a file path"
         plan_file=$2; shift 2 ;;
@@ -882,11 +1008,16 @@ cmd_code() {
   if [ -n "$plan_file" ]; then
     plan_context=$(python3 "$QWEN_SOURCE_DIR/scripts/qwen-plan-context.py" "$plan_file") ||
       die "could not retain the build plan; select a readable UTF-8 plan of at most 24000 bytes"
-    plan_args=(--append-system-prompt "$plan_context")
   fi
+  case "$mcp_spec" in cmem|none|all) ;; *) die "--mcp takes cmem, none or all" ;; esac
   code_prepare
+  if [ -n "$plan_context" ]; then
+    CODE_JEV_ARGS=(--append-system-prompt "$plan_context
+
+$jev_brief")
+  fi
   note "Qwen Code on $MODEL at $API (side queries: $FAST_MODEL); file and shell tools enabled"
-  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" "$bin" "${CODE_ARGS[@]}" "${plan_args[@]+"${plan_args[@]}"}" "$@"
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" "$bin" "${CODE_ARGS[@]}" "${CODE_JEV_ARGS[@]}" "$@"
   local rc=$?
   return "$rc"
 }
@@ -938,10 +1069,12 @@ goal_field() {
 # objective in a new session reads the files again, and the files keep every
 # earlier attempt's edits.
 cmd_goal() {
+  mcp_spec=all
   local bin objective="" yes=0 attempts="${QWEN_GOAL_ATTEMPTS:-3}" attempt=1 dir log status reason rc
   bin=$(code_bin) || exit 1
   while [ $# -gt 0 ]; do
     case "$1" in
+      --mcp) [ $# -ge 2 ] || die "--mcp needs cmem, none or all"; mcp_spec=$2; shift 2 ;;
       -y|--yolo) yes=1; shift ;;
       --attempts) [ $# -ge 2 ] || die "--attempts needs a number"; attempts="$2"; shift 2 ;;
       --force) force=1; shift ;;
@@ -955,6 +1088,7 @@ cmd_goal() {
   [ "$yes" = 1 ] || die "a goal runs unattended and needs -y, which approves every tool call (shell included) in $(pwd)"
   case "$attempts" in ''|*[!0-9]*|0) die "--attempts must be a positive integer" ;; esac
 
+  case "$mcp_spec" in cmem|none|all) ;; *) die "--mcp takes cmem, none or all" ;; esac
   code_prepare
   dir="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/goals/$(date +%Y%m%d-%H%M%S)-$$"
   mkdir -p "$dir"
@@ -964,7 +1098,7 @@ cmd_goal() {
     note "attempt $attempt/$attempts"
     rc=0
     env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" \
-      "$bin" "${CODE_ARGS[@]}" -y -o stream-json "/goal $objective" </dev/null |
+      "$bin" "${CODE_ARGS[@]}" "${CODE_JEV_ARGS[@]}" -y -o stream-json "/goal $objective" </dev/null |
       python3 -c "$GOAL_PROGRESS_PY" "$log" || rc=$?
     status=$(goal_field status "$log")
     reason=$(goal_field lastReason "$log")
