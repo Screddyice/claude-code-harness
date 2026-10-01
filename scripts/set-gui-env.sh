@@ -58,3 +58,20 @@ case "$slots" in
     echo "set-gui-env: published LLMJURY_OLLAMA_PARALLEL=$slots to the GUI domain"
     ;;
 esac
+
+# Read the active job, not the saved plist: editing LLAMA_ARG_CACHE_RAM does
+# not change the running server until it restarts. Unknown or unlimited caps
+# keep memguard's conservative default by removing the GUI override.
+ollama_job="${OLLAMA_LAUNCHD_TARGET:-gui/$(id -u)/com.screddy.ollama}"
+cache_mib=$(launchctl print "$ollama_job" 2>/dev/null |
+  awk '$1 == "LLAMA_ARG_CACHE_RAM" && $2 == "=>" { print $3 }')
+case "$cache_mib" in
+  ''|*[!0-9]*|0*)
+    launchctl unsetenv LLMJURY_PROMPT_CACHE_MIB
+    echo "set-gui-env: no bounded running Ollama cache; unset LLMJURY_PROMPT_CACHE_MIB" >&2
+    ;;
+  *)
+    launchctl setenv LLMJURY_PROMPT_CACHE_MIB "$cache_mib"
+    echo "set-gui-env: published LLMJURY_PROMPT_CACHE_MIB=$cache_mib from the running Ollama job"
+    ;;
+esac

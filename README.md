@@ -2001,7 +2001,7 @@ file to read. **The secret value stays in `~/projects/.env`**: it is never writt
 and the log records only the key name and a character count. A missing file or a missing key exits
 0 with a message rather than failing login.
 
-The script also publishes one derived, non-secret value: `LLMJURY_OLLAMA_PARALLEL`, read from
+The script also publishes derived, non-secret values. It reads `LLMJURY_OLLAMA_PARALLEL` from
 `OLLAMA_NUM_PARALLEL` in Ollama's own launchd unit (`OLLAMA_PLIST` overrides the path). Ollama
 exports that setting to its server process and nowhere else, and llm-jury's memguard charges KV as
 `num_ctx x` this number, falling back to Ollama's default of 4 when it cannot see the real one. A
@@ -2009,6 +2009,14 @@ GUI-launched session running the council or the diff reviewer therefore overesti
 work without it. An absent, malformed, or zero value unsets the variable instead of publishing a
 wrong one: memguard's conservative default is the safe direction, a bad number is not. The secret
 loop and this block are independent, so a missing env file no longer skips the derived value.
+
+It reads `LLMJURY_PROMPT_CACHE_MIB` from `LLAMA_ARG_CACHE_RAM` in the running Ollama
+launchd job. This keeps GUI-launched jury consumers from reserving the default 8 GiB when
+the server uses a smaller cache. The publisher checks the active job because an edited plist
+does not change the server's limit until a restart. An unavailable job or a missing, invalid,
+or unlimited bound removes the override and leaves memguard's conservative default in place.
+`OLLAMA_LAUNCHD_TARGET` can select another job for a read-only probe. A missing secrets file
+does not skip either derived setting. Existing apps inherit the new values on their next launch.
 
 This moved here on 2026-09-10 from `router-gui-env.sh`, which was deleted with the Backdoor
 router. That script also health-gated `ANTHROPIC_BASE_URL` onto the router and published a Mem0
@@ -2019,9 +2027,10 @@ The Hermes boxes deliberately do not use this. Each keeps its own mode-600 `~/.h
 and the provider reads the environment then that file, so there is no launchd or GUI session to
 lose. Verified on `src`, `reddy2help` and `neb-ops-gcp` with `CMEM_PRO_TOKEN` explicitly unset.
 
-Tests: `scripts/test-set-gui-env.sh` (13 assertions, stubs `launchctl` so it never touches the
+Tests: `scripts/test-set-gui-env.sh` (21 assertions, stubs `launchctl` so it never touches the
 real domain and a fixture plist so the derived value never depends on this host's Ollama setup,
-and asserts the secret value is never printed).
+and asserts the secret value is never printed). The cache tests distinguish the active job
+from its saved plist and cover missing, malformed, unlimited, and unavailable limits.
 
 ## MCP auth headers without a stored value (`scripts/mcp-headers.py`)
 

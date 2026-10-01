@@ -15,6 +15,10 @@ cat > "$TMP/bin/launchctl" <<'STUB'
 # Record what would have been published, value included, so the test can assert
 # the value never appears anywhere it should not.
 echo "$@" >> "$RECORD"
+if [ "${1:-}" = print ]; then
+  [ "${GUI_ENV_TEST_UNAVAILABLE:-0}" != 1 ] || exit 1
+  printf 'LLAMA_ARG_CACHE_RAM => %s\n' "${GUI_ENV_TEST_CACHE-1024}"
+fi
 STUB
 chmod +x "$TMP/bin/launchctl"
 export PATH="$TMP/bin:$PATH"
@@ -78,6 +82,38 @@ RECORD="$TMP/rec6" GUI_ENV_SOURCE="$TMP/env" OLLAMA_PLIST="$ZERO_PLIST" bash "$H
 grep -q 'unsetenv LLMJURY_OLLAMA_PARALLEL' "$TMP/rec6" \
   && ok "a zero slot count unsets rather than publishing 0" \
   || no "zero slot count unsets" "$(cat "$TMP/rec6")"
+
+grep -q 'setenv LLMJURY_PROMPT_CACHE_MIB 1024' "$TMP/rec1" \
+  && ok "publishes the running Ollama prompt-cache bound" \
+  || no "publishes the running prompt-cache bound" "$(cat "$TMP/rec1")"
+grep -q 'setenv LLMJURY_PROMPT_CACHE_MIB 1024' "$TMP/rec3" \
+  && ok "missing secrets do not skip the prompt-cache bound" \
+  || no "missing secrets do not skip the cache bound" "$(cat "$TMP/rec3")"
+
+# A saved plist can disagree with the active job. Use the running value.
+/usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables:LLAMA_ARG_CACHE_RAM string 4096' \
+  "$GOOD_PLIST" >/dev/null
+RECORD="$TMP/rec7" GUI_ENV_SOURCE="$TMP/nope" GUI_ENV_TEST_CACHE=2048 \
+  bash "$HERE/set-gui-env.sh" >/dev/null 2>&1
+grep -q 'setenv LLMJURY_PROMPT_CACHE_MIB 2048' "$TMP/rec7" \
+  && ! grep -q 'setenv LLMJURY_PROMPT_CACHE_MIB 4096' "$TMP/rec7" \
+  && ok "running cache limit wins over an edited plist" \
+  || no "running cache limit wins" "$(cat "$TMP/rec7")"
+
+for invalid in 0 -1 malformed ''; do
+  RECORD="$TMP/rec-invalid" GUI_ENV_SOURCE="$TMP/nope" GUI_ENV_TEST_CACHE="$invalid" \
+    bash "$HERE/set-gui-env.sh" >/dev/null 2>&1
+  grep -q 'unsetenv LLMJURY_PROMPT_CACHE_MIB' "$TMP/rec-invalid" \
+    && ! grep -q '^setenv LLMJURY_PROMPT_CACHE_MIB' "$TMP/rec-invalid" \
+    && ok "invalid or unlimited cache '$invalid' keeps conservative admission" \
+    || no "invalid cache '$invalid' is refused" "$(cat "$TMP/rec-invalid")"
+  rm -f "$TMP/rec-invalid"
+done
+RECORD="$TMP/rec8" GUI_ENV_SOURCE="$TMP/nope" GUI_ENV_TEST_UNAVAILABLE=1 \
+  bash "$HERE/set-gui-env.sh" >/dev/null 2>&1
+grep -q 'unsetenv LLMJURY_PROMPT_CACHE_MIB' "$TMP/rec8" \
+  && ok "an unavailable running job removes the cache override" \
+  || no "unavailable job removes override" "$(cat "$TMP/rec8")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
