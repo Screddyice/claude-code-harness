@@ -855,8 +855,50 @@ cmd_codex() {
     -m "$MODEL"
   )
   prepare_jev
+  local -a disabled_mcp=()
+  # Codex merges table overrides into its saved MCP config. Disable excluded
+  # saved entries explicitly; an empty mcp_servers table does not remove them.
+  if [ "$mcp_spec" != all ]; then
+    local saved_name saved_transport saved_names
+    saved_names=$(python3 - "$codex_bin" <<'PYMCP'
+import json, re, subprocess, sys
+try:
+    result = subprocess.run([sys.argv[1], "mcp", "list", "--json"],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        sys.exit(1)
+    for server in json.loads(result.stdout):
+        if not server.get("enabled", True):
+            continue
+        name = server["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            sys.exit(1)
+        kind = server["transport"]["type"]
+        if kind not in ("stdio", "streamable_http"):
+            sys.exit(1)
+        print(name + "\t" + kind)
+except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+    sys.exit(1)
+PYMCP
+) || die "could not read saved Codex MCP names; refusing an unfiltered session"
+    while IFS=$'\t' read -r saved_name saved_transport; do
+      [ -n "$saved_name" ] || continue
+      if [ "$mcp_spec" = cmem ] && { [ "$saved_name" = cmem ] || { [ "$saved_name" = jev ] && [ "$jev_ready" = 1 ]; }; }; then
+        continue
+      fi
+      # Plugin-provided entries need a valid transport in the override layer.
+      # Use inert endpoints, then disable them; no inherited credential values
+      # are copied into arguments and no excluded server starts.
+      if [ "$saved_transport" = stdio ]; then
+        disabled_mcp+=(-c "mcp_servers.$saved_name.command=\"/usr/bin/true\"")
+      else
+        disabled_mcp+=(-c "mcp_servers.$saved_name.url=\"https://example.invalid/mcp\"")
+      fi
+      disabled_mcp+=(-c "mcp_servers.$saved_name.enabled=false")
+    done <<< "$saved_names"
+  fi
   case "$mcp_spec" in
-    none) extra+=(-c 'mcp_servers={}') ;;
+    none) ;;
     all)
       note "keeping every MCP server in ~/.codex/config.toml; their schemas will crowd the window"
       if [ "$jev_ready" = 1 ]; then
@@ -868,12 +910,13 @@ cmd_codex() {
       ensure_cmem_token || die "CMEM_PRO_TOKEN is not set and not readable from ~/projects/.env; use --mcp none or --mcp all"
       local mcp_inline="cmem = { url = $(jq -Rn --arg u "$CMEM_URL" '$u'), bearer_token_env_var = \"CMEM_PRO_TOKEN\" }"
       if [ "$jev_ready" = 1 ]; then
-        mcp_inline="$mcp_inline, jev = { command = $(jq -Rn --arg c "$jev_command" '$c'), env_vars = [\"JEV_OPENROUTER_API_KEY\"] }"
+        mcp_inline="$mcp_inline, jev = { command = $(jq -Rn --arg c "$jev_command" '$c'), env_vars = [\"JEV_OPENROUTER_API_KEY\"], enabled = true }"
       fi
       extra+=(-c "mcp_servers={$mcp_inline}") ;;
     *) die "--mcp takes cmem, none or all (got \"$mcp_spec\")" ;;
   esac
 
+  extra+=(${disabled_mcp[@]+"${disabled_mcp[@]}"})
   extra+=(-c "developer_instructions=$(jq -Rn --arg brief "$jev_brief" '$brief')")
 
   note "codex on $MODEL, mcp=$mcp_spec; no failover, and ~/.codex/config.toml is untouched"

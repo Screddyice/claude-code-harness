@@ -147,6 +147,10 @@ EOF
 
 cat > "$STUB/codex" <<'EOF'
 #!/bin/bash
+if [ "$*" = 'mcp list --json' ]; then
+  echo '[{"name":"jev","transport":{"type":"stdio"}},{"name":"cmem","transport":{"type":"streamable_http"}},{"name":"other","transport":{"type":"stdio"}}]'
+  exit 0
+fi
 printf '%s\n' "$@" > "$FIXTURE/codex.argv"
 env > "$FIXTURE/codex.env"
 exit 0
@@ -208,7 +212,15 @@ reset_world() {
   done
   : > "$FIXTURE/mem-cache/13.24.99/.orphaned_at"
   rm -rf "$FIXTURE/leases" "$FIXTURE/state"
-  mkdir -p "$FIXTURE/leases" "$FIXTURE/state"
+  mkdir -p "$FIXTURE/leases" "$FIXTURE/state" "$FIXTURE/.codex"
+  cat > "$FIXTURE/.codex/config.toml" <<'TOML'
+[mcp_servers.jev]
+command = "not-used"
+[mcp_servers.cmem]
+url = "https://example.invalid/mcp"
+[mcp_servers.other]
+command = "not-used"
+TOML
 }
 
 run_qwen() {
@@ -233,6 +245,7 @@ run_qwen() {
 }
 
 claude_env() { grep -m1 "^$1=" "$FIXTURE/claude.env" | cut -d= -f2-; }
+codex_disables() { grep -qxF "mcp_servers.$1.enabled=false" "$FIXTURE/codex.argv"; }
 claude_argv_has() { grep -qxF -- "$1" "$FIXTURE/claude.argv"; }
 
 # A launcher stub only supplies an executable path. Probe tests never call it.
@@ -288,6 +301,22 @@ for entry in code codex claude; do
   if [ ! -e "$FIXTURE/jev-probe.log" ]; then pass "$entry skips missing credentials before probing";
   else fail "$entry probed without a credential"; fi
 done
+reset_world
+run_qwen codex >/dev/null
+if codex_disables jev && codex_disables other && ! codex_disables cmem; then
+  pass "Codex cmem disables inherited JEV offline and other saved servers"
+else fail "Codex saved-server exclusion"; fi
+reset_world
+run_qwen codex --mcp none >/dev/null
+if codex_disables jev && codex_disables other && codex_disables cmem; then
+  pass "Codex none disables saved servers despite table merging"
+else fail "Codex none exclusion"; fi
+reset_world
+: > "$FIXTURE/jev-online"
+TEST_JEV_KEY=test-jev-not-real run_qwen codex >/dev/null
+if codex_disables other && ! codex_disables jev && ! codex_disables cmem; then
+  pass "Codex cmem enables only memory and online JEV"
+else fail "Codex online allowlist"; fi
 reset_world
 : > "$FIXTURE/jev-online"
 TEST_JEV_KEY=test-jev-not-real run_qwen codex --mcp all >/dev/null

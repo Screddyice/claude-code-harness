@@ -1744,7 +1744,9 @@ checks still apply. `qwen raw` has no tools and uses local judgments.
 Qwen Code keeps its existing MCP selection by default; `--mcp cmem` restricts it
 to memory and available JEV, and `--mcp none` excludes MCP servers. Codex and
 Claude keep their `cmem` default, with online JEV added. In `--mcp all`, offline
-Codex disables inherited JEV and Claude blocks its tool calls. Generated Qwen
+Codex disables inherited JEV and Claude blocks its tool calls. Codex table
+overrides merge with saved settings, so the launcher disables excluded saved
+servers by name for its `cmem` and `none` selections. Generated Qwen
 settings contain no secrets and the launcher removes them on exit.
 
 Run `bash scripts/test-qwen.sh` for online/offline attachment, opt-outs,
