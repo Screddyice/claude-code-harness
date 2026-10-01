@@ -1718,6 +1718,37 @@ Codex goes over Ollama's OpenAI-compatible `/v1/responses` endpoint. The wrapper
 sets `model_providers.qwen.wire_api=responses`, which current Codex requires. Neither
 client needs the translation proxy Backdoor's `:8083` provided, so nothing gets rebuilt.
 
+#### Optional JEV decisions for local sessions
+
+With `jev-mcp` installed and its OpenRouter credential available, the guarded
+launcher attaches JEV to Qwen Code, goals, Codex and Claude sessions. The local
+model uses it for classification, evidence checks, scoring, ranking and record
+matching without an `@JEV` tag. The launcher puts the routing guidance into the
+session prompt, including probability thresholds, data restrictions and request
+limits. Coding and chat inference stay on Ollama.
+
+A public OpenRouter HEAD probe has a two-second total timeout and no retries.
+If it fails, or the launcher or credential is missing, the session skips JEV and
+uses local judgments. If connectivity drops after startup, the prompt tells the
+model to disclose its local fallback and avoid retrying an uncertain billed call.
+`QWEN_JEV=0`, `QWEN_OFFLINE=1` and `--mcp none` skip the probe and JEV attachment.
+These switches do not change the existing memory-worker controls.
+
+The MCP entry contains a launcher path. It never contains a key value. The
+launcher reads `JEV_OPENROUTER_API_KEY` from its environment or its protected
+runtime file. Existing OpenAI accounts and the local admission, lease and lock
+checks still apply. `qwen raw` has no tools and uses local judgments.
+
+Qwen Code keeps its existing MCP selection by default; `--mcp cmem` restricts it
+to memory and available JEV, and `--mcp none` excludes MCP servers. Codex and
+Claude keep their `cmem` default, with online JEV added. In `--mcp all`, offline
+Codex disables inherited JEV and Claude blocks its tool calls. Generated Qwen
+settings contain no secrets and the launcher removes them on exit.
+
+Run `bash scripts/test-qwen.sh` for online/offline attachment, opt-outs,
+credential-free arguments and the existing model admission checks. The suite
+uses fake services and does not load a model or call OpenRouter.
+
 #### The model id is the catch
 
 Claude Code 2.1.267 validates the session model against its own compiled catalog

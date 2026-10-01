@@ -18,7 +18,7 @@ mkdir -p "$STUB"
 REAL_PS=$(command -v ps)
 # Everything the wrapper shells out to, except the six stubbed below. Linking the
 # real binaries keeps the test honest: only Ollama and the memory probes are fake.
-for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm mv env cut ls sort ps stat; do
+for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm mv env cut ls sort ps stat cp; do
   path=$(command -v "$tool") || continue
   ln -sf "$path" "$STUB/$tool"
 done
@@ -32,6 +32,9 @@ cat > "$STUB/curl" <<'EOF'
 url=""
 for arg in "$@"; do case "$arg" in http*) url=$arg ;; esac; done
 case "$url" in
+  https://openrouter.ai/*)
+    printf '%s\n' "$*" >> "$FIXTURE/jev-probe.log"
+    [ -f "$FIXTURE/jev-online" ]; exit $? ;;
   */api/version) echo '{"version":"0.0.0-test"}' ;;
   */api/tags)    cat "$FIXTURE/tags.json" ;;
   */api/ps)      cat "$FIXTURE/ps.json" ;;
@@ -153,6 +156,13 @@ cat > "$STUB/qwen-code" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" > "$FIXTURE/qwen-code.argv"
 env > "$FIXTURE/qwen-code.env"
+# Keep the generated settings for assertions after the wrapper cleans up.
+if [ -n "${QWEN_CODE_SYSTEM_DEFAULTS_PATH:-}" ]; then
+  cp "$QWEN_CODE_SYSTEM_DEFAULTS_PATH" "$FIXTURE/code-config.json"
+  sed "s|^QWEN_CODE_SYSTEM_DEFAULTS_PATH=.*|QWEN_CODE_SYSTEM_DEFAULTS_PATH=$FIXTURE/code-config.json|" \
+    "$FIXTURE/qwen-code.env" > "$FIXTURE/code.env.next"
+  mv "$FIXTURE/code.env.next" "$FIXTURE/qwen-code.env"
+fi
 find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' > "$FIXTURE/qwen-code.leases" 2>/dev/null
 # A goal test lists one Goal status per attempt; each call consumes the first.
 if [ -s "$FIXTURE/goal-statuses" ]; then
@@ -173,7 +183,7 @@ chmod +x "$STUB"/*
 MODEL=qwen3.8:27b-obliterated
 
 reset_world() {
-  rm -f "$FIXTURE/vm_stat"
+  rm -f "$FIXTURE/vm_stat" "$FIXTURE/jev-online" "$FIXTURE/jev-probe.log"
   printf '{"models":[{"name":"%s","size":17716740000,"digest":"heavy"},{"name":"qwen3.5:4b-64k","size":2500000000,"digest":"small"},{"name":"qwen3.5:4b-256k","size":2500000000,"digest":"small"}]}\n' "$MODEL" > "$FIXTURE/tags.json"
   echo '{"models":[]}' > "$FIXTURE/ps.json"
   echo 1 > "$FIXTURE/pressure"
@@ -214,6 +224,9 @@ run_qwen() {
     QWEN_CLAUDE_MEM_CACHE="$FIXTURE/mem-cache" \
     CLAUDE_MEM_WORKER_PORT=37799 \
     QWEN_MEMORY="${QWEN_MEMORY:-1}" \
+    JEV_OPENROUTER_API_KEY="${TEST_JEV_KEY-}" \
+    QWEN_JEV_COMMAND="$STUB/jev-mcp" \
+    QWEN_JEV="${QWEN_JEV:-1}" QWEN_OFFLINE="${QWEN_OFFLINE:-0}" \
     QWEN_CODE_BIN="$STUB/qwen-code" \
     QWEN_FAST_MODEL="${QWEN_FAST_MODEL-}" \
     bash "$QWEN" "$@" 2>&1 </dev/null
@@ -222,7 +235,80 @@ run_qwen() {
 claude_env() { grep -m1 "^$1=" "$FIXTURE/claude.env" | cut -d= -f2-; }
 claude_argv_has() { grep -qxF -- "$1" "$FIXTURE/claude.argv"; }
 
+# A launcher stub only supplies an executable path. Probe tests never call it.
+ln -sf "$STUB/qwen-code" "$STUB/jev-mcp"
+
 # --- cases ------------------------------------------------------------------
+
+# Automatic JEV attachment, offline skipping and opt-outs on each client.
+for entry in code codex claude; do
+  reset_world
+  : > "$FIXTURE/jev-online"
+  TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" >/dev/null
+  case "$entry" in
+    code) online=$(jq -r '.mcpServers.jev.command // empty' "$FIXTURE/code-config.json") ;;
+    codex) online=$(grep 'mcp_servers=.*jev.*command' "$FIXTURE/codex.argv" || true) ;;
+    claude) online=$(grep 'mcpServers.*jev.*command' "$FIXTURE/claude.argv" || true) ;;
+  esac
+  if [[ "$online" == *"jev-mcp"* ]] && grep -q 'jev_decide' "$FIXTURE/$([ "$entry" = code ] && echo qwen-code || echo "$entry").argv"; then
+    pass "$entry attaches JEV and routing guidance online"
+  else
+    fail "$entry attaches JEV online" "$online"
+  fi
+  if grep -q -- '--max-time 2 --retry 0' "$FIXTURE/jev-probe.log" &&
+     ! grep -q 'test-jev-not-real' "$FIXTURE/$([ "$entry" = code ] && echo qwen-code || echo "$entry").argv"; then
+    pass "$entry bounds its probe and keeps credentials out of argv"
+  else fail "$entry bounds probe without credential args"; fi
+
+  reset_world
+  out=$(TEST_JEV_KEY=test-jev-not-real run_qwen "$entry")
+  case "$entry" in
+    code) offline=$(jq -r '(.mcp.excluded | index("jev")) != null and (.mcpServers.jev == null)' "$FIXTURE/code-config.json") ;;
+    codex) offline=$(! grep -q 'mcp_servers=.*jev.*command' "$FIXTURE/codex.argv" && echo true) ;;
+    claude) offline=$(! grep -q 'mcpServers.*jev.*command' "$FIXTURE/claude.argv" && echo true) ;;
+  esac
+  if [ "$offline" = true ] && [[ "$out" == *"connection unavailable"* ]]; then
+    pass "$entry continues locally when the connection fails"
+  else fail "$entry skips JEV offline" "$out"; fi
+
+  for opt in QWEN_JEV QWEN_OFFLINE none; do
+    reset_world
+    : > "$FIXTURE/jev-online"
+    case "$opt" in
+      QWEN_JEV) QWEN_JEV=0 TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" >/dev/null ;;
+      QWEN_OFFLINE) QWEN_OFFLINE=1 TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" >/dev/null ;;
+      none) TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" --mcp none >/dev/null ;;
+    esac
+    if [ ! -e "$FIXTURE/jev-probe.log" ]; then pass "$entry honors $opt before probing";
+    else fail "$entry honors $opt"; fi
+  done
+  reset_world
+  run_qwen "$entry" >/dev/null
+  if [ ! -e "$FIXTURE/jev-probe.log" ]; then pass "$entry skips missing credentials before probing";
+  else fail "$entry probed without a credential"; fi
+done
+reset_world
+: > "$FIXTURE/jev-online"
+TEST_JEV_KEY=test-jev-not-real run_qwen codex --mcp all >/dev/null
+if grep -qx 'mcp_servers.jev.enabled=true' "$FIXTURE/codex.argv"; then pass "Codex all enables installed JEV online";
+else fail "Codex all enables JEV"; fi
+reset_world
+TEST_JEV_KEY=test-jev-not-real run_qwen codex --mcp all >/dev/null
+if grep -qx 'mcp_servers.jev.enabled=false' "$FIXTURE/codex.argv"; then pass "Codex all disables inherited JEV offline";
+else fail "Codex all disables JEV"; fi
+reset_world
+QWEN_OFFLINE=1 run_qwen claude --mcp all >/dev/null
+if grep -qx 'mcp__jev__\*' "$FIXTURE/claude.argv"; then pass "Claude all blocks inherited JEV offline";
+else fail "Claude all blocks JEV"; fi
+reset_world
+: > "$FIXTURE/jev-online"
+printf 'complete\n' > "$FIXTURE/goal-statuses"
+TEST_JEV_KEY=test-jev-not-real run_qwen goal -y 'Verify the fixture' >/dev/null
+if jq -e '.mcpServers.jev.command' "$FIXTURE/code-config.json" >/dev/null && grep -q 'jev_decide' "$FIXTURE/qwen-code.argv"; then
+  pass "Qwen goals inherit automatic JEV guidance"
+else fail "Qwen goals inherit JEV"; fi
+if [ -z "$(find "$FIXTURE/state" -name 'jev-session-*.json')" ]; then pass "temporary JEV settings are removed after Qwen exits";
+else fail "JEV session settings cleanup"; fi
 
 reset_world
 printf 'PLAN_KEEP_7731: implement one step and verify it.\n' > "$FIXTURE/plan with spaces.md"
