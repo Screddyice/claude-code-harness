@@ -926,7 +926,7 @@ code_prepare() {
   session_config="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/jev-session-$$.json"
   mkdir -p "$(dirname "$session_config")"
   jq --argjson ready "$jev_ready" --argjson jev "$(jev_json)" --arg selection "$mcp_spec" '
-    if $ready == 1 then .mcpServers.jev = $jev
+    if $ready == 1 then .mcpServers.jev = $jev | .tools.visible = ((.tools.visible // []) + ["mcp__jev__jev_decide"] | unique)
     else del(.mcpServers.jev) | .mcp.excluded = ((.mcp.excluded // []) + ["jev"] | unique) end |
     if $selection == "none" then .mcp.allowed = []
     elif $selection == "cmem" then .mcp.allowed = (["cmem"] + if $ready == 1 then ["jev"] else [] end)

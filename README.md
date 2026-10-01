@@ -1725,7 +1725,9 @@ launcher attaches JEV to Qwen Code, goals, Codex and Claude sessions. The local
 model uses it for classification, evidence checks, scoring, ranking and record
 matching without an `@JEV` tag. The launcher puts the routing guidance into the
 session prompt, including probability thresholds, data restrictions and request
-limits. Coding and chat inference stay on Ollama.
+limits. Qwen Code gets the JEV schema upfront and concrete JSON examples to
+avoid tool-name and nesting errors on smaller models. Coding and chat inference
+stay on Ollama.
 
 A public OpenRouter HEAD probe has a two-second total timeout and no retries.
 If it fails, or the launcher or credential is missing, the session skips JEV and

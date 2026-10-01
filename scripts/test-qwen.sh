@@ -246,7 +246,8 @@ for entry in code codex claude; do
   : > "$FIXTURE/jev-online"
   TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" >/dev/null
   case "$entry" in
-    code) online=$(jq -r '.mcpServers.jev.command // empty' "$FIXTURE/code-config.json") ;;
+    code) online=$(jq -r '.mcpServers.jev.command // empty' "$FIXTURE/code-config.json")
+      if jq -e '.tools.visible | index("mcp__jev__jev_decide")' "$FIXTURE/code-config.json" >/dev/null; then pass "Qwen Code exposes the exact JEV schema upfront"; else fail "Qwen Code visible JEV schema"; fi ;;
     codex) online=$(grep 'mcp_servers=.*jev.*command' "$FIXTURE/codex.argv" || true) ;;
     claude) online=$(grep 'mcpServers.*jev.*command' "$FIXTURE/claude.argv" || true) ;;
   esac
