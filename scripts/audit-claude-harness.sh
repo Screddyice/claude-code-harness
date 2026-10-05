@@ -13,9 +13,6 @@ fail() {
 
 [ -f "$root/README.md" ] || fail "missing $root/README.md"
 [ -f "$root/CLAUDE.md" ] || fail "missing $root/CLAUDE.md"
-[ -f "$root/holyclaude-cloud/.claude-plugin/plugin.json" ] ||
-  fail "Claude plugin manifest is missing"
-
 if find "$root" -type f \( -name plugin.json -o -name marketplace.json \) -print 2>/dev/null |
    while IFS= read -r manifest; do
      rg -q '\.codex-plugin|codex plugin marketplace|install-codex' "$manifest" &&

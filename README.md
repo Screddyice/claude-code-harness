@@ -2,8 +2,8 @@
 
 # claude-code-harness
 
-This repository carries the Claude Code side of the local agent setup: Claude-facing
-plugin sources, Claude hooks, status tooling, and shared utilities.
+This repository carries the Claude Code side of the local agent setup: Claude hooks,
+status tooling, and shared utilities.
 
 Codex has a separate source of truth in [`Screddyice/codex-harness`](https://github.com/Screddyice/codex-harness).
 Keep Codex configuration and Codex plugin manifests there. This repository does not
@@ -38,7 +38,6 @@ claude-code-harness/
 │   ├── kernel-zone-watchdog.sh       # catches a kernel zone-map leak before it panics the Mac
 │   ├── test-kernel-zone-watchdog.sh  # watchdog unit tests (parsing, thresholds, snapshots)
 │   └── codex-workspace-summary.sh    # quick local sanity summary
-└── holyclaude-cloud/                 # vendored Claude plugin source
 ```
 
 ## Where an auto-opened PR is aimed
@@ -714,8 +713,8 @@ versions remain under `~/.local/share/claude/versions` for manual rollback.
 
 ## Client boundary
 
-Claude plugin sources stay in this repository. Codex configuration, Codex hooks, and
-Codex plugin marketplaces live in [`codex-harness`](https://github.com/Screddyice/codex-harness).
+Claude hooks and shared utilities stay in this repository. Codex configuration, Codex
+hooks, and Codex plugin marketplaces live in [`codex-harness`](https://github.com/Screddyice/codex-harness).
 Use that repository when a task needs a Codex plugin or Codex-specific installation.
 
 ## Swarm — Cross-CLI Parallel Agent Dispatch
