@@ -21,7 +21,6 @@ claude-code-harness/
 ├── scripts/
 │   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
 │   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
-│   ├── install-llmjury-orchestration.sh # optional Claude/Codex delegation setup
 │   ├── install-claude-resilient-updater.sh # resumable Claude native updates on macOS
 │   ├── claude-manual-update             # checksum-verified update worker
 │   ├── statusline.sh                     # Claude model and session status source
