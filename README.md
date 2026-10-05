@@ -71,6 +71,10 @@ it in `guard-main-base.yml`: only `dev`, `promote/*` and `hotfix/*` may target
 still scores `main` as its fork point, so the hook aimed there and CI rejected it
 on arrival. That happened on `nebos-v2` #531 and #532, and #365 before them.
 
+A branch created from the current `main` tip keeps `main` as its target. The resolver
+checks the exact fork point before applying an integration-branch policy, so a shared
+ancestor does not retarget fresh trunk work to `dev`.
+
 Precedence, most specific first:
 
 | | Source | Use it when |
