@@ -2,12 +2,40 @@
 # qwen — local Qwen 4B by default; `qwen 27b` selects the optional 27B.
 #
 # WHY THIS EXISTS
-#   The wrapper adds client setup, model aliases, leases, and a shared compute lock
-#   around Ollama. macOS owns memory pressure and Ollama owns model residency; the
-#   launcher does not maintain a second RAM budget.
+#   Backdoor was removed on 2026-09-10 and took `~/.local/bin/qwen` with it. Losing
+#   the wrapper is not the problem; losing what it did before the load is. Roughly
+#   20 GB of *wired* Metal memory lands on a 36 GB host, and wired allocations
+#   cannot be paged out — so when this model shares the machine with an llm-jury
+#   council or a background diff review, the host compresses and swaps everything
+#   else until the kernel watchdog starves and panics. That happened twice on
+#   2026-07-31. There is no catchable OOM to react to, which is why every guard
+#   here runs before the first byte is loaded.
 #
-#   The lease and lock coordinate cooperating local clients while a model loads.
-#   They do not replace macOS or Ollama's memory boundaries.
+#   LLM-Jury's memguard already knows this model by name: EXCLUSIVE_MODELS in
+#   llmjury/memguard.py is exactly {"qwen3.8:27b-obliterated"}, and every
+#   cooperating local job — the Stop-hook diff reviewer, llm-jury councils — stands
+#   down while it owns compute. memguard learns that two ways: a lease file under
+#   ~/.backdoor/compute-leases, or the model appearing in Ollama's /api/ps. This
+#   wrapper publishes the lease, because the gap between "start loading" and "ps
+#   shows it" is tens of seconds and a Stop hook fires in far less than that. It
+#   also holds the same nonblocking kernel lock the reviewer uses,
+#   ~/.cache/llmjury/local-compute.lock, so the two cannot race at all.
+#
+#   The lease directory keeps Backdoor's name because memguard's default path is
+#   what its other readers resolve; renaming it here would silently stop gating
+#   them. Override both sides together with LLMJURY_COMPUTE_LEASE_DIR if it moves.
+#
+# WHY NOT JUST GATE ON `llmjury preflight`
+#   Because it refuses this model on this host, always, and it is right to for its
+#   own callers. estimate_resident() is `disk * 1.35 + cells * 85_000`, fitted on
+#   2-9 GB models at f16 KV, so it projects 27.5 GB against a 23.4 GiB budget. This
+#   server runs OLLAMA_KV_CACHE_TYPE=q8_0 and LLAMA_ARG_CACHE_RAM=1024 — verified
+#   on the running process, not the saved plist — so the real figure is far lower.
+#   Erring high is correct when the question is "may a council pile on top". It is
+#   useless when the question is "may the exclusive owner run at all". So this
+#   wrapper does its own arithmetic, and replaces the estimate with the number
+#   `ollama ps` reports after the first successful load rather than guessing
+#   forever.
 #
 # USAGE
 #   qwen                       standalone Qwen Code agent on Qwen3.5 4B
@@ -35,7 +63,7 @@
 #   QWEN_MEMORY=0              disable claude-client memory integration
 #   QWEN_JEV=0 / QWEN_OFFLINE=1 skip the optional OpenRouter JEV sidecar
 #
-#   --force         compatibility flag; macOS/Ollama remain the memory authority
+#   --force         load even if the memory guard objects (it is advisory, not law)
 #   --keep-others   leave other resident Ollama models alone (default: unload them)
 #   --keepalive D   how long Ollama holds the model after the session (e.g. 30s, 1h)
 #   Ollama's own --think, --verbose, --hidethinking, --nowordwrap, --format pass
@@ -54,11 +82,27 @@ case "${1:-}" in
   27b|27B) MODEL="qwen3.8:27b-obliterated"; shift ;;
 esac
 GB=$((1024 ** 3))
+DESKTOP_RESERVE=$((4 * GB))     # desktop, agent tools, and runner growth
+PROMPT_CACHE_MIB="${QWEN_PROMPT_CACHE_MIB:-1024}"   # LLAMA_ARG_CACHE_RAM on this host
 LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.backdoor/compute-leases}"
 LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
 STALE_SESSION_SECONDS="${QWEN_STALE_SESSION_SECONDS:-1800}"
 MODEL_KEY="$(printf '%s' "$MODEL" | tr -c '[:alnum:]_.-' '_')"
 MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/$MODEL_KEY/resident-bytes"
+# Ollama applies its server context cap to every runner. The model metadata can
+# advertise a larger window than the active service allows, so read the launchd
+# environment for admission arithmetic. The client still keeps the model's baked
+# window for prompt accounting and UI configuration.
+server_context() {
+  local configured
+  configured=$(launchctl print "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null |
+    awk '$1 == "OLLAMA_CONTEXT_LENGTH" && $2 == "=>" { print $3; exit }') || true
+  case "$configured" in
+    ''|*[!0-9]*) printf '%s\n' 32768 ;;
+    *) printf '%s\n' "$configured" ;;
+  esac
+}
+
 model_context_for() {
   case "$1" in
     qwen3.5:4b-256k) printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-262144}" ;;
@@ -66,6 +110,7 @@ model_context_for() {
   esac
 }
 model_context() { model_context_for "$MODEL"; }
+admission_context() { printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-$(server_context)}"; }
 AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
 # Claude Code refuses any model id outside its compiled catalog, whatever
 # ANTHROPIC_BASE_URL points at, so the local weights are served under a catalog id.
@@ -275,9 +320,52 @@ check_pressure() {
   [ "$level" = 1 ] || die "host memory pressure is elevated or unknown (level $level); free memory first"
 }
 
-# Record the resident size for `qwen status`. Runs detached because the model is
-# still loading when the session starts, and closes fd 9 so the poller cannot keep
-# the compute lock after the user quits.
+available_bytes() {
+  # memory_pressure's percentage is a pressure metric, not allocatable bytes.
+  # Include file cache, but do not add overlapping cache/reclaimable counters.
+  # This estimates reclaimable capacity, not guaranteed immediately free RAM.
+  # Inactive anonymous pages and compressed/swap capacity are not counted.
+  vm_stat 2>/dev/null | python3 -c '
+import re, sys
+text = sys.stdin.read()
+page = re.search(r"page size of ([0-9]+) bytes", text)
+counts = [re.search(r"^Pages " + name + r":\s+([0-9]+)\.\s*$", text, re.M)
+          for name in ("free", "speculative", "purgeable")]
+file_pages = re.search(r"^File-backed pages:\s+([0-9]+)\.\s*$", text, re.M)
+if not page or not all(counts) or not file_pages or int(page[1]) not in (4096, 16384):
+    sys.exit(1)
+free, speculative, purgeable = (int(count[1]) for count in counts)
+print(int(page[1]) * (free + max(int(file_pages[1]), speculative + purgeable)))'
+}
+
+simulator_booted() {
+  [ "${LLMJURY_ALLOW_SIMULATOR:-0}" != 0 ] && return 1
+  pgrep -qf 'CoreSimulator/Devices/.*/data' 2>/dev/null
+}
+
+# What this load will cost. A measurement from a previous run beats any formula;
+# until there is one, over-estimate — refusing a run that would have fit is an
+# annoyance, allowing one that does not takes the machine down.
+need_bytes() {
+  local measured disk slots ctx cells
+  measured=$(cat "$MEASURED" 2>/dev/null || true)
+  case "$measured" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s\n' $(( measured + PROMPT_CACHE_MIB * 1024 * 1024 )); return 0 ;;
+  esac
+  disk=$(disk_bytes) || true
+  [ -n "${disk:-}" ] || return 1
+  slots="${LLMJURY_OLLAMA_PARALLEL:-${OLLAMA_NUM_PARALLEL:-2}}"
+  ctx=$(admission_context)
+  cells=$(( ctx * slots ))
+  # weights ~ disk * 1.15, and ~45 KB per KV cell at q8_0 (about half of f16).
+  printf '%s\n' $(( disk * 115 / 100 + cells * 45000 + PROMPT_CACHE_MIB * 1024 * 1024 ))
+}
+
+# Record what it actually cost, so the next run stops guessing. Runs detached,
+# because the model is still loading when the session starts — and with fd 9
+# closed, because inheriting the compute lock would leave this poller holding it
+# for two minutes after the user has already quit.
 record_resident() {
   ( for _ in $(seq 1 60); do
       size=$(resident_bytes 2>/dev/null || true)
@@ -474,12 +562,22 @@ stop_other_models() {
 }
 
 admit() {
-  # macOS owns memory pressure and Ollama owns model residency. Do not invent a
-  # second byte budget here: it drifted from the active server settings and made
-  # a 4B model require --force despite fitting when loaded normally.
+  local avail need budget
+  if simulator_booted; then
+    die "an iOS Simulator is booted (~17.6 GB resident); quit it, or set LLMJURY_ALLOW_SIMULATOR=1"
+  fi
   check_pressure
   [ "$keep_others" = 1 ] || stop_other_models
-  note "macOS pressure is normal; Ollama owns model memory limits"
+  need=$(need_bytes) || die "cannot read the model's size from Ollama; is $MODEL pulled?"
+  avail=$(available_bytes) || die "cannot read host memory; pass --force to load anyway"
+  budget=$(( avail - DESKTOP_RESERVE ))
+  [ "$budget" -ge 0 ] || budget=0
+  if [ "$budget" -lt "$need" ]; then
+    die "$MODEL needs ~$(gb "$need") GiB; $(gb "$budget") GiB estimated headroom
+     after the 4 GiB desktop/runtime reserve ($(gb "$avail") GiB before reserve). Close something, or use the smaller qwen model.
+     A wired over-commit does not fail cleanly here — it panics the host."
+  fi
+  note "loading $MODEL (~$(gb "$need") GB, $(gb "$avail") GiB estimated available)"
 }
 
 # --- subcommands ------------------------------------------------------------
@@ -602,7 +700,7 @@ parse_agent_opts() {
 
 agent_admit() {
   if is_resident; then
-    check_pressure
+    [ "$force" = 1 ] || check_pressure
     note "attaching to the resident $MODEL"
     # Residency does not last a whole agent session: a Goal verification swaps
     # the 27B out for the side-query model, and the diff reviewer or a council
@@ -615,7 +713,12 @@ agent_admit() {
   disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
   acquire_compute_lock
   lease_open
-  admit
+  if [ "$force" = 1 ]; then
+    if [ "$keep_others" != 1 ]; then stop_other_models; fi
+    note "--force: skipping the memory guard"
+  else
+    admit
+  fi
   record_resident
 }
 
@@ -1078,7 +1181,7 @@ if [ -z "$prompt" ] && [ ! -t 0 ]; then prompt="$(cat)"; fi
 start_server || die "Ollama did not come up on $API (launchctl kickstart gui/$(id -u)/$AGENT_LABEL)"
 
 if is_resident; then
-  check_pressure
+  [ "$force" = 1 ] || check_pressure
   # Already loaded: this session costs no new memory, so it needs no guard, no
   # lease (residency is memguard's own second source of truth) and no lock.
   note "attaching to the resident $MODEL"
@@ -1086,7 +1189,12 @@ else
   disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
   acquire_compute_lock
   lease_open
-  admit
+  if [ "$force" = 1 ]; then
+    [ "$keep_others" = 1 ] || stop_other_models
+    note "--force: skipping the memory guard"
+  else
+    admit
+  fi
   record_resident
 fi
 

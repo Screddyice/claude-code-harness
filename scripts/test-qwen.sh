@@ -413,6 +413,16 @@ else
 fi
 
 reset_world
+echo 32768 > "$FIXTURE/server-context"
+echo 50 > "$FIXTURE/free_pct"
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-256k run_qwen raw "hello")
+if [[ "$out" == *"RAN run qwen3.5:4b-256k hello"* ]]; then
+  pass "admission uses Ollama's active context cap instead of the model metadata window"
+else
+  fail "active Ollama context cap must control the memory estimate" "$out"
+fi
+
+reset_world
 cat > "$FIXTURE/vm_stat" <<'EOF'
 Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free: 65536.
