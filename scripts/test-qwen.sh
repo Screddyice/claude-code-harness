@@ -398,26 +398,18 @@ reset_world
 echo 20 > "$FIXTURE/free_pct"
 out=$(run_qwen raw "hello")
 case "$out" in
-  *"needs ~"*) pass "too little free memory refuses the load" ;;
-  *) fail "too little free memory refuses the load" "$out" ;;
+  *"RAN run $MODEL hello"*) pass "Ollama owns model admission under normal pressure" ;;
+  *) fail "Ollama owns model admission under normal pressure" "$out" ;;
 esac
 
-# The pressure percentage can be high despite too little physical RAM for 27B.
+# The launcher follows macOS pressure and leaves byte accounting to Ollama.
 reset_world
-cat > "$FIXTURE/vm_stat" <<'EOF'
-Mach Virtual Memory Statistics: (page size of 16384 bytes)
-Pages free: 900000.
-Pages speculative: 20000.
-Pages purgeable: 20000.
-Pages inactive: 900000.
-File-backed pages: 0.
-EOF
-out=$(run_qwen code -p "hello")
-status=$?
-if [ "$status" -ne 0 ] && [ ! -e "$FIXTURE/qwen-code.argv" ] && [[ "$out" == *"needs ~"* ]]; then
-  pass "high pressure percentage cannot admit a physically overcommitted agent"
+echo 20 > "$FIXTURE/free_pct"
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-256k run_qwen raw "hello")
+if [[ "$out" == *"RAN run qwen3.5:4b-256k hello"* ]]; then
+  pass "normal pressure lets Ollama own model admission"
 else
-  fail "physical memory must gate the agent before launch" "$out"
+  fail "normal pressure must not apply a second byte budget" "$out"
 fi
 
 reset_world
@@ -454,10 +446,10 @@ Pages purgeable: 0.
 File-backed pages: 0.
 EOF
 out=$(run_qwen code -p "hello")
-if [[ "$out" == *"0.0 GiB estimated headroom"* ]] && [[ "$out" != *"-4.0"* ]]; then
-  pass "exhausted reserve reports zero headroom"
+if [ -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "macOS owns exhausted reserve behavior"
 else
-  fail "exhausted reserve reports zero headroom" "$out"
+  fail "macOS owns exhausted reserve behavior" "$out"
 fi
 
 reset_world
@@ -469,37 +461,38 @@ Pages purgeable: 524288.
 File-backed pages: 1572864.
 EOF
 out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen code -p "hello")
-if [ ! -e "$FIXTURE/qwen-code.argv" ] && [[ "$out" == *"3.0 GiB estimated headroom"* ]]; then
-  pass "4K pages do not double count overlapping reclaimable counters"
+if [ -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "macOS owns page accounting"
 else
-  fail "4K pages do not double count overlapping reclaimable counters" "$out"
+  fail "macOS owns page accounting" "$out"
 fi
 
 reset_world
 echo 'unavailable' > "$FIXTURE/vm_stat"
 out=$(run_qwen code -p "hello")
-if [[ "$out" == *"cannot read host memory"* ]] && [ ! -e "$FIXTURE/qwen-code.argv" ]; then
-  pass "missing physical memory counters fail closed"
+if [ -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "Ollama remains usable when byte probes are unavailable"
 else
-  fail "missing physical memory counters fail closed" "$out"
+  fail "Ollama remains usable when byte probes are unavailable" "$out"
 fi
 
-# --force is the documented escape hatch, and has to survive both refusals above.
+# --force remains a compatibility flag and cannot bypass macOS pressure.
 reset_world
 echo 20 > "$FIXTURE/free_pct"
 echo 4 > "$FIXTURE/pressure"
 out=$(run_qwen raw --force "hello")
-case "$out" in
-  *"RAN run $MODEL hello"*) pass "--force loads past the guard" ;;
-  *) fail "--force loads past the guard" "$out" ;;
-esac
+if [[ "$out" == *"host memory pressure is elevated"* ]] && [[ "$out" != *"RAN run"* ]]; then
+  pass "--force cannot bypass macOS pressure"
+else
+  fail "--force cannot bypass macOS pressure" "$out"
+fi
 
 reset_world
 touch "$FIXTURE/simulator"
 out=$(run_qwen raw "hello")
 case "$out" in
-  *"iOS Simulator is booted"*) pass "a booted Simulator refuses the load" ;;
-  *) fail "a booted Simulator refuses the load" "$out" ;;
+  *"RAN run $MODEL hello"*) pass "macOS and Ollama own simulator co-residency" ;;
+  *) fail "macOS and Ollama own simulator co-residency" "$out" ;;
 esac
 
 reset_world
@@ -1295,8 +1288,8 @@ echo 1 > "$FIXTURE/state/qwen3.5_4b-64k/resident-bytes"
 echo 20 > "$FIXTURE/free_pct"
 out=$(run_qwen 27b raw hello)
 case "$out" in
-  *"needs ~"*) pass "27B admission does not reuse a smaller 4B measurement" ;;
-  *) fail "resident measurements are model-specific" "$out" ;;
+  *"RAN run qwen3.8:27b-obliterated hello"*) pass "Qwen admission does not use stale measurements" ;;
+  *) fail "Qwen admission does not use stale measurements" "$out" ;;
 esac
 mkdir -p "$FIXTURE/state/qwen3.5_4b-256k"
 echo 1 > "$FIXTURE/state/qwen3.5_4b-256k/resident-bytes"

@@ -352,8 +352,8 @@ plans need a phase-sized excerpt. Missing or invalid plans refuse startup before
 loading a model. Put this launcher option before client options such as `-p`.
 Plan edits after startup require a fresh session or an explicit reread. This mode
 supports the normal/code/agent entry points; it does not change `qwen goal`.
-The memory guard still applies. Persistent context fixes plan eviction; it does
-not guarantee that a model will complete an arbitrary build.
+macOS and Ollama own memory admission. Persistent context fixes plan eviction; it
+does not guarantee that a model will complete an arbitrary build.
 
 Give Qwen a Goal and it keeps working until it proves the goal is met:
 
@@ -1596,60 +1596,18 @@ The lease directory keeps Backdoor's name on purpose. memguard's other readers
 resolve that default path, and renaming it here would quietly stop gating them.
 Move both sides together with `LLMJURY_COMPUTE_LEASE_DIR`.
 
-### Why the guard is not `llmjury preflight`
+### Memory ownership
 
-`llmjury preflight --models qwen3.8:27b-obliterated --num-ctx 32768` refuses on
-this host every time, and it is right to for its own callers. `estimate_resident()`
-is `disk * 1.35 + cells * 85_000`, fitted on 2-9 GB models at f16 KV, so it
-projects 27.5 GB against a 23.4 GiB budget. This server runs
-`OLLAMA_KV_CACHE_TYPE=q8_0` and `LLAMA_ARG_CACHE_RAM=1024`, read off the running
-process rather than the saved plist, so `ollama ps` reports 16.3 GB. Erring high is
-correct when you are asking whether a council may pile on top. It answers nothing
-when you are asking whether the exclusive owner may run at all.
+macOS owns system memory pressure and Ollama owns model residency. The launcher checks
+the native pressure level before starting a session, unloads other models unless
+`--keep-others` is set, and holds the shared compute lock so cooperating local
+clients do not load models at the same time. It does not maintain a second byte
+budget or reject a model because its tag advertises a larger context window.
 
-So the wrapper does its own arithmetic. Before a load it checks:
-
-| Condition | Source | Why |
-|-----------|--------|-----|
-| No booted iOS Simulator | `pgrep` | 17.6 GB of CoreSimulator measured on this host |
-| Memory pressure at level 1 | `kern.memorystatus_vm_pressure_level` | memguard's own refusal condition |
-| Physical headroom covers the load plus 4 GiB | `vm_stat` free + max(file-backed, speculative + purgeable) pages | reserve for the desktop, agent tools, and runner growth |
-| Nothing else resident in Ollama | `/api/ps` | co-residency is what panicked the Mac |
-
-Another resident model gets unloaded rather than tolerated. Pass `--keep-others` to
-leave it alone, or `--force` to load past every check above.
-
-The launcher does not convert `memory_pressure`'s free percentage into bytes.
-That pressure metric can admit a 27B load when physical memory cannot hold it.
-It includes file-backed cache that macOS can reclaim. It takes the larger of
-file-backed pages and speculative + purgeable pages, rather than adding overlapping
-counters. The estimate includes potentially active or dirty file pages, so it is
-not a promise of immediately free RAM; normal pressure and the 4 GiB reserve still
-apply. It excludes the inactive-page total because that can contain anonymous
-memory requiring swap. Compressor and swap capacity do not add to the budget.
-Refusals report estimated headroom before/after the reserve, clamped at zero. Missing physical counters refuse
-the launch. If 27B does not fit, close memory-heavy applications or select the
-smaller model with `QWEN_MODEL=qwen3.5:4b-64k qwen`; overriding the guard with
-`--force` can reproduce the overcommit.
-Attaching to an already-resident model still checks memory pressure, but does
-not charge its loaded weights a second time. This is a launch-time guard, not
-a continuous monitor of other applications or memory allocated by build tools.
-
-The opening estimate is deliberately high, `disk * 1.15 + cells * 45_000` plus the
-1 GiB prompt cache, or about 22.7 GB. Once a load succeeds the wrapper writes what
-`/api/ps` reported into `~/.cache/qwen/<model-key>/resident-bytes` and uses that
-number for the selected model. A 4B measurement cannot lower the 27B admission
-estimate. `QWEN_STATE_DIR` overrides the cache root; each model still gets its
-own subdirectory. Delete the file to re-measure after changing `num_ctx`,
-`OLLAMA_NUM_PARALLEL`, or the KV cache type.
-
-A second `qwen` while the model is already resident costs no new memory, so it
-attaches without taking the lock, publishing a lease, or running the guard.
-
-`ollama run` replaces the wrapper process. That keeps the pid, which keeps the
-lease accurate for exactly as long as the session lives, and it skips the exit
-trap, which leaves the lease file behind. memguard ignores a lease whose pid is
-gone, and the next `qwen` run deletes it.
+`--force` remains accepted for script compatibility, but it does not bypass an
+elevated macOS pressure level. Use Ollama's own settings and `ollama ps` to inspect
+model residency. LLM-Jury's custom preflight is opt-in with `--mem-check refuse`;
+its normal macOS path leaves RAM admission to macOS and Ollama.
 
 ### Agent sessions: `qwen claude` and `qwen codex`
 
