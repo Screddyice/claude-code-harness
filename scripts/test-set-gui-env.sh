@@ -57,6 +57,15 @@ rc=$?
 [ "$rc" = 0 ] && ok "a missing env file exits 0 rather than failing login" || no "missing env file exits 0" "rc=$rc"
 ! grep -q 'setenv CMEM_PRO_TOKEN' "$TMP/rec3" && ok "a missing env file publishes no secret" || no "missing env file publishes no secret" "$(cat "$TMP/rec3")"
 
+cat > "$TMP/.claude.json" <<'JSON'
+{"mcpServers":{"srcos":{"headers":{"Authorization":"Bearer config-token"}}}}
+JSON
+RECORD="$TMP/rec-config" HOME="$TMP" GUI_ENV_SOURCE="$TMP/nope" GUI_ENV_KEYS="NEBOS_OS_BEARER_TOKEN" \
+  bash "$HERE/set-gui-env.sh" >/dev/null 2>&1
+grep -q 'setenv NEBOS_OS_BEARER_TOKEN config-token' "$TMP/rec-config" \
+  && ok "recovers the SRCOS bearer from the authenticated Claude config" \
+  || no "recovers the SRCOS bearer" "$(cat "$TMP/rec-config")"
+
 RECORD="$TMP/rec4" GUI_ENV_SOURCE="$TMP/env" GUI_ENV_KEYS="ABSENT_KEY" bash "$HERE/set-gui-env.sh" >"$TMP/out4" 2>&1
 ! grep -q 'setenv ABSENT_KEY' "$TMP/rec4" && ok "an absent key publishes nothing" || no "absent key publishes nothing" "$(cat "$TMP/rec4")"
 grep -q 'not found' "$TMP/out4" && ok "an absent key says so instead of failing silently" || no "absent key is reported" "$(cat "$TMP/out4")"

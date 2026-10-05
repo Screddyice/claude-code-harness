@@ -1950,8 +1950,10 @@ launchctl getenv CMEM_PRO_TOKEN >/dev/null && echo published
 ```
 
 `GUI_ENV_KEYS` selects which keys to publish (default `CMEM_PRO_TOKEN`) and `GUI_ENV_SOURCE` the
-file to read. **The secret value stays in `~/projects/.env`**: it is never written into the plist,
-and the log records only the key name and a character count. A missing file or a missing key exits
+file to read. A one-line `~/projects/.env` pointer is followed when the generated file is present.
+For `NEBOS_OS_BEARER_TOKEN`, the publisher also uses the existing authenticated SRCOS header in
+`~/.claude.json` when the env source is unavailable. Secret values are never written into the
+plist or log; the log records only the key name and a character count. A missing file or key exits
 0 with a message rather than failing login.
 
 The script also publishes derived, non-secret values. It reads `LLMJURY_OLLAMA_PARALLEL` from

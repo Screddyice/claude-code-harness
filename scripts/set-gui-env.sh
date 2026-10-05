@@ -24,21 +24,45 @@ set -uo pipefail
 ENV_FILE="${GUI_ENV_SOURCE:-$HOME/projects/.env}"
 KEYS="${GUI_ENV_KEYS:-CMEM_PRO_TOKEN}"
 
+read_env_value() {
+  local key="$1" source="$ENV_FILE" value
+  if [ -r "$source" ]; then
+    if [ "$(wc -l <"$source" 2>/dev/null)" = 1 ] && ! grep -q '=' "$source"; then
+      source=$(cat "$source")
+    fi
+    if [ -r "$source" ]; then
+      value=$(grep -m1 "^${key}=" "$source" | cut -d= -f2-)
+      value="${value#\"}"; value="${value%\"}"
+      value="${value#\'}"; value="${value%\'}"
+      [ -n "$value" ] && { printf '%s' "$value"; return; }
+    fi
+  fi
+  if [ "$key" = NEBOS_OS_BEARER_TOKEN ] && [ -r "$HOME/.claude.json" ]; then
+    /opt/homebrew/bin/python3 - "$HOME/.claude.json" <<'PYTHON'
+import json
+import sys
+try:
+    config = json.load(open(sys.argv[1]))
+    header = config["mcpServers"]["srcos"]["headers"]["Authorization"]
+except (OSError, ValueError, KeyError, TypeError):
+    raise SystemExit(0)
+if isinstance(header, str) and header.lower().startswith("bearer "):
+    print(header[7:].strip(), end="")
+PYTHON
+  fi
+}
+
 # Secrets. A missing file skips this block and leaves the derived value below
 # alone, rather than exiting: the two have nothing to do with each other.
-if [ -r "$ENV_FILE" ]; then
-  for key in $KEYS; do
-    value=$(grep -m1 "^${key}=" "$ENV_FILE" | cut -d= -f2- | sed 's/^["'"'"']//; s/["'"'"']$//')
-    if [ -n "$value" ]; then
-      launchctl setenv "$key" "$value"
-      echo "set-gui-env: published $key (${#value} chars) to the GUI domain"
-    else
-      echo "set-gui-env: $key not found in $ENV_FILE" >&2
-    fi
-  done
-else
-  echo "set-gui-env: no $ENV_FILE" >&2
-fi
+for key in $KEYS; do
+  value=$(read_env_value "$key")
+  if [ -n "$value" ]; then
+    launchctl setenv "$key" "$value"
+    echo "set-gui-env: published $key (${#value} chars) to the GUI domain"
+  else
+    echo "set-gui-env: $key not found in $ENV_FILE or ~/.claude.json" >&2
+  fi
+done
 
 # Derived, not secret. Ollama's parallel-decode slots live in the server's own
 # launchd unit, which exports them to the server process and nowhere else. Read
