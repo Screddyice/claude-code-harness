@@ -269,11 +269,26 @@ hook_resolve_pr_base() {
     dev|develop|promote/*|hotfix/*|release/*) return 0 ;;
   esac
 
+  # A squash merge can leave the selected remote trunk ref with the same tree
+  # as this branch while its commit ancestry still differs. Keep that ref so
+  # the duplicate-work guard can see the empty diff before any retargeting.
+  if git diff --quiet "$HOOK_BASE" HEAD 2>/dev/null \
+    && ! git merge-base --is-ancestor "$HOOK_BASE" HEAD 2>/dev/null; then
+    return 0
+  fi
+
   for integration in dev develop; do
     git rev-parse --verify --quiet "origin/$integration" >/dev/null 2>&1 || continue
     [ "$integration" = "$HOOK_BRANCH" ] && continue
     fork_point="$(git merge-base "$HOOK_BASE" HEAD 2>/dev/null || true)"
     [ -n "$fork_point" ] || continue
+    # A branch created from the current trunk keeps that target when the
+    # integration branch has moved ahead. If the integration ref still equals
+    # trunk, the repository policy below remains the useful default.
+    if [ "$fork_point" = "$(git rev-parse "$HOOK_BASE" 2>/dev/null || true)" ] \
+      && [ "$(git rev-list --count "$HOOK_BASE..origin/$integration" 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
+      return 0
+    fi
     git merge-base --is-ancestor "$fork_point" "origin/$integration" 2>/dev/null || continue
     HOOK_BASE="origin/$integration"
     HOOK_BASE_BRANCH="$integration"
