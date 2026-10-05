@@ -1,26 +1,18 @@
-> **claude-mem is back as of 2026-09-04**, and it is the only memory layer on this
-> machine. The 2026-08-02 removal notice that stood here objected to the local worker
-> hijacking a session, which the cloud-sync design does not do. Cognee and Mem0 were
-> retired the same day. See "Memory" below.
+> **claude-mem is the only memory layer on this machine.** See "Memory" below.
 
-# codex-harness
+# claude-code-harness
 
-A starter template for organizing a multi-company [OpenAI Codex CLI](https://github.com/openai/codex)
-workspace.
+This repository carries the Claude Code side of the local agent setup: Claude-facing
+plugin sources, Claude hooks, status tooling, and shared utilities.
 
-This is **not** a fork of Codex itself. It is the thin local layer around Codex:
-sanitized `AGENTS.md` templates, a conservative `~/.codex/config.toml` example,
-per-repo `.codex-harness/` scaffolding, and a local Codex plugin marketplace stub.
-
-The repo was adapted from a Claude Code harness. The Claude-specific surfaces
-(`~/.claude/settings.json`, hooks, status lines, and `CLAUDE.md`) are mapped to
-Codex-native concepts. A staged migration can keep `CLAUDE.md` as a configured
-fallback until each repo has an adapted `AGENTS.md`.
+Codex has a separate source of truth in [`Screddyice/codex-harness`](https://github.com/Screddyice/codex-harness).
+Keep Codex configuration and Codex plugin manifests there. This repository does not
+install or register Codex plugins.
 
 ## What's Inside
 
 ```
-codex-harness/
+claude-code-harness/
 ├── examples/
 │   ├── AGENTS.md.workspace.example   # ~/projects/AGENTS.md template
 │   ├── AGENTS.md.project.example     # per-repo AGENTS.md starter
@@ -47,8 +39,7 @@ codex-harness/
 │   ├── kernel-zone-watchdog.sh       # catches a kernel zone-map leak before it panics the Mac
 │   ├── test-kernel-zone-watchdog.sh  # watchdog unit tests (parsing, thresholds, snapshots)
 │   └── codex-workspace-summary.sh    # quick local sanity summary
-└── marketplace/
-    └── example-local/                # Codex local plugin marketplace example
+└── holyclaude-cloud/                 # vendored Claude plugin source
 ```
 
 ## Where an auto-opened PR is aimed
@@ -190,7 +181,7 @@ while sharing one Codex setup.
 | `~/.claude/settings.json` | `~/.codex/config.toml` plus CLI commands |
 | SessionStart hook | Codex `SessionStart` hook in `hooks.json`, explicit initializer, or a shell wrapper |
 | Claude status line | No direct Codex equivalent; use `scripts/codex-workspace-summary.sh` |
-| Claude plugin marketplace | `.agents/plugins/marketplace.json` and `codex plugin marketplace add` |
+| Claude plugin source | `holyclaude-cloud/.claude-plugin/plugin.json` and Claude Code plugin installation |
 | Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
 
 ## Standalone local Qwen agent
@@ -687,33 +678,18 @@ decision, a backup of the current script, a passing fixture run, `bash -n`, and 
 
 ```bash
 # 1. Clone this repo
-git clone https://github.com/Screddyice/claude-code-harness.git codex-harness
-cd codex-harness
+git clone https://github.com/Screddyice/claude-code-harness.git
+cd claude-code-harness
 
-# 2. Back up your Codex config, then install the example
-cp ~/.codex/config.toml ~/.codex/config.toml.backup 2>/dev/null || true
-cp examples/config.toml.example ~/.codex/config.toml
+# Check the repository and installed Claude plugin boundary.
+scripts/audit-claude-harness.sh --installed
+scripts/verify.sh
 
-# 3. Install the workspace AGENTS.md template
-cp examples/AGENTS.md.workspace.example ~/projects/AGENTS.md
-# Edit ~/projects/AGENTS.md for your orgs, credentials policy, and infrastructure.
+# Run the local Claude plugin tests before making an installation change.
+scripts/test-statusline.sh
+scripts/test-shared-hooks.sh
 
-# 4. Initialize a repo-level harness where you want local memory/state scaffolding
-scripts/init-codex-harness.sh ~/projects/my-org/my-repo
-
-# 5. Optional: wire Codex hooks after editing paths in examples/hooks.json.example
-cp examples/hooks.json.example ~/.codex/hooks.json
-
-# 6. Add a local Codex plugin marketplace, if you use in-house plugins
-codex plugin marketplace add "$(pwd)/marketplace/example-local"
-
-# 7. Optional: install bidirectional Claude/Codex orchestration (requires LLM-Jury)
-scripts/install-llmjury-orchestration.sh
-
-# 8. Audit the whole workspace; this command is read-only.
-scripts/audit-codex-migration.sh ~/projects
-
-# 9. Optional: replace Claude Code's deadline-bound native updater on slow links.
+# Optional: replace Claude Code's deadline-bound native updater on slow links.
 scripts/install-claude-resilient-updater.sh
 ```
 
@@ -737,37 +713,11 @@ Run a read-only channel and checksum check at any time:
 Logs are stored in `~/.local/state/claude-resilient-updater/update.log`. Existing
 versions remain under `~/.local/share/claude/versions` for manual rollback.
 
-## Optional LLM-Jury Orchestration
+## Client boundary
 
-When `llmjury` is installed, the harness can make Claude Code and Codex cooperate from
-either starting point:
-
-```text
-Claude session → Claude plans → Codex executes ─┐
-                                                ├→ verify → finish
-Codex session  → Claude plans ← Codex requests ─┘    │
-                         ↑                           │ new evidence
-                         └──── dynamic replan ───────┘
-
-Testable Python unit → local Ollama council → independent verifier → integrate
-```
-
-Run the idempotent installer:
-
-```bash
-scripts/install-llmjury-orchestration.sh
-```
-
-It calls `llmjury install-claude` and `llmjury install-codex`, then verifies both
-skill files. On non-trivial work, the Codex skill requests a read-only structured
-Claude plan before execution and asks Claude to replan when tests or repository
-evidence invalidate the plan. The Claude skill delegates bounded implementation to a
-workspace-confined Codex agent. Local models remain limited to code units with a real
-oracle; the verifier, not a vote, determines whether their output can be integrated.
-
-This integration is optional: the harness works without LLM-Jury. Restart both Claude
-Code and Codex after first installation so their skill catalogs refresh. Use `--force`
-only to replace locally modified installed copies.
+Claude plugin sources stay in this repository. Codex configuration, Codex hooks, and
+Codex plugin marketplaces live in [`codex-harness`](https://github.com/Screddyice/codex-harness).
+Use that repository when a task needs a Codex plugin or Codex-specific installation.
 
 ## Swarm — Cross-CLI Parallel Agent Dispatch
 

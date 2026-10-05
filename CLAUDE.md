@@ -1,57 +1,17 @@
 # claude-code-harness
 
-## What this is
+This repository is the Claude Code side of the local agent setup. It carries the
+Claude-facing plugin sources, Claude hooks, status tooling, and shared utilities.
 
-The shared harness for Shawn's Claude Code and Codex sessions: the hook
-implementations both hosts register, the operational scripts around them, and an
-example plugin marketplace.
+Codex has a separate source of truth at
+[`Screddyice/codex-harness`](https://github.com/Screddyice/codex-harness). Keep Codex
+configuration, Codex plugin manifests, and Codex-only installers there. This repo
+must not install or register Codex plugins.
 
-**This repo is where the hooks actually live.** `~/.claude/settings.json` and
-`~/.codex/hooks.json` register these paths directly, and the same-named files under
-`~/.claude/scripts/` are one-line compat wrappers that `exec` into here. Edit the
-implementation in this repo, never the wrapper.
+`holyclaude-cloud/` is a vendored Claude plugin source. Make upstream changes in
+`Screddyice/holyclaude-cloud` and re-vendor them here. `hermes/plugins/cmem/` is the
+ClaudeMem provider source used by Hermes hosts. The machine-level ClaudeMem plugin
+is managed by ClaudeMem itself.
 
-> claude-mem came back on 2026-09-04 and is now the only memory layer. The earlier
-> removal (2026-08-02) objected to the local worker on `:37701` hijacking a session,
-> which the cloud-sync design does not do. Cognee and Mem0 were retired the same day.
-
-## Stack
-
-Bash and Python. No `package.json`, no build step, and no npm anything — earlier
-versions of this file listed `npm run build` / `npm run lint` / `npm test`, none of
-which exist.
-
-## Hooks it provides
-
-| Hook | Event | Behavior |
-|---|---|---|
-| `scripts/hooks/auto-pr-push.sh` | PostToolUse (both hosts) | Pushes and opens a draft PR on the first commit, for owned orgs only (`teamnebula-ai`, `Screddyice`) |
-| `scripts/hooks/enforce-pr-claude.sh` | Stop (Claude) | Blocks the stop once when a branch has commits but no PR; emits `{decision,reason}` |
-| `scripts/hooks/enforce-pr-codex.sh` | Stop (Codex) | Same rule, emitting Codex's `{continue,stopReason,systemMessage}` contract |
-| `scripts/hooks/local-diff-review.sh` | Stop (Claude) | Local qwen review of the branch diff. Gated on `LOCAL_REVIEW`, which defaults to `1`. Shawn dropped the `0` override from `~/.claude/settings.json` on 2026-09-07, so the reviewer runs again |
-| `scripts/hooks/local-diff-review-codex.sh` | Stop (Codex) | The Codex copy of the same reviewer |
-| `scripts/hooks/harness-guard-patch.sh` | SessionStart (Claude) | Reapplies a fix to the claude-harness plugin's PreToolUse guard, which denied `git rm --cached` and any file merely mentioning the delete phrase. No-op once patched |
-
-## Commands
-
-```bash
-bash -n scripts/hooks/<hook>.sh          # syntax check before registering
-./scripts/test-auto-pr-push-base.sh      # auto-pr-push base-branch behavior
-./scripts/test-auto-pr-push-merged-guard.sh
-./scripts/test-auto-pr-push-elsewhere-guard.sh
-```
-
-A hook that exits non-zero blocks the tool call that triggered it, so run the syntax
-check before you register anything.
-
-## Rules that apply here
-
-Machine hard rules: `~/.claude/CLAUDE.md`. Workspace rules: `~/projects/CLAUDE.md`
-and `~/projects/AGENTS.md`. Org identity comes from the git `origin` remote.
-
-Durable facts go to **claude-mem** (cmem.ai), the only memory on this machine since
-2026-09-04. Search it before re-deriving a past decision. A local worker captures the
-writes and the `cmem` MCP reads across hosts. The `.claude-harness/memory/` tree in this
-repo is scaffolding, not a live memory layer.
-
-Every branch gets a PR, and every PR updates this repo's README.
+The harness has no Node build. Use the shell and Python checks in `AGENTS.md` and
+`README.md`; do not invent an npm build step.
