@@ -89,8 +89,20 @@ LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
 STALE_SESSION_SECONDS="${QWEN_STALE_SESSION_SECONDS:-1800}"
 MODEL_KEY="$(printf '%s' "$MODEL" | tr -c '[:alnum:]_.-' '_')"
 MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/$MODEL_KEY/resident-bytes"
-# Match the selected tag's baked context when estimating KV memory and telling
-# Claude Code its window. Smaller tags keep the previous 32K default.
+# Ollama applies its server context cap to every runner. The model metadata can
+# advertise a larger window than the active service allows, so read the launchd
+# environment for admission arithmetic. The client still keeps the model's baked
+# window for prompt accounting and UI configuration.
+server_context() {
+  local configured
+  configured=$(launchctl print "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null |
+    awk '$1 == "OLLAMA_CONTEXT_LENGTH" && $2 == "=>" { print $3; exit }') || true
+  case "$configured" in
+    ''|*[!0-9]*) printf '%s\n' 32768 ;;
+    *) printf '%s\n' "$configured" ;;
+  esac
+}
+
 model_context_for() {
   case "$1" in
     qwen3.5:4b-256k) printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-262144}" ;;
@@ -98,6 +110,7 @@ model_context_for() {
   esac
 }
 model_context() { model_context_for "$MODEL"; }
+admission_context() { printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-$(server_context)}"; }
 AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.screddy.ollama}"
 # Claude Code refuses any model id outside its compiled catalog, whatever
 # ANTHROPIC_BASE_URL points at, so the local weights are served under a catalog id.
@@ -343,7 +356,7 @@ need_bytes() {
   disk=$(disk_bytes) || true
   [ -n "${disk:-}" ] || return 1
   slots="${LLMJURY_OLLAMA_PARALLEL:-${OLLAMA_NUM_PARALLEL:-2}}"
-  ctx=$(model_context)
+  ctx=$(admission_context)
   cells=$(( ctx * slots ))
   # weights ~ disk * 1.15, and ~45 KB per KV cell at q8_0 (about half of f16).
   printf '%s\n' $(( disk * 115 / 100 + cells * 45000 + PROMPT_CACHE_MIB * 1024 * 1024 ))

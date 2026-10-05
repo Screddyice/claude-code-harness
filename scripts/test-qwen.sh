@@ -123,6 +123,9 @@ EOF
 
 cat > "$STUB/launchctl" <<'EOF'
 #!/bin/bash
+if [ -f "$FIXTURE/server-context" ]; then
+  printf 'OLLAMA_CONTEXT_LENGTH => %s\n' "$(cat "$FIXTURE/server-context")"
+fi
 exit 0
 EOF
 
@@ -415,6 +418,16 @@ if [ "$status" -ne 0 ] && [ ! -e "$FIXTURE/qwen-code.argv" ] && [[ "$out" == *"n
   pass "high pressure percentage cannot admit a physically overcommitted agent"
 else
   fail "physical memory must gate the agent before launch" "$out"
+fi
+
+reset_world
+echo 32768 > "$FIXTURE/server-context"
+echo 50 > "$FIXTURE/free_pct"
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-256k run_qwen raw "hello")
+if [[ "$out" == *"RAN run qwen3.5:4b-256k hello"* ]]; then
+  pass "admission uses Ollama's active context cap instead of the model metadata window"
+else
+  fail "active Ollama context cap must control the memory estimate" "$out"
 fi
 
 reset_world
