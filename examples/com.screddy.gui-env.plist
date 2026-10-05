@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/screddy/.claude/scripts/set-gui-env.sh</string>
+        <string>/Users/screddy/projects/SRC/claude-code-harness/scripts/set-gui-env.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
