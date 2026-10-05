@@ -275,10 +275,9 @@ check_pressure() {
   [ "$level" = 1 ] || die "host memory pressure is elevated or unknown (level $level); free memory first"
 }
 
-# Record what it actually cost, so the next run stops guessing. Runs detached,
-# because the model is still loading when the session starts — and with fd 9
-# closed, because inheriting the compute lock would leave this poller holding it
-# for two minutes after the user has already quit.
+# Record the resident size for `qwen status`. Runs detached because the model is
+# still loading when the session starts, and closes fd 9 so the poller cannot keep
+# the compute lock after the user quits.
 record_resident() {
   ( for _ in $(seq 1 60); do
       size=$(resident_bytes 2>/dev/null || true)
