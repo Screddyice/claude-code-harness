@@ -226,6 +226,12 @@ may refuse a session when the Mac lacks headroom. An explicit `27b` selector
 keeps its 32K client window and overrides `QWEN_MODEL`.
 `QWEN_CODE_BIN` overrides the installed executable path.
 
+Admission follows the active Ollama service limit. On macOS the launcher reads
+`OLLAMA_CONTEXT_LENGTH` from the `com.screddy.ollama` launchd job, so a model tag
+that advertises a 256K window does not get charged for 256K when the server caps
+the runner at 32K. `OLLAMA_CONTEXT_LENGTH` in the client environment remains an
+explicit override.
+
 The same file keeps Qwen Code's startup prompt near 11K tokens. With stock
 settings a session in `~` opened at 21,895 tokens of a 32,768-token window, so
 compaction fired on the first tool result and the model lost track of commands
