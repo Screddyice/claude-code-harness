@@ -1596,7 +1596,31 @@ The lease directory keeps Backdoor's name on purpose. memguard's other readers
 resolve that default path, and renaming it here would quietly stop gating them.
 Move both sides together with `LLMJURY_COMPUTE_LEASE_DIR`.
 
-### Memory ownership
+### Smaller local jury council
+
+For a 36 GiB Mac, `scripts/install-local-council.py` installs host-local jury
+defaults: Qwen3.5 4B + Phi-4 Mini 3.8B, 8192 context, and verifier-gated
+authenticated Codex fallback. It wraps the `llmjury` and `jury` symlinks while
+keeping their pipx executables. Only local Ollama `solve` calls receive these
+defaults; explicit models, context, frontier and memory-check options still work.
+
+```bash
+python3 scripts/install-local-council.py
+python3 scripts/test-local-council.py
+```
+
+The model files total about 5.5 GiB, compared with 12.2 GiB for Gemma 12B + Llama
+8B. Runtime memory also includes KV and prompt caches. This installer changes
+no memory policy or service configuration; macOS and Ollama retain their existing
+controls. Smaller models may need Codex fallback more often.
+
+Original executable paths live in `~/.config/llmjury/local-council.json`. To undo
+the defaults, restore each `llmjury`/`jury` symlink to its saved path.
+The installer serializes updates and replaces staged files atomically, keeping
+working aliases usable after a failed write. It rejects unrelated wrapper files
+and invalid saved executable paths before replacing anything.
+
+### Local-model memory ownership
 
 macOS owns system memory pressure and Ollama owns model residency. The launcher checks
 the native pressure level before starting a session, unloads other models unless
