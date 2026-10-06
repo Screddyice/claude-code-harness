@@ -66,7 +66,7 @@ def install(wrapper, config):
         try:
             for name in clients:
                 (Path(binary_stage) / name).replace(wrapper.parent / name)
-        except OSError:
+        except (OSError, KeyboardInterrupt):
             if not wrapper_existed and not any(
                 (wrapper.parent / name).is_symlink() and (wrapper.parent / name).resolve() == wrapper.resolve()
                 for name in clients

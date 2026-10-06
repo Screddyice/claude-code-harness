@@ -91,20 +91,21 @@ class CouncilTests(unittest.TestCase):
                 self.assertEqual((binary / "llmjury").resolve(), original.resolve())
 
     def test_failed_first_alias_publish_can_be_retried(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            binary, original, config = self.make_installation(Path(temporary))
-            wrapper = binary / "local-council"
-            real_replace = Path.replace
-            def failed_alias(path, target):
-                if Path(target) == binary / "llmjury":
-                    raise OSError("alias publish failed")
-                return real_replace(path, target)
-            with mock.patch.object(Path, "replace", failed_alias), self.assertRaises(OSError):
+        for error in (OSError, KeyboardInterrupt):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temporary:
+                binary, original, config = self.make_installation(Path(temporary))
+                wrapper = binary / "local-council"
+                real_replace = Path.replace
+                def failed_alias(path, target):
+                    if Path(target) == binary / "llmjury":
+                        raise error("alias publish failed")
+                    return real_replace(path, target)
+                with mock.patch.object(Path, "replace", failed_alias), self.assertRaises(error):
+                    installer.install(wrapper, config)
+                self.assertFalse(wrapper.exists())
+                self.assertEqual((binary / "llmjury").resolve(), original.resolve())
                 installer.install(wrapper, config)
-            self.assertFalse(wrapper.exists())
-            self.assertEqual((binary / "llmjury").resolve(), original.resolve())
-            installer.install(wrapper, config)
-            self.assertEqual((binary / "llmjury").resolve(), wrapper.resolve())
+                self.assertEqual((binary / "llmjury").resolve(), wrapper.resolve())
 
     def test_smaller_defaults_and_codex_fallback(self):
         args = council.optimized_options(["solve", "--backend", "ollama"])
