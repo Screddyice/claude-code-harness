@@ -8,13 +8,104 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("council", Path(__file__).with_name("local-council.py"))
 council = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(council)
+installer_spec = importlib.util.spec_from_file_location("installer", Path(__file__).with_name("install-local-council.py"))
+installer = importlib.util.module_from_spec(installer_spec)
+installer_spec.loader.exec_module(installer)
 
 
 class CouncilTests(unittest.TestCase):
+    def make_installation(self, home):
+        binary = home / ".local/bin"
+        binary.mkdir(parents=True)
+        original = home / "original-cli"
+        original.write_text("#!" + sys.executable + "\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+        original.chmod(0o755)
+        for name in ("llmjury", "jury"):
+            (binary / name).symlink_to(original)
+        config = home / ".config/llmjury/local-council.json"
+        config.parent.mkdir(parents=True)
+        return binary, original, config
+
+    def test_colliding_wrapper_preserves_unrelated_tool(self):
+        for symlink in (True, False):
+            with self.subTest(symlink=symlink), tempfile.TemporaryDirectory() as temporary:
+                binary, original, config = self.make_installation(Path(temporary))
+                wrapper = binary / "local-council"
+                unrelated = binary / "unrelated-tool" if symlink else wrapper
+                unrelated.write_text("unrelated tool\n")
+                unrelated.chmod(0o700)
+                if symlink:
+                    wrapper.symlink_to(unrelated)
+                with self.assertRaises(SystemExit):
+                    installer.install(wrapper, config)
+                self.assertEqual(unrelated.read_text(), "unrelated tool\n")
+                self.assertEqual(unrelated.stat().st_mode & 0o777, 0o700)
+                self.assertFalse(config.exists())
+                self.assertEqual((binary / "llmjury").resolve(), original.resolve())
+
+    def test_failed_reinstall_keeps_both_aliases_working(self):
+        for failure in ("copy", "config", "publish"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                binary, original, config = self.make_installation(home)
+                wrapper = binary / "local-council"
+                installer.install(wrapper, config)
+                before = (wrapper.read_bytes(), config.read_bytes())
+                real_write, real_replace = Path.write_text, Path.replace
+                def failed_copy(source, target):
+                    Path(target).write_text("invalid partial Python")
+                    raise OSError(28, "disk full")
+                def failed_write(path, *args, **kwargs):
+                    real_write(path, "partial")
+                    raise OSError(28, "disk full")
+                def failed_replace(path, target):
+                    if Path(target) == wrapper:
+                        raise OSError("wrapper publish failed")
+                    return real_replace(path, target)
+                patch = {"copy": mock.patch.object(installer.shutil, "copyfile", failed_copy),
+                         "config": mock.patch.object(Path, "write_text", failed_write),
+                         "publish": mock.patch.object(Path, "replace", failed_replace)}[failure]
+                with patch, self.assertRaises(OSError):
+                    installer.install(wrapper, config)
+                self.assertEqual((wrapper.read_bytes(), config.read_bytes()), before)
+                for name in ("llmjury", "jury"):
+                    result = subprocess.run([str(binary / name), "--version"], env={**os.environ, "HOME": str(home)}, capture_output=True, text=True, check=True)
+                    self.assertEqual(json.loads(result.stdout), ["--version"])
+
+    def test_invalid_saved_originals_are_rejected_without_changes(self):
+        for saved in ({"jury": "/missing-original"}, {"../outside": "/missing-original"}, {"jury": None}, []):
+            with self.subTest(saved=saved), tempfile.TemporaryDirectory() as temporary:
+                binary, original, config = self.make_installation(Path(temporary))
+                (binary / "jury").unlink()
+                config.write_text(json.dumps(saved))
+                before = config.read_bytes()
+                with self.assertRaises(SystemExit):
+                    installer.install(binary / "local-council", config)
+                self.assertEqual(config.read_bytes(), before)
+                self.assertFalse((binary / "local-council").exists())
+                self.assertEqual((binary / "llmjury").resolve(), original.resolve())
+
+    def test_failed_first_alias_publish_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            binary, original, config = self.make_installation(Path(temporary))
+            wrapper = binary / "local-council"
+            real_replace = Path.replace
+            def failed_alias(path, target):
+                if Path(target) == binary / "llmjury":
+                    raise OSError("alias publish failed")
+                return real_replace(path, target)
+            with mock.patch.object(Path, "replace", failed_alias), self.assertRaises(OSError):
+                installer.install(wrapper, config)
+            self.assertFalse(wrapper.exists())
+            self.assertEqual((binary / "llmjury").resolve(), original.resolve())
+            installer.install(wrapper, config)
+            self.assertEqual((binary / "llmjury").resolve(), wrapper.resolve())
+
     def test_smaller_defaults_and_codex_fallback(self):
         args = council.optimized_options(["solve", "--backend", "ollama"])
         self.assertEqual(args[args.index("--models") + 1], "qwen3.5:4b,phi4-mini:3.8b")

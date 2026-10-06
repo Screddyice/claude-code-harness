@@ -1616,6 +1616,9 @@ controls. Smaller models may need Codex fallback more often.
 
 Original executable paths live in `~/.config/llmjury/local-council.json`. To undo
 the defaults, restore each `llmjury`/`jury` symlink to its saved path.
+The installer serializes updates and replaces staged files atomically, keeping
+working aliases usable after a failed write. It rejects unrelated wrapper files
+and invalid saved executable paths before replacing anything.
 
 ### Local-model memory ownership
 
