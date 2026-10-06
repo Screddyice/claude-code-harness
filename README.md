@@ -1596,7 +1596,36 @@ The lease directory keeps Backdoor's name on purpose. memguard's other readers
 resolve that default path, and renaming it here would quietly stop gating them.
 Move both sides together with `LLMJURY_COMPUTE_LEASE_DIR`.
 
-### Memory ownership
+### macOS RAM guard at 94%
+
+The independent RAM guard samples physical memory every five seconds and alerts
+when usage reaches 94%. It clears the alert below 90% to avoid repeated alerts
+near the limit. It records the latest reading and executable names of the largest
+processes in `~/.local/state/ram-guard/`; it does not stop processes or unload models.
+
+Choose the metric that matches your RAM display: `occupied` counts RAM outside
+free and speculative pages, including reclaimable file cache. `memory-used` uses
+[Stats' RAM formula](https://github.com/exelban/stats/blob/v3.0.19/Modules/RAM/readers.swift):
+active + inactive + speculative + wired + physical compressor, minus purgeable
+and file-backed pages. The monitor reports both percentages so you can compare them.
+
+```bash
+python3 scripts/install-ram-guard.py --mode block --metric memory-used
+python3 ~/.local/bin/ram-guard status
+python3 scripts/test-ram-guard.py
+```
+
+`--mode block` also enables `python3 ~/.local/bin/ram-guard check` as an admission
+gate: exit 2 means refuse new local work. It reads RAM afresh and refuses work if
+the probe fails. Clients must invoke this gate before starting work; the monitor
+alone cannot stop an application from allocating RAM. Existing native macOS and
+Ollama safety controls still apply.
+
+Disable this monitor with
+`launchctl bootout gui/$(id -u)/com.screddy.ram-guard`. The installer controls only
+this monitor's LaunchAgent and does not change Ollama or Backdoor services.
+
+### Local-model memory ownership
 
 macOS owns system memory pressure and Ollama owns model residency. The launcher checks
 the native pressure level before starting a session, unloads other models unless
