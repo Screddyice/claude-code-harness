@@ -1598,32 +1598,37 @@ Move both sides together with `LLMJURY_COMPUTE_LEASE_DIR`.
 
 ### macOS RAM guard at 94%
 
-The independent RAM guard samples physical memory every five seconds and alerts
-when usage reaches 94%. It clears the alert below 90% to avoid repeated alerts
-near the limit. It records the latest reading and executable names of the largest
-processes in `~/.local/state/ram-guard/`; it does not stop processes or unload models.
+The RAM guard samples every two seconds, blocks new local AI work at 94%, and
+reopens admission below 90%. With `--emergency-stop`, it stops owned Ollama model
+runners at 95%: TERM, then KILL after one second if the same process survives.
+It verifies executable, UID, parent and start time before signalling, and leaves
+the Ollama server, router and other applications running. Emergency stops run
+once per pressure episode and rearm below 90%.
 
-Choose the metric that matches your RAM display: `occupied` counts RAM outside
-free and speculative pages, including reclaimable file cache. `memory-used` uses
-[Stats' RAM formula](https://github.com/exelban/stats/blob/v3.0.19/Modules/RAM/readers.swift):
-active + inactive + speculative + wired + physical compressor, minus purgeable
-and file-backed pages. The monitor reports both percentages so you can compare them.
+`memory-used` matches [Stats' RAM formula](https://github.com/exelban/stats/blob/v3.0.19/Modules/RAM/readers.swift),
+excluding reclaimable file cache. `occupied` includes that cache. Status and
+process snapshots live in `~/.local/state/ram-guard/`; logs rotate at 256 KiB.
 
 ```bash
-python3 scripts/install-ram-guard.py --mode block --metric memory-used
+python3 scripts/install-ram-guard.py --mode block --metric memory-used --emergency-stop
 python3 ~/.local/bin/ram-guard status
 python3 scripts/test-ram-guard.py
 ```
 
-`--mode block` also enables `python3 ~/.local/bin/ram-guard check` as an admission
-gate: exit 2 means refuse new local work. It reads RAM afresh and refuses work if
-the probe fails. Clients must invoke this gate before starting work; the monitor
-alone cannot stop an application from allocating RAM. Existing native macOS and
-Ollama safety controls still apply.
+The installer wraps the `qwen`, `llmjury` and `jury` symlinks, preserving their
+original executables. `ram-guard check` probes RAM afresh; exit 2 refuses local
+work, including on probe failure. Local jury `solve` calls default to
+`qwen3.5:4b,phi4-mini:3.8b`, 8192 context, enforced `--mem-check refuse`, and
+verifier-gated authenticated Codex fallback. Explicit model/context choices still
+work. Remote-only calls and help pass through.
 
-Disable this monitor with
-`launchctl bootout gui/$(id -u)/com.screddy.ram-guard`. The installer controls only
-this monitor's LaunchAgent and does not change Ollama or Backdoor services.
+Direct Ollama/pipx calls bypass client admission. macOS manages swap; this guard
+cannot cap other apps' RAM or guarantee recovery from a kernel failure.
+
+Stop monitoring with `launchctl bootout gui/$(id -u)/com.screddy.ram-guard`.
+Admission continues when monitoring stops. Reinstall with `--mode alert --metric
+memory-used` to disable blocking and emergency stops. The installer changes only
+this monitor's LaunchAgent, not Ollama or Backdoor services.
 
 ### Local-model memory ownership
 
@@ -1635,8 +1640,8 @@ budget or reject a model because its tag advertises a larger context window.
 
 `--force` remains accepted for script compatibility, but it does not bypass an
 elevated macOS pressure level. Use Ollama's own settings and `ollama ps` to inspect
-model residency. LLM-Jury's custom preflight is opt-in with `--mem-check refuse`;
-its normal macOS path leaves RAM admission to macOS and Ollama.
+model residency. The installed RAM guard enables LLM-Jury's `--mem-check refuse`
+preflight; the package's unwrapped macOS default leaves admission to macOS and Ollama.
 
 ### Agent sessions: `qwen claude` and `qwen codex`
 

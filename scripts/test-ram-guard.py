@@ -2,6 +2,7 @@
 """Offline guard boundaries, cache accounting, hysteresis and probe failures."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,6 +12,9 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("ram_guard", Path(__file__).with_name("ram-guard.py"))
 guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
+client_spec = importlib.util.spec_from_file_location("ram_client", Path(__file__).with_name("ram-guard-client.py"))
+client = importlib.util.module_from_spec(client_spec)
+client_spec.loader.exec_module(client)
 
 
 def snapshot(free=5, speculative=1, anonymous=30, purgeable=2, wired=10, compressed=5, page=16384):
@@ -21,6 +25,64 @@ def snapshot(free=5, speculative=1, anonymous=30, purgeable=2, wired=10, compres
 
 
 class GuardTests(unittest.TestCase):
+    def test_jury_defaults_are_small_and_verified(self):
+        local, result = client.local_options(["solve", "--backend", "ollama", "--mem-check", "off"])
+        self.assertTrue(local)
+        self.assertEqual(result[result.index("--models") + 1], "qwen3.5:4b,phi4-mini:3.8b")
+        self.assertEqual(result[result.index("--num-ctx") + 1], "8192")
+        self.assertEqual(result[-2:], ["--frontier-backend", "codex"])
+        self.assertEqual(result[result.index("--mem-check", 5) + 1], "refuse")
+        self.assertFalse(client.local_options(["solve", "--backend", "codex"])[0])
+        self.assertFalse(client.local_options(["preflight", "--models", "qwen"])[0])
+        self.assertFalse(client.local_options(["solve", "--backend", "ollama", "--help"])[0])
+
+    def test_explicit_model_and_context_are_preserved(self):
+        _, result = client.local_options(["solve", "--backend=ollama", "--models=chosen", "--num-ctx", "4096"])
+        self.assertNotIn("--models", result)
+        self.assertEqual(result.count("--num-ctx"), 1)
+
+    def test_qwen_wrapper_gates_default_and_27b(self):
+        for args in ([], ["raw", "hello"], ["27b", "code"]):
+            self.assertTrue(client.local_options(args, "qwen")[0])
+        for args in (["status"], ["27b", "stop"], ["--help"], ["code", "--help"]):
+            self.assertFalse(client.local_options(args, "qwen")[0])
+
+    def test_only_owned_ollama_runner_with_ollama_parent_matches(self):
+        binary = Path("/opt/test/ollama")
+        good = f"{os.getuid()} 100 Tue Oct 6 15:00:00 2026 /opt/test/ollama runner --model x"
+        parent = f"{os.getuid()} /opt/test/ollama serve"
+        for command, parent_command, allowed in ((good, parent, True),
+                (good.replace(" runner ", " serve "), parent, False),
+                (good.replace("/opt/test/ollama", "/opt/test/router"), parent, False),
+                (good, parent.replace("/opt/test/ollama", "/opt/test/router"), False),
+                (good.replace(str(os.getuid()), str(os.getuid() + 1), 1), parent, False)):
+            with self.subTest(command=command, parent=parent_command), patch.object(guard.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, command), subprocess.CompletedProcess([], 0, parent_command)]):
+                self.assertEqual(bool(guard.runner_identity(200, binary)), allowed)
+
+    def test_emergency_rechecks_identity_before_kill(self):
+        with patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "200\n")), patch.object(guard, "runner_identity", side_effect=[("runner",), ("runner",), None, None]), patch.object(guard.os, "kill") as kill, patch.object(guard.time, "sleep"):
+            receipt = guard.emergency_stop({"ollama_binary": "/opt/test/ollama"})
+            self.assertEqual(kill.call_count, 1)
+            self.assertEqual(receipt["terminated_pids"], [200])
+            self.assertFalse(receipt["killed_pids"])
+        with patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "200\n")), patch.object(guard, "runner_identity", return_value=("runner",)), patch.object(guard.os, "kill") as kill, patch.object(guard.time, "sleep"):
+            receipt = guard.emergency_stop({"ollama_binary": "/opt/test/ollama"})
+            self.assertEqual([call.args[1] for call in kill.call_args_list], [guard.signal.SIGTERM, guard.signal.SIGKILL])
+            self.assertEqual(receipt["remaining_runner_pids"], [200])
+
+    def test_emergency_only_at_95_and_once_per_episode(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(guard, "emergency_stop", return_value={"terminated_pids": [200]}) as stop, patch.object(guard, "notify"), patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "PID RSS COMM\n")):
+            directory = Path(temporary)
+            config = {"mode": "block", "metric": "memory-used", "emergency_stop": True}
+            for usage in (94, 95, 96, 93, 95):
+                with patch.object(guard, "probe", return_value={"used_bytes": usage, "total_bytes": 100, "usage_percent": usage}):
+                    guard.sample(directory, config, alert=False)
+                self.assertEqual(stop.call_count, 0 if usage == 94 else 1)
+            for usage in (89, 95):
+                with patch.object(guard, "probe", return_value={"used_bytes": usage, "total_bytes": 100, "usage_percent": usage}):
+                    guard.sample(directory, config, alert=False)
+            self.assertEqual(stop.call_count, 2)
+
     def test_trigger_exact_boundary(self):
         self.assertFalse(guard.transition(False, 9399, 10000))
         self.assertTrue(guard.transition(False, 9400, 10000))

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""macOS RAM threshold monitor; does not signal or unload any process."""
+"""macOS RAM admission guard with optional Ollama-runner emergency stop."""
 import argparse
+import fcntl
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import shlex
+import signal
 import subprocess
 import time
 
 TRIGGER = 94
 RECOVERY = 90
+EMERGENCY = 95
+INTERVAL = 2
 STATE_DIR = Path.home() / ".local/state/ram-guard"
 
 
@@ -81,9 +86,67 @@ def notify(message):
         logging.exception("desktop notification failed")
 
 
+def runner_identity(pid, binary):
+    """Pin UID, parent, start time and argv; only the configured Ollama runner."""
+    try:
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "uid=", "-o", "ppid=",
+                                 "-o", "lstart=", "-o", "command="],
+                                capture_output=True, text=True, check=True, timeout=2)
+        parts = result.stdout.split(None, 7)
+        if len(parts) != 8 or int(parts[0]) != os.getuid():
+            return None
+        argv = shlex.split(parts[7])
+        if len(argv) < 2 or argv[1] != "runner" or Path(argv[0]).resolve() != binary:
+            return None
+        parent = subprocess.run(["/bin/ps", "-p", parts[1], "-o", "uid=", "-o", "command="],
+                                capture_output=True, text=True, check=True, timeout=2).stdout.split(None, 1)
+        parent_argv = shlex.split(parent[1])
+        if int(parent[0]) != os.getuid() or len(parent_argv) < 2 or parent_argv[1] != "serve" or Path(parent_argv[0]).resolve() != binary:
+            return None
+        return tuple(parts)
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def emergency_stop(config):
+    """Stop verified model runners, leaving the Ollama server and router alone."""
+    binary = Path(config["ollama_binary"]).resolve()
+    result = subprocess.run(["/usr/bin/pgrep", "-u", str(os.getuid()), "-f", r"^/[^ ]*/ollama runner( |$)"],
+                            capture_output=True, text=True, timeout=2)
+    if result.returncode not in (0, 1):
+        raise RuntimeError("cannot enumerate Ollama runners")
+    identities = {int(raw): runner_identity(int(raw), binary) for raw in result.stdout.split()}
+    targets = {pid: identity for pid, identity in identities.items() if identity}
+    receipt = {"terminated_pids": [], "killed_pids": [], "remaining_runner_pids": [], "errors": []}
+    for pid, identity in targets.items():
+        if runner_identity(pid, binary) == identity:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                receipt["terminated_pids"].append(pid)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                receipt["errors"].append(f"TERM {pid}: {error}")
+    if targets:
+        time.sleep(1)
+    for pid, identity in targets.items():
+        if runner_identity(pid, binary) == identity:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                receipt["killed_pids"].append(pid)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                receipt["errors"].append(f"KILL {pid}: {error}")
+    if receipt["killed_pids"]:
+        time.sleep(0.2)
+    receipt["remaining_runner_pids"] = [pid for pid, identity in targets.items() if runner_identity(pid, binary) == identity]
+    return receipt
+
+
 def sample(directory, config, alert=True):
     previous = read_json(directory / "status.json")
-    now = {"sampled_at": time.time(), "trigger_percent": TRIGGER,
+    now = {"sampled_at": time.time(), "trigger_percent": TRIGGER, "emergency_percent": EMERGENCY,
            "recovery_below_percent": RECOVERY, **config}
     try:
         now.update(probe(config["metric"]))
@@ -93,9 +156,26 @@ def sample(directory, config, alert=True):
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         now.update(active=previous.get("active") is True, error=str(error))
     now["blocked"] = config["mode"] == "block" and (now["active"] or bool(now["error"]))
+    now["emergency_attempted"] = previous.get("emergency_attempted", False) if now["active"] or now["error"] else False
+    if now["emergency_attempted"]:
+        now["emergency_receipt"] = previous.get("emergency_receipt")
     old_state = (previous.get("active", False), bool(previous.get("error")))
     new_state = (now["active"], bool(now["error"]))
     write_json(directory / "status.json", now)
+    if (config.get("emergency_stop") and not now["error"] and not now["emergency_attempted"]
+            and now["used_bytes"] * 100 >= now["total_bytes"] * EMERGENCY):
+        # Publish before signalling. An interrupted/uncertain action is never
+        # replayed on the next sample or daemon restart in this pressure episode.
+        now["emergency_attempted"] = True
+        write_json(directory / "status.json", now)
+        try:
+            now["emergency_receipt"] = emergency_stop(config)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            now["emergency_receipt"] = {"errors": [str(error)]}
+        write_json(directory / "status.json", now)
+        logging.warning("95%% emergency model-stop receipt: %s", now["emergency_receipt"])
+        if alert:
+            notify("RAM reached 95%. Emergency Ollama model stop attempted; see guard status for its result.")
     if old_state != new_state:
         if now["error"]:
             message = "RAM probe failed; " + ("new local AI work is blocked." if now["blocked"] else "check the guard log.")
@@ -157,10 +237,16 @@ def main():
     if args.command == "once":
         print(json.dumps(sample(directory, config, not args.quiet), indent=2))
         return 0
-    logging.info("guard started: trigger=94%% recovery<90%% interval=5s mode=%s metric=%s", config["mode"], config["metric"])
-    while True:
-        sample(directory, config)
-        time.sleep(5)
+    logging.info("guard started: block=94%% emergency=95%% recovery<90%% interval=2s mode=%s metric=%s", config["mode"], config["metric"])
+    with (directory / "monitor.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logging.error("another RAM monitor already owns the lock")
+            return 1
+        while True:
+            sample(directory, config)
+            time.sleep(INTERVAL)
 
 
 if __name__ == "__main__":
