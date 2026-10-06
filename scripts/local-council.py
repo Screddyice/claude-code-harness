@@ -7,6 +7,18 @@ import sys
 
 MODELS = "qwen3.5:4b,phi4-mini:3.8b"
 CONTEXT = "8192"
+SOLVE_OPTIONS = ("--task", "--tests", "--entry-point", "--cases", "--backend", "--k",
+                 "--frontier-k", "--jobs", "--num-ctx", "--mem-check", "--think",
+                 "--models", "--best", "--json", "--frontier", "--frontier-backend",
+                 "--brain", "--brain-url", "--brain-model", "--help")
+
+
+def option_name(argument):
+    name = argument.split("=", 1)[0]
+    if name in SOLVE_OPTIONS:
+        return name
+    matches = [option for option in SOLVE_OPTIONS if option.startswith(name)] if name.startswith("--") else []
+    return matches[0] if len(matches) == 1 else None
 
 
 def optimized_options(args):
@@ -15,14 +27,14 @@ def optimized_options(args):
         return result
     backend = "openrouter"
     for index, arg in enumerate(args):
-        if arg == "--backend" and index + 1 < len(args):
+        if option_name(arg) == "--backend" and "=" not in arg and index + 1 < len(args):
             backend = args[index + 1]
-        elif arg.startswith("--backend="):
+        elif option_name(arg) == "--backend" and "=" in arg:
             backend = arg.split("=", 1)[1]
     if backend != "ollama":
         return result
     def supplied(option):
-        return any(arg == option or arg.startswith(option + "=") for arg in args)
+        return any(option_name(arg) == option for arg in args)
     if not supplied("--models"):
         result += ["--models", MODELS]
     if not supplied("--num-ctx"):

@@ -34,6 +34,11 @@ class CouncilTests(unittest.TestCase):
         args = ["solve", "--backend=ollama", "--backend", "codex"]
         self.assertEqual(council.optimized_options(args), args)
 
+    def test_native_cli_abbreviations_keep_explicit_choices(self):
+        args = ["solve", "--ba=ollama", "--mo=mine", "--num", "4096", "--frontier-ba", "codex"]
+        self.assertEqual(council.optimized_options(args), args)
+        self.assertIn(council.MODELS, council.optimized_options(["solve", "--ba", "ollama"]))
+
     def test_install_is_idempotent_and_exec_preserves_arguments(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
