@@ -62,8 +62,8 @@ def install(wrapper, config):
             (Path(binary_stage) / name).symlink_to(wrapper)
         # Both old and new wrappers understand this config. Publish it first.
         staged_config.replace(config)
-        staged_wrapper.replace(wrapper)
         try:
+            staged_wrapper.replace(wrapper)
             for name in clients:
                 (Path(binary_stage) / name).replace(wrapper.parent / name)
         except (OSError, KeyboardInterrupt):
@@ -71,7 +71,7 @@ def install(wrapper, config):
                 (wrapper.parent / name).is_symlink() and (wrapper.parent / name).resolve() == wrapper.resolve()
                 for name in clients
             ):
-                wrapper.unlink()
+                wrapper.unlink(missing_ok=True)
             raise
     print("Local council: Qwen 4B + Phi 3.8B, 8192 context, verified Codex fallback.")
     print("Original executables retained. No service or memory-policy changes.")

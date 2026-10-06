@@ -107,6 +107,23 @@ class CouncilTests(unittest.TestCase):
                 installer.install(wrapper, config)
                 self.assertEqual((binary / "llmjury").resolve(), wrapper.resolve())
 
+    def test_interrupt_immediately_after_wrapper_publish_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            binary, original, config = self.make_installation(Path(temporary))
+            wrapper = binary / "local-council"
+            real_replace = Path.replace
+            def interrupt_after_publish(path, target):
+                result = real_replace(path, target)
+                if Path(target) == wrapper:
+                    raise KeyboardInterrupt()
+                return result
+            with mock.patch.object(Path, "replace", interrupt_after_publish), self.assertRaises(KeyboardInterrupt):
+                installer.install(wrapper, config)
+            self.assertFalse(wrapper.exists())
+            self.assertEqual((binary / "llmjury").resolve(), original.resolve())
+            installer.install(wrapper, config)
+            self.assertEqual((binary / "llmjury").resolve(), wrapper.resolve())
+
     def test_smaller_defaults_and_codex_fallback(self):
         args = council.optimized_options(["solve", "--backend", "ollama"])
         self.assertEqual(args[args.index("--models") + 1], "qwen3.5:4b,phi4-mini:3.8b")
