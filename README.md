@@ -404,7 +404,7 @@ and 1.0 made 2 and 1. The publisher's model card calls 1.15 "Critical for
 agents. Without it, greedy decoding loops on repeated tool calls", and
 recommends temperature 0.1 to 0.3 for agents, which covers Qwen Code's 0.2.
 Ollama's OpenAI endpoint has no per-request `repeat_penalty` anyway, and the
-tag is also Backdoor's failover model. The fresh-session retry in `qwen goal` is
+tag is also the retired failover model. The fresh-session retry in `qwen goal` is
 what absorbs these slips.
 
 Four settings let that loop continue within the configured window:
@@ -654,15 +654,15 @@ Three independent conditions are required, each closing a different way to lie:
 
 | Condition | What it prevents |
 |---|---|
-| This session is routed through the router (`:8083` base URL or `:8084` proxy, read from the env or walked up the process ancestry) | Breaker state is global to the router, so a session talking directly to Anthropic must not inherit a badge from one that is routed |
-| `failover_active` is true **for `anthropic`** in `$HOME/.backdoor/failover-state.json` | A Codex failover says nothing about a Claude session |
+| This session is routed through the router (the configured local endpoint, read from the env or walked up the process ancestry) | Breaker state is global to the router, so a session talking directly to Anthropic must not inherit a badge from one that is routed |
+| `failover_active` is true **for `anthropic`** in the retired failover state file | A Codex failover says nothing about a Claude session |
 | The file's `pid` is alive **and is really the router** | A state file outlives the process that wrote it, and a recycled pid would otherwise resurrect a badge for a router that is gone |
 
 Anything invalid, unreadable, or unverifiable fails closed and renders no badge. A stale proxy
 variable left over from a retired router still changes nothing, because the environment alone was
 never sufficient.
 
-There is deliberately **no "off" badge.** The retired `BACKDOOR OFF` printed on every ordinary
+There is deliberately **no "off" badge.** The old failover OFF badge printed on every ordinary
 session and told nobody anything; the normal case does not need a label.
 
 `jq` is a hard dependency, and a missing one used to be invisible. The script parses the session
@@ -802,8 +802,8 @@ The hooks ask GitHub about the branch through `gh`, and every one of those calls
 precedence and prefers `upstream` when one exists, so inside a fork it answers about the
 *parent* repository.
 
-That is not theoretical. On 2026-08-12 in `Screddyice/backdoor` (a fork of
-`ajsai47/backdoor`), an open PR on origin was reported as "no open pull request" and the
+That is not theoretical. On 2026-08-12 in the former relay repository (a fork of
+the former upstream relay repository), an open PR on origin was reported as "no open pull request" and the
 Stop hook blocked every stop with no way to satisfy it — the PR existed the whole time,
 the hook was simply asking the wrong repo. The same resolution silently made
 `auto-pr-push.sh` unable to see merged PRs, defeating its duplicate-PR guard.
@@ -915,7 +915,7 @@ git push origin HEAD:fix/first-failure-failover
 Those commits are now under review as `fix/first-failure-failover`. The checkout still says
 `pr44-check`, which has commits ahead of `main` and no PR of its own, so the hook pushed that
 name too and opened a PR for work already in review. Observed 2026-08-25 in
-`Screddyice/backdoor`: #51 and #52 appeared for the `pr47-check` and `pr44-check` branches used
+the former relay repository: #51 and #52 appeared for the `pr47-check` and `pr44-check` branches used
 to test-merge #47 and #44.
 
 `hook_head_has_pr_elsewhere()` asks a different question — is this exact commit the head of any
@@ -1575,7 +1575,7 @@ session. Use `qwen 27b stop` to stop that model.
 
 ### Why a wrapper instead of `ollama run`
 
-Backdoor was removed on 2026-09-10 and took `~/.local/bin/qwen` with it. What the
+the retired failover service was removed on 2026-09-10 and took `~/.local/bin/qwen` with it. What the
 wrapper did before the load matters more than the wrapper. This tag puts 16.3 GB of
 wired Metal memory on a 36 GB Mac, and wired pages cannot swap out. Put an llm-jury
 council or a background diff review beside it and the host compresses everything
@@ -1586,13 +1586,13 @@ before the first byte loads.
 LLM-Jury's memguard already names this model: `EXCLUSIVE_MODELS` is exactly
 `{"qwen3.8:27b-obliterated"}`. Cooperating local jobs stand down while it owns
 compute, and they learn that two ways, from a lease file under
-`~/.backdoor/compute-leases` or from the model appearing in Ollama's `/api/ps`.
+`~/.cache/llmjury/compute-leases` or from the model appearing in Ollama's `/api/ps`.
 `scripts/qwen` publishes the lease, because Ollama needs tens of seconds to load
 this model and a Stop hook fires in far less. It also holds
 `~/.cache/llmjury/local-compute.lock`, the same nonblocking lock the reviewer
 takes, so the two never race.
 
-The lease directory keeps Backdoor's name on purpose. memguard's other readers
+The shared lease path is retained for compatibility. memguard's other readers
 resolve that default path, and renaming it here would quietly stop gating them.
 Move both sides together with `LLMJURY_COMPUTE_LEASE_DIR`.
 
@@ -1637,7 +1637,7 @@ its normal macOS path leaves RAM admission to macOS and Ollama.
 
 Both run a full agent session against the local model, with the same guard, lease
 and lock as everything else here. There is no failover in either direction. You
-asked for the local model, so you get the local model until you quit; Backdoor
+asked for the local model, so you get the local model until you quit; retired router
 swapped tiers under a live session, which is what made it unreliable enough to
 delete.
 
@@ -1657,7 +1657,7 @@ Ollama 0.32 serves the Anthropic Messages API at `/v1/messages`: correct envelop
 `tool_use` blocks, thinking blocks, SSE streaming, and it ignores the auth headers.
 Codex goes over Ollama's OpenAI-compatible `/v1/responses` endpoint. The wrapper
 sets `model_providers.qwen.wire_api=responses`, which current Codex requires. Neither
-client needs the translation proxy Backdoor's `:8083` provided, so nothing gets rebuilt.
+client needs the translation proxy the old setup provided, so nothing gets rebuilt.
 
 #### Optional JEV decisions for local sessions
 
@@ -1967,7 +1967,7 @@ or unlimited bound removes the override and leaves memguard's conservative defau
 `OLLAMA_LAUNCHD_TARGET` can select another job for a read-only probe. A missing secrets file
 does not skip either derived setting. Existing apps inherit the new values on their next launch.
 
-This moved here on 2026-09-10 from `router-gui-env.sh`, which was deleted with the Backdoor
+This moved here on 2026-09-10 from `router-gui-env.sh`, which was deleted with the retired local service
 router. That script also health-gated `ANTHROPIC_BASE_URL` onto the router and published a Mem0
 key; both are retired, so neither came across. The example plist gained `StartInterval 3600` to
 replace its 60-second poll.

@@ -766,7 +766,7 @@ else
   fail "every model slot points at the one alias" "$(grep -E '^(ANTHROPIC|CLAUDE_CODE)' "$FIXTURE/claude.env" | tr '\n' ' ')"
 fi
 
-# Backdoor's tier-swapping under a live session is what got it deleted.
+# retired router's tier-swapping under a live session is what got it deleted.
 reset_world
 run_qwen claude >/dev/null
 if [ "$(claude_env CLAUDE_CODE_NO_MODEL_FALLBACK)" = "1" ] &&

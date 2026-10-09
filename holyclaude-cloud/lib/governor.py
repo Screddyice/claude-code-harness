@@ -127,7 +127,7 @@ def local_model_slots(state: RunState, config: LegionConfig) -> int:
 
 
 def local_model_available(config: LegionConfig) -> bool:
-    """Best-effort preflight: is the backdoor router reachable?
+    """Best-effort preflight: is the local Ollama endpoint reachable?
 
     Returns False (never raises) if disabled or the router doesn't answer, so
     cmd_run falls back to today's behavior (ready tasks wait) instead of

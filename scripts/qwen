@@ -54,7 +54,7 @@ case "${1:-}" in
   27b|27B) MODEL="qwen3.8:27b-obliterated"; shift ;;
 esac
 GB=$((1024 ** 3))
-LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.backdoor/compute-leases}"
+LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.cache/llmjury/compute-leases}"
 LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
 STALE_SESSION_SECONDS="${QWEN_STALE_SESSION_SECONDS:-1800}"
 MODEL_KEY="$(printf '%s' "$MODEL" | tr -c '[:alnum:]_.-' '_')"
@@ -528,7 +528,7 @@ cmd_stop() {
 
 # Shared setup for an agent session (Claude Code or Codex) on the local model.
 #
-# NO FAILOVER, BY DESIGN. Backdoor's :8083 proxy watched a circuit breaker and
+# No failover is performed here; Ollama owns the local model session.
 # swapped tiers underneath a live session, which is what made it unreliable and got
 # it deleted on 2026-09-10. This does none of that: you ask for the local model,
 # you get the local model for the whole session, and CLAUDE_CODE_NO_MODEL_FALLBACK
@@ -623,7 +623,7 @@ agent_admit() {
 #
 # Ollama 0.32 serves the Anthropic Messages API at /v1/messages: correct envelope,
 # tool_use blocks, thinking blocks, SSE streaming, and it ignores the auth headers.
-# That is what Backdoor's proxy existed to translate, so there is no proxy here.
+# The wrapper talks to Ollama directly, so no translation proxy is needed.
 #
 # The model id is the catch. Claude Code 2.1.267 validates the session model against
 # its own compiled catalog and answers [claude-code:unrecognized_model] for anything

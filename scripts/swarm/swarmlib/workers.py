@@ -6,7 +6,7 @@ cloud workers each booting a local Ollama council is how this machine kernel
 panicked on 2026-07-31). The Claude worker runs with a scrubbed ALLOWLIST
 environment so credentials beyond its own OAuth never ride along, and with
 ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY absent so it bills subscription OAuth
-directly instead of routing through the local :8083 router.
+directly instead of routing through the local Ollama router.
 """
 from __future__ import annotations
 

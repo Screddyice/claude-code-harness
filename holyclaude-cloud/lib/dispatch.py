@@ -116,7 +116,7 @@ def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str
     """Fire off a local `claude -p` in a git worktree. Returns spawn metadata.
 
     When `model`/`base_url` are set, the worker runs against an on-device model
-    via the backdoor router (`local-model` target) instead of the Anthropic API:
+    via the local Ollama service (`local-model` target) instead of the Anthropic API:
     `--model <model>` is appended and ANTHROPIC_BASE_URL is pointed at the router.
     """
     worker_target = "local-model" if model else "local"
@@ -196,7 +196,7 @@ def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str
     else:  # session
         env.pop("ANTHROPIC_API_KEY", None)
 
-    # local-model worker: point claude-code at the backdoor router so qwen*
+    # local-model worker: point claude-code at the local Ollama service so qwen*
     # model names resolve to local Ollama. Session creds still apply for any
     # passthrough; no API key needed.
     if model:

@@ -215,7 +215,7 @@ worker_timeout_minutes = 30              # stale-worker reaping
 [local_model]                            # ADD-ON: extra on-device (Qwen) workers
 enabled = true                           # spawn beyond max_workers when saturated
 max_workers = 2                          # extra local workers ON TOP of the cap
-base_url = "http://localhost:8083"       # backdoor router (qwen* -> local Ollama)
+base_url = "http://localhost:11434"       # local Ollama service (qwen* -> local Ollama)
 default_model = "qwen3.5:4b-64k"
 offload = "simple"                       # only small/trivial overflow goes local
 redispatch_to_real_model = true          # failed local PR retries on the real model
@@ -231,12 +231,12 @@ For serious workloads, flip to `auth_mode = "api"` in `legion.toml` and re-run s
 
 ## Local-model overflow (add-on)
 
-When the session/cloud fleet is saturated (`max_workers` reached, or the governor has halved the cap during a throttle window) and ready tasks are still waiting, legion can spawn **extra workers on-device** instead of letting those tasks idle. These overflow workers run a local model — Qwen through the [backdoor](https://github.com/ajsai47/backdoor) router on `:8083` — so they **don't consume the Anthropic rate limit**. It's purely additive: cloud capacity is unchanged, you just get *more* total agents.
+When the session/cloud fleet is saturated (`max_workers` reached, or the governor has halved the cap during a throttle window) and ready tasks are still waiting, legion can spawn **extra workers on-device** instead of letting those tasks idle. These overflow workers run a local model — Qwen through the local Ollama endpoint — so they **don't consume the Anthropic rate limit**. It's purely additive: cloud capacity is unchanged, you just get *more* total agents.
 
 ```
 fill session/cloud slots up to max_workers   → spawn(local | cloud)   [Anthropic]
-ready tasks still waiting + :8083 reachable   → spawn EXTRA workers     [on-device Qwen]
-                                                 (--model qwen3.5:4b-64k, ANTHROPIC_BASE_URL=:8083)
+ready tasks still waiting + Ollama reachable   → spawn EXTRA workers     [on-device Qwen]
+                                                 (--model qwen3.5:4b-64k, ANTHROPIC_BASE_URL=http://localhost:11434)
 ```
 
 Configured under `[local_model]` (see above). Notes:
@@ -252,7 +252,7 @@ During a throttle window this composes nicely: the governor backs the *cloud* pa
 
 ## What's not yet supported
 
-What IS supported: parallel cloud workers, local-model overflow workers (extra on-device Qwen agents via the backdoor router, additive on top of the cloud cap), dependency-ordered merges, adversarial review with re-dispatch, CI-aware retry (validated end-to-end), merge conflict mediation, cost cap enforcement, brain/learning loop (retros written and injected across runs), and end-to-end runs on repos without branch protection or pre-commit hooks.
+What IS supported: parallel cloud workers, local-model overflow workers (extra on-device Qwen agents via the local Ollama service, additive on top of the cloud cap), dependency-ordered merges, adversarial review with re-dispatch, CI-aware retry (validated end-to-end), merge conflict mediation, cost cap enforcement, brain/learning loop (retros written and injected across runs), and end-to-end runs on repos without branch protection or pre-commit hooks.
 
 What isn't supported yet:
 
