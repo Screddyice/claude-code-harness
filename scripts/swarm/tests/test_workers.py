@@ -73,7 +73,7 @@ def test_worker_result_fast_and_limit():
 # -- env scrubbing -------------------------------------------------------
 
 def test_scrubbed_env_allowlist(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost:8083")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost:11434")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-secret")
     monkeypatch.setenv("PATH", "/usr/bin")

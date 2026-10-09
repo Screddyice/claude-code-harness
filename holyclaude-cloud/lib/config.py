@@ -15,7 +15,7 @@ class SwarmConfig:
     # Hard cap on concurrent session/cloud workers (the ones that hit the
     # Anthropic API). Raised from the original 5 → 10; the governor still
     # halves this on a real 429, and local-model overflow workers (Qwen via
-    # the backdoor router) run ON TOP of this cap without touching it.
+    # the local Ollama service) run ON TOP of this cap without touching it.
     max_workers: int = 10
     ramp_first_run: bool = True
     human_checkpoint_after_decompose: bool = True
@@ -67,16 +67,16 @@ class DispatchConfig:
 
 @dataclass
 class LocalModelConfig:
-    """Overflow workers backed by an on-device model (Qwen via the backdoor
-    router on :8083). These spawn as EXTRA workers beyond the session/cloud
+    """Overflow workers backed by an on-device model (Qwen via the retired router
+    router on Ollama). These spawn as EXTRA workers beyond the session/cloud
     cap when ready tasks are starved — so the Mac absorbs overflow instead of
     legion tapping out on the Pro-session rate limit.
     """
     enabled: bool = True
     # Extra workers beyond the session/cloud cap (current_max_workers).
     max_workers: int = 2
-    # Backdoor router endpoint; qwen* model names route to local Ollama.
-    base_url: str = "http://localhost:8083"
+    # local Ollama endpoint; qwen* model names route to local Ollama.
+    base_url: str = "http://localhost:11434"
     # Full-harness-safe default. Do NOT default to 9B — it pins a 36GB Mac.
     default_model: str = "qwen3.5:4b-64k"
     # Optional code-heavy model (e.g. "qwen-coder"). "" = always default_model.

@@ -1,8 +1,8 @@
 """Unit tests for the local-model overflow feature.
 
 When the session/cloud fleet is saturated and ready tasks remain, legion spawns
-EXTRA workers backed by an on-device model (Qwen via the backdoor router on
-:8083) instead of idling. Coverage:
+EXTRA workers backed by an on-device model (Qwen via the local Ollama service on
+port 11434) instead of idling. Coverage:
 
   - config: [local_model] parses + defaults when absent
   - routing.is_simple: which overflow tasks are eligible for the local model
@@ -39,7 +39,7 @@ def test_config_defaults_when_section_absent(tmp_path):
     lm = cfg.local_model
     assert lm.enabled is True
     assert lm.max_workers == 2
-    assert lm.base_url == "http://localhost:8083"
+    assert lm.base_url == "http://localhost:11434"
     assert lm.default_model == "qwen3.5:4b-64k"
     assert lm.coder_model == ""
     assert lm.offload == "simple"
@@ -220,12 +220,12 @@ def test_spawn_local_no_model_is_plain_local(tmp_path, monkeypatch):
 
 def test_spawn_local_with_model_injects_flag_and_base_url(tmp_path, monkeypatch):
     captured, meta = _spawn_local_capture(
-        tmp_path, monkeypatch, model="qwen3.5:4b-64k", base_url="http://localhost:8083"
+        tmp_path, monkeypatch, model="qwen3.5:4b-64k", base_url="http://localhost:11434"
     )
     cmd = captured["cmd"]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "qwen3.5:4b-64k"
-    assert captured["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:8083"
+    assert captured["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:11434"
     assert "ANTHROPIC_API_KEY" not in captured["env"]
     assert meta["target"] == "local-model"
     assert meta["model"] == "qwen3.5:4b-64k"

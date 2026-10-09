@@ -16,7 +16,7 @@ Mitigations:
 - `ramp_first_run = true` — start with 1, only add more after observing clean runs.
 - The Governor halves `max_workers` for 10 min on first 429.
 - `max_workers` defaults to 10. On session auth the Pro limit still bites above ~5; the governor's halving + ramp keep you honest. If your account is touchy, dial it down — if you run `auth_mode = "api"`, push it to 20+.
-- **Local-model overflow absorbs the rest.** With `[local_model] enabled = true`, ready tasks that can't get a session/cloud slot (cap reached or throttle-halved) spawn as EXTRA on-device Qwen workers via the backdoor router — these don't touch the Anthropic rate limit, so a 429 storm no longer means idle tasks.
+- **Local-model overflow absorbs the rest.** With `[local_model] enabled = true`, ready tasks that can't get a session/cloud slot (cap reached or throttle-halved) spawn as EXTRA on-device Qwen workers via the local Ollama service — these don't touch the Anthropic rate limit, so a 429 storm no longer means idle tasks.
 
 ### Refresh-token death spiral
 The Pro session token in the secret is the access token + refresh token. The Claude Code CLI refreshes automatically when the access token expires (~8h). In a Modal container, the refreshed token writes to the container's ephemeral FS and dies with the container.

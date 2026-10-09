@@ -106,8 +106,8 @@ enabled = true
 # workers typically share one inference server (effectively serialized).
 max_workers = 2
 
-# Router endpoint; model names route to local inference, others pass through.
-base_url = "http://localhost:8083"
+# Local inference endpoint; model names route to local inference.
+base_url = "http://localhost:11434"
 
 # Default on-device model. Pick one small/fast enough to run the full harness.
 default_model = "qwen3.5:4b-64k"
