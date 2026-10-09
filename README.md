@@ -1845,6 +1845,12 @@ scripts/init-codex-harness.sh /path/to/repo
 
 ## MCP And Apps
 
+### Document and presentation authoring
+
+Claude's Gstack installation provides `document-generate`, `document-release`, and
+`make-pdf`. For DOCX, XLSX, PPTX, PDF, and data-backed templates, install the official
+`carbone-skill` plugin as described in [`docs/authoring-tools.md`](docs/authoring-tools.md).
+
 Use Codex's CLI to register MCP servers instead of editing opaque config by hand:
 
 ```bash
