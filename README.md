@@ -1361,7 +1361,8 @@ launchctl getenv CMEM_PRO_TOKEN >/dev/null && echo published
 ```
 
 `GUI_ENV_KEYS` selects which keys to publish (default `CMEM_PRO_TOKEN`) and `GUI_ENV_SOURCE` the
-file to read. A one-line `~/projects/.env` pointer is followed when the generated file is present.
+file to read. The example plist sets `GUI_ENV_KEYS` to `CMEM_PRO_TOKEN NEBOS_OS_BEARER_TOKEN`, the
+pair this Mac publishes; edit that line to add a key. A one-line `~/projects/.env` pointer is followed when the generated file is present.
 For `NEBOS_OS_BEARER_TOKEN`, the publisher also uses the existing authenticated SRCOS header in
 `~/.claude.json` when the env source is unavailable. Secret values are never written into the
 plist or log; the log records only the key name and a character count. A missing file or key exits

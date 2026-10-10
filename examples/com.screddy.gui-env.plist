@@ -9,6 +9,13 @@
         <string>/bin/bash</string>
         <string>/Users/screddy/projects/SRC/claude-code-harness/scripts/set-gui-env.sh</string>
     </array>
+    <!-- Key names only. set-gui-env.sh reads the values from ~/projects/.env
+         (or ~/.claude.json for NEBOS_OS_BEARER_TOKEN) and never writes them here. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GUI_ENV_KEYS</key>
+        <string>CMEM_PRO_TOKEN NEBOS_OS_BEARER_TOKEN</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <!-- Hourly refresh so a change to Ollama's parallel-decode slots reaches the
