@@ -53,6 +53,15 @@ STALE_PATTERN='widgetron' bash "$AUDIT" "$TMP/widget.md" >/dev/null 2>&1 \
   && no "STALE_PATTERN should catch a custom term" "" \
   || ok "STALE_PATTERN catches a custom term"
 
+cat > "$TMP/gate.md" <<'MD'
+# Notes
+
+memory-capture-gate.sh runs on SessionStart and keeps client repos out of memory.
+MD
+bash "$AUDIT" "$TMP/gate.md" >/dev/null 2>&1 \
+  && no "the retired capture gate should be flagged as current" "" \
+  || ok "the retired capture gate is flagged when described as current"
+
 bash "$AUDIT" "$TMP/missing.md" >/dev/null 2>&1 && ok "a missing file is not an error" || no "missing file is not an error" ""
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

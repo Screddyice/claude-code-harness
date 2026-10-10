@@ -1313,35 +1313,14 @@ on all three Hermes boxes. It was hand-deployed and lived nowhere else; a rebuil
 source to copy from. One memory project per box, and no writes until something is actually
 remembered. Details and the deploy command: `hermes/README.md`.
 
-## Memory capture gate (claude-mem)
+## Memory capture gate (retired 2026-10-09)
 
-`scripts/hooks/memory-capture-gate.sh` runs on SessionStart and keeps client repositories out of
-agent memory. It reads the git **origin remote**, and for `teamnebula-ai` or `Reddy2help` writes
-`.claude/settings.local.json` with `enabledPlugins["claude-mem@thedotmack"] = false`, which beats
-the user-level `true` by settings precedence. It replaces the identical gate that guarded the
-Cognee plugin until 2026-09-04; only the plugin id changed.
-
-Two things it deliberately does not do. It does not use `CLAUDE_MEM_EXCLUDED_PROJECTS`, which
-matches on folder name, because a client repo cloned under any other name would capture. And it
-cannot affect the session that writes the file: plugin enablement resolves at startup, so the
-first session in a freshly cloned client repo still captures and every later one does not; the
-systemMessage says so.
-
-## The capture gate does not depend on this checkout
-
-The gate is registered as a `SessionStart` hook at the fixed path
-`~/.claude/scripts/memory-capture-gate.sh`. That file is `scripts/hooks/memory-capture-gate-wrapper.sh`,
-and it runs the implementation installed beside it at `~/.claude/scripts/memory-capture-gate.impl.sh`,
-a copy of `scripts/hooks/memory-capture-gate.sh`. It prints a loud `systemMessage` when the
-implementation is missing.
-
-It used to `exec` this repo's copy. This repo is a working tree that moves between branches, and
-for weeks before 2026-09-04 the checkout sat on a branch without the script, so the gate never ran
-and TMN sessions were captured. A gate that fails open looks the same as a gate with nothing to
-do. After changing the gate here, copy both files into `~/.claude/scripts/`.
-
-The excluded orgs are `teamnebula-ai`, `Reddy2help` and `BH-Repos`. RS21 needs no entry: those
-repos live under `teamnebula-ai`.
+The SessionStart gate that turned claude-mem off in client repositories by git origin remote was
+removed on 2026-10-09, along with its `~/.claude/scripts` copies. The last version is archived at
+`~/projects/archive/memory-capture-gate-20261009-gate/`. claude-mem now captures every repository,
+client repositories included. To keep one out, set `enabledPlugins["claude-mem@thedotmack"]` to
+`false` in that repository's `.claude/settings.local.json`; plugin enablement resolves at startup,
+so the change takes effect from the next session.
 
 ## Publishing environment into the macOS GUI domain (`scripts/set-gui-env.sh`)
 
