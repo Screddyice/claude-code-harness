@@ -15,7 +15,7 @@ fail() {
 [ -f "$root/CLAUDE.md" ] || fail "missing $root/CLAUDE.md"
 if find "$root" -type f \( -name plugin.json -o -name marketplace.json \) -print 2>/dev/null |
    while IFS= read -r manifest; do
-     rg -q '\.codex-plugin|codex plugin marketplace|install-codex' "$manifest" &&
+     grep -Eq '\.codex-plugin|codex plugin marketplace|install-codex' "$manifest" &&
        { printf '%s\n' "$manifest"; exit 0; }
    done | grep -q .; then
   fail "Claude harness contains a Codex plugin manifest"
@@ -29,7 +29,7 @@ fi
 if [ "${1:-}" = "--installed" ]; then
   settings="$claude_home/settings.json"
   [ -f "$settings" ] || fail "missing installed Claude settings: $settings"
-  if [ -f "$settings" ] && rg -qi 'codex-plugin|codex marketplace|install-codex' "$settings"; then
+  if [ -f "$settings" ] && grep -Eqi 'codex-plugin|codex marketplace|install-codex' "$settings"; then
     fail "$settings contains Codex plugin wiring"
   fi
 fi
