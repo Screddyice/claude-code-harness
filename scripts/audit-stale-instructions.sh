@@ -16,7 +16,7 @@
 set -uo pipefail
 TMPOUT=$(mktemp); trap 'rm -f "$TMPOUT"' EXIT
 
-RETIRED_DEFAULT='cognee|mem0|hyperswarm|127\.0\.0\.1:8001|localhost:8001'
+RETIRED_DEFAULT='cognee|mem0|hyperswarm|127\.0\.0\.1:8001|localhost:8001|memory-capture-gate'
 RETIRED="${STALE_PATTERN:-$RETIRED_DEFAULT}"
 # A line that dates or retires the thing is history, not guidance.
 HISTORY='retired|deleted|removed|decommission|replaced by|superseded|no longer|was |were |formerly|legacy|archive|obsolete|stopped|went dry|dead|until 20|scripts/hooks/|do not (use|reintroduce|resurrect)'
