@@ -17,9 +17,9 @@
 # It also publishes LLMJURY_OLLAMA_PARALLEL, which is derived rather than secret
 # and so does not depend on the env file existing. llm-jury's memguard charges
 # KV as num_ctx x this value and falls back to Ollama's default of 4 when it
-# cannot see the real setting, so a GUI-launched session running the council or
-# the diff reviewer overestimates and refuses work without it. It moved here on
-# 2026-09-10 from router-gui-env.sh, which was retired with the old router helper.
+# cannot see the real setting, so a GUI-launched session running the council
+# overestimates and refuses work without it. It moved here on
+# 2026-09-10 from the retired GUI environment helper.
 set -uo pipefail
 ENV_FILE="${GUI_ENV_SOURCE:-$HOME/projects/.env}"
 KEYS="${GUI_ENV_KEYS:-CMEM_PRO_TOKEN}"
