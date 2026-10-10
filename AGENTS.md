@@ -13,7 +13,7 @@ find scripts -name '*.sh' -print0 | xargs -0 bash -n
 scripts/verify.sh
 scripts/audit-claude-harness.sh
 scripts/test-statusline.sh
-scripts/test-shared-hooks.sh
+scripts/audit-stale-instructions.sh
 git diff --check
 ```
 

@@ -605,7 +605,7 @@ agent_admit() {
     check_pressure
     note "attaching to the resident $MODEL"
     # Residency does not last a whole agent session: a Goal verification swaps
-    # the 27B out for the side-query model, and the diff reviewer or a council
+    # the 27B out for the side-query model, and a council
     # that sees no 27B loaded and a free lock would take the GPU mid-run. Hold
     # the lock and lease when nobody else does; another Qwen session that
     # already holds them protects this one too.

@@ -16,17 +16,18 @@ claude-code-harness/
 ├── examples/
 │   ├── AGENTS.md.workspace.example   # ~/projects/AGENTS.md template
 │   ├── AGENTS.md.project.example     # per-repo AGENTS.md starter
-│   ├── config.toml.example           # ~/.codex/config.toml starter
-│   └── hooks.json.example            # optional Codex hook wiring
+│   ├── com.screddy.gui-env.plist     # LaunchAgent that runs set-gui-env.sh
+│   └── com.screddy.kernel-zone-watchdog.plist
 ├── scripts/
-│   ├── init-codex-harness.sh         # idempotently creates .codex-harness/
-│   ├── audit-codex-migration.sh       # reports remaining Claude-only surfaces
+│   ├── verify.sh                     # parses every tracked shell and Python file
+│   ├── audit-stale-instructions.sh   # finds docs that present a retired component as current
 │   ├── install-claude-resilient-updater.sh # resumable Claude native updates on macOS
 │   ├── claude-manual-update             # checksum-verified update worker
 │   ├── statusline.sh                     # Claude model and session status source
 │   ├── test-statusline.sh                # status-line fixture tests
-│   ├── hooks/                           # shared hook logic and runtime adapters
-│   ├── test-shared-hooks.sh          # hook unit tests (PR base resolution, enforcement)
+│   ├── hooks/                        # capture gate, manual team-context sync, login-expiry and browse watchdogs
+│   ├── mcp-headers.py                # MCP auth headers read from the environment at call time
+│   ├── set-gui-env.sh                # publishes named keys into the macOS GUI domain
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
@@ -36,130 +37,22 @@ claude-code-harness/
 │   ├── dns-preflight.sh              # what breaks if I move this domain's DNS now
 │   ├── dns-postflight.sh             # did the cutover land, and did mail survive
 │   ├── kernel-zone-watchdog.sh       # catches a kernel zone-map leak before it panics the Mac
-│   ├── test-kernel-zone-watchdog.sh  # watchdog unit tests (parsing, thresholds, snapshots)
-│   └── codex-workspace-summary.sh    # quick local sanity summary
+│   └── test-kernel-zone-watchdog.sh  # watchdog unit tests (parsing, thresholds, snapshots)
 ```
 
-## Where an auto-opened PR is aimed
+## team-context memory sync (manual)
 
-`scripts/hooks/auto-pr-push.sh` pushes a branch and opens its draft PR the moment
-it has a commit. The base it picks is derived per branch, never assumed.
-
-Three questions, answered separately, because they have different answers:
-
-1. **Where did this branch fork?** Scored by total divergence (`behind + ahead`)
-   against `origin/HEAD`, `main`, `master`, `dev`, `develop`, `staging`. Remote
-   refs are scored alone whenever any exist — a stale local `main` looks closer
-   than the real one exactly when it matters.
-2. **Is this branch stacked on another one?** `hook_tighten_base_to_parent`. The
-   scorer above only knows trunk and the integration branches, so a branch cut from
-   another *feature* branch scores `dev` or `main` — and the PR then carries the
-   parent's commits as its own. Three of them on `nebos-v2` #531; ten on the branch
-   behind #508, which belonged to `hotfix/nebby-slack-backoff`.
-
-   Detected from the oldest commit the PR would carry: if another remote branch
-   already contains it, that commit is not this branch's work and that branch is the
-   base. One `git branch -r --contains`, not a count per remote — this runs after
-   every Bash call. The base only ever moves forward, so a branch forked straight off
-   `dev` is untouched.
-3. **Where is a PR from this branch allowed to land?** `hook_resolve_pr_base`.
-
-The second question exists because trunk is a deploy branch in any repo that keeps
-an integration branch, and it takes work only after that branch. `nebos-v2` states
-it in `guard-main-base.yml`: only `dev`, `promote/*` and `hotfix/*` may target
-`main`. A branch cut from `main` — a stale checkout, a rebase onto the wrong ref —
-still scores `main` as its fork point, so the hook aimed there and CI rejected it
-on arrival. That happened on `nebos-v2` #531 and #532, and #365 before them.
-
-A branch created from the current `main` tip keeps `main` as its target when the
-integration branch has moved ahead. The resolver checks the exact fork point before
-applying an integration-branch policy, so a shared ancestor does not retarget fresh
-trunk work to `dev`.
-
-Precedence, most specific first:
-
-| | Source | Use it when |
-|---|---|---|
-| 1 | `HOOK_PR_BASE` in the environment | a one-off, or a wrapper that knows better |
-| 2 | `.claude-harness/pr-base` in the repo | the repo has a policy and should say so itself |
-| 3 | the integration-branch rule | everything else |
-
-The rule: if the fork point resolved to `main`/`master`, the repo has an
-`origin/dev` or `origin/develop`, and the branch is not itself `dev`/`develop` or
-an escape hatch (`promote/*`, `hotfix/*`, `release/*`), aim at the integration
-branch instead. A repo with no integration branch is untouched, which is most of
-them.
-
-Verify what a branch would target without opening anything:
-
-```bash
-( . scripts/hooks/hook-common.sh
-  hook_load_branch_context && echo "$HOOK_BRANCH -> $HOOK_BASE_BRANCH" )
-```
-
-Covered by `scripts/test-shared-hooks.sh`: a `fix/*` branch in a repo with `dev`,
-a `hotfix/*` keeping trunk, a trunk-only repo, a repo-declared base, a branch stacked
-on a feature branch (base and commit count both), and a branch forked straight off
-`dev` that must not move.
-
-Checked against the real branches too, which is the check that matters — a truncated
-function once passed `bash -n` and the whole suite while being broken:
-
-```
-feat/nebby-verdict-routing  -> hotfix/nebby-slack-backoff  (7 commits, not 16)
-hotfix/nebby-slack-backoff  -> main                        (escape hatch)
-```
-
-## team-context memory auto-sync
-
-`scripts/hooks/team-context-autosync.sh` is a **Stop** hook that commits and pushes
-`memory/` and `projects-context/` in `~/TeamNebula/team-context` to whatever branch
-that repo is currently on. Register it in `~/.claude/settings.json` with
-`"async": true` so it never delays session end.
+`scripts/hooks/team-context-autosync.sh` commits and pushes `memory/` and `projects-context/` in
+`~/TeamNebula/team-context` to whatever branch that repo is on. It runs only when you call it,
+which is what `/tmn-sync` does. Do not register it as a Stop or SessionStart hook: automatic
+context capture for Team Nebula was retired on 2026-10-09, and context changes now go up as
+individual PRs.
 
 ```bash
 scripts/hooks/team-context-autosync.sh status   # branch, pause state, pending, recent runs
-scripts/hooks/team-context-autosync.sh now      # sync immediately, ignoring the pause flag
-scripts/hooks/team-context-autosync.sh pause    # stop auto-syncing
-scripts/hooks/team-context-autosync.sh resume
-scripts/hooks/team-context-autosync.sh check    # SessionStart: systemMessage if the last sync was blocked
+scripts/hooks/team-context-autosync.sh now      # sync immediately
+scripts/test-team-context-autosync.sh           # run after changing the script
 ```
-
-Register `check` as a **SessionStart** hook too. The Stop hook runs async, so nothing
-it prints reaches a session; `check` is how a blocked sync becomes visible.
-
-**Why this exists.** It replaces tmn-skills' `memory-autosync.sh`, which stopped
-running on 2026-08-31 when the tree it lived in (`~/moonshot/...`) ceased to exist.
-Nothing noticed for ten days: 22 episodic records piled up uncommitted, and the
-log's final lines were *successes*, so there was no failure to find. Its last run
-had also pushed to a dedicated branch and opened a PR nobody watched — that PR sat
-open for eleven days holding a record that existed nowhere else.
-
-Three design choices follow from that:
-
-- **Pushes to the current branch, never its own.** Records land where the session
-  was already working, so they cannot strand on an orphan branch.
-- **Never opens a PR.** A PR nobody watches is how the record above got stranded.
-- **Refuses to push to `main`/`master`.** Those are protected upstream; a sync must
-  not be the thing that discovers that. Records still commit locally.
-
-**PII guard.** Before committing, the hook scans the staged diff for email
-addresses and aborts if it finds one belonging to a named individual. Role and
-vendor addresses (`support@`, `admin@`, `noreply@`) and org-domain addresses pass.
-This exists because agents append memory records automatically: on 2026-09-10 a
-client contact's address reached `records.jsonl` with nobody looking, and the
-repo's own no-PII rule failed silently. A blocked sync logs the addresses, resets
-the index, and leaves the work uncommitted for a human to scrub.
-
-The block itself then failed silently. From 2026-09-11 to 2026-09-17 one record quoted
-the WhatsApp JID shape `digits@s.whatsapp.net`; every sync in those six days logged
-`BLOCKED` to `.memory-autosync.log`, which nobody reads, and 54 records sat uncommitted.
-Two changes followed. Placeholder local parts (`digits@`, `phone@`, `number@`, `user@`,
-`username@`, `name@`, `example@`, `someone@`) now pass the scan. A blocked sync also
-writes `.memory-autosync-blocked` with the time and the addresses, a successful commit
-removes it, and `check` turns it into a `systemMessage` at the next session start that
-names the address and the command to rerun. `scripts/test-team-context-autosync.sh`
-covers the placeholder, a named address, the marker, and the message.
 
 ## Who This Is For
 
@@ -174,18 +67,7 @@ its own:
 - Project-level agent instructions
 
 The goal is to keep each company's automations, credentials, and agent context isolated
-while sharing one Codex setup.
-
-## Codex Mapping
-
-| Claude harness concept | Codex equivalent in this repo |
-|------------------------|-------------------------------|
-| `CLAUDE.md` | `AGENTS.md` |
-| `~/.claude/settings.json` | `~/.codex/config.toml` plus CLI commands |
-| SessionStart hook | Codex `SessionStart` hook in `hooks.json`, explicit initializer, or a shell wrapper |
-| Claude status line | No direct Codex equivalent; use `scripts/codex-workspace-summary.sh` |
-| Claude plugin source | `holyclaude-cloud/.claude-plugin/plugin.json` and Claude Code plugin installation |
-| Claude MCP JSON | `codex mcp add ...` entries stored by Codex |
+while sharing one Claude Code setup.
 
 ## Standalone local Qwen agent
 
@@ -452,7 +334,7 @@ same id could hand the session the side-query entry's `reasoning_effort: none`.
 
 An agent session that attaches to an already-loaded model now takes the
 compute lock and lease when they are free. During a test run the verifier swap
-left no 27B loaded and no lock held, and the local diff reviewer loaded its
+left no 27B loaded and no lock held, and another local job loaded its
 own model into the gap. A Qwen Code session releases its lease the moment it
 exits, because the launcher waits for Qwen Code instead of `exec`-ing it. `qwen
 raw` still `exec`s `ollama run`, so its lease stays until the next launch prunes it.
@@ -462,7 +344,7 @@ free memory. Claude Code's memory guard for its own background tasks killed two
 of four test runs at that level, so start long Goal runs from a terminal.
 
 The 27B selector owns the shared local-compute lock. If a cooperating LLM-Jury
-council or diff reviewer holds that lock, the launcher terminates that exact
+council holds that lock, the launcher terminates that exact
 holder, waits for the kernel lock to release, and then runs the normal pressure
 and RAM checks. It refuses to force-stop another Qwen or Ollama process. A 4B
 launch keeps the non-preemptive behavior. When Qwen owns the 27B lease,
@@ -696,7 +578,6 @@ scripts/verify.sh
 
 # Run the local Claude plugin tests before making an installation change.
 scripts/test-statusline.sh
-scripts/test-shared-hooks.sh
 
 # Optional: replace Claude Code's deadline-bound native updater on slow links.
 scripts/install-claude-resilient-updater.sh
@@ -794,241 +675,6 @@ The workspace and project `AGENTS.md` templates make this first-commit draft-PR 
 default agent policy. PR creation is intentionally explicit rather than a hidden Git
 hook: commits stay usable offline, while every agent session is still required to run
 the tracker before switching branches or handing off work. The script never merges.
-
-### Every `gh` call is pinned to origin
-
-The hooks ask GitHub about the branch through `gh`, and every one of those calls passes
-`--repo` for the **origin** remote explicitly. Bare `gh` picks a remote by its own
-precedence and prefers `upstream` when one exists, so inside a fork it answers about the
-*parent* repository.
-
-That is not theoretical. On 2026-08-12 in the former relay repository (a fork of
-the former upstream relay repository), an open PR on origin was reported as "no open pull request" and the
-Stop hook blocked every stop with no way to satisfy it — the PR existed the whole time,
-the hook was simply asking the wrong repo. The same resolution silently made
-`auto-pr-push.sh` unable to see merged PRs, defeating its duplicate-PR guard.
-
-Two implementation details are load-bearing, both learned by breaking them first:
-
-- The `--repo` flag is passed as an **array**, never as an unquoted
-  `${VAR:+--repo "$VAR"}`. That form relies on word-splitting an unquoted expansion,
-  which bash does and zsh does not, so under zsh it collapses into the single argument
-  `--repo owner/name` and `gh` rejects it with `unknown flag`.
-- The array is expanded as `${HOOK_GH_REPO_ARGS[@]+"${HOOK_GH_REPO_ARGS[@]}"}`. macOS
-  ships bash 3.2, where an empty array expanded under `set -u` aborts with
-  `unbound variable` — and `auto-pr-push.sh` runs `set -uo pipefail`. A remote URL that
-  failed to parse would otherwise turn a cosmetic miss into a dead hook.
-
-Verify against a fork specifically; a non-fork repo passes either way and proves nothing.
-
-### A rejected push is a failure, not an `[ok]`
-
-`auto-pr-push.sh` used to run `git push` and discard its exit status, then report success from
-the branch it took afterwards. A rejected push produced exactly this in the log:
-
-```
- ! [rejected]  HEAD -> feat/be-icp-scoring-rubric (non-fast-forward)
-error: failed to push some refs to …/nebos-v2.git
-[ok] pushed nebos-v2@feat/be-icp-scoring-rubric (PR already open)
-```
-
-Nothing reached GitHub, and the one place you would check to find that out said it had. The
-other branch was worse in a quieter way: it read `[warn] push ok but could not open PR`, which
-asserts the push succeeded in the middle of reporting a problem. Both were reachable with the
-push already rejected, so "the hook says it pushed" carried no information either way.
-
-The exit status is now checked. On failure the hook classifies the cause rather than printing
-`git push failed` and sending you into a 30,000-line log to work out which of several unrelated
-problems you have:
-
-| Cause | Reported as |
-|---|---|
-| Remote has commits this checkout lacks | `REJECTED (non-fast-forward) … nothing was uploaded` + the `git pull --rebase` to run |
-| No write access | `REJECTED — no write access to <slug>` |
-| No usable git credentials | `FAILED — git has no usable credentials` |
-| Offline / host unreachable | `FAILED — network unreachable` |
-| Server-side branch protection | `REJECTED by a server-side rule` |
-
-Failures also append one line each to **`~/.cache/claude-code-harness/auto-pr-push-failures.log`**.
-The main log interleaves raw `git` and `gh` output for every repo on the machine, so a failure
-in it is findable only if you already suspect one. The failures file answers "did anything not
-make it to GitHub?" with `cat`.
-
-Worth knowing about the non-fast-forward case specifically: the hook does not resolve it. A
-diverged branch needs a human to choose rebase, merge, or discard, and a hook that force-pushed
-on your behalf would be a much worse bug than the one it replaced.
-
-### A squash-merged branch is not a branch without a PR
-
-The enforcement asks GitHub for an **open** PR. After a squash merge there isn't one: the PR
-is `MERGED`, and the squash commit on the base is an ancestor of nothing on the branch, so
-`HOOK_AHEAD` stays above zero forever. A branch whose work shipped therefore looks identical
-to work that never had a PR, and the Stop hook blocks every stop with no action that can
-satisfy it — opening another PR does not help, and deleting the local branch is the only way
-out, which nothing tells you.
-
-`hook_load_pr_status` now falls through to `hook_branch_already_merged()` and reports
-`merged_pr`, which the enforcers treat as satisfied:
-
-```
-open PR found        -> has_pr
-merged PR, same head -> merged_pr     (satisfied — work already landed)
-neither              -> needs_pr      (blocks)
-```
-
-**The check is keyed on the branch's current head SHA**, matching `auto-pr-push.sh`, which
-had this guard first. That is what stops a branch coasting: reuse a merged branch for new
-commits and its head no longer matches the merged PR, so it correctly needs a PR again.
-Both directions are worth testing, because a fix that only satisfies the first one silently
-turns the rule off for reused branches.
-
-**An older commit of the merged head also counts** (`hook_head_within_merged`, used by
-both hooks). A clone that stopped pulling before its PR merged still sits on an earlier
-commit of the same branch: the PR gained commits on the remote and landed, and nothing in
-this checkout is outside it. The exact-SHA test failed there and the Stop hook demanded a
-PR it could never satisfy (teamnebula-ai/teamnebula.ai `feat/fe-nebos-team-login`, 25
-commits behind after #425 merged, 2026-09-17). HEAD now counts as merged when it is the
-merged head or its ancestor. It reads local objects only, so a merged head that was never
-fetched keeps the old answer instead of touching the network, and a branch reused for new
-commits still needs a PR because its head is not an ancestor of the old merge.
-
-```
-merged PR, HEAD is an ancestor of its head -> merged_pr   (satisfied — checkout is just stale)
-```
-
-`merged_pr` is deliberately a separate status rather than reusing `has_pr` — "already
-landed" and "has an open review surface" are different facts, and anything that logs or
-reports should be able to tell them apart. `enforce-pr-codex.sh` needed no change; it blocks
-only on exactly `needs_pr`.
-
-### A head already under review does not get a second PR
-
-The merged-PR guard above asks GitHub about `--head "$HOOK_BRANCH"`, so it only sees PRs opened
-under the name currently checked out. Push a branch's HEAD somewhere else and it goes blind:
-
-```
-git checkout -b pr44-check origin/fix/first-failure-failover
-git merge origin/main            # test the integration
-git push origin HEAD:fix/first-failure-failover
-```
-
-Those commits are now under review as `fix/first-failure-failover`. The checkout still says
-`pr44-check`, which has commits ahead of `main` and no PR of its own, so the hook pushed that
-name too and opened a PR for work already in review. Observed 2026-08-25 in
-the former relay repository: #51 and #52 appeared for the `pr47-check` and `pr44-check` branches used
-to test-merge #47 and #44.
-
-`hook_head_has_pr_elsewhere()` asks a different question — is this exact commit the head of any
-PR, under any branch name:
-
-```
-open PR, this branch     -> has_pr
-merged PR, same head     -> merged_pr        (work already landed)
-any PR elsewhere, same head -> pr_elsewhere  (reviewed under another name)
-none of the above        -> needs_pr         (blocks)
-```
-
-`auto-pr-push.sh` checks it **before pushing**, not just before `gh pr create`. Skipping only the
-create still publishes a redundant remote branch, which the Stop hook then demands a PR for.
-`enforce-pr-claude.sh` reports `pr_elsewhere` and names the PR instead of blocking, since there is
-nothing to open. `enforce-pr-codex.sh` needed no change; it blocks only on exactly `needs_pr`.
-
-A **closed, unmerged** PR is not a match. That work was rejected, and rejected work is not a
-review surface.
-
-**The result is shape-checked, and that is load-bearing.** This guard suppresses a pull request,
-so every way it can be wrong costs review coverage. A non-empty check is not good enough: the two
-older `auto-pr-push` tests mock `gh` with a catch-all that answers an unrecognised `pr list` query
-with `0`, and that lone character read as a match and stopped proposing PRs on every branch they
-exercise. All three suites went red at once. The guard now demands `#<number> <branch>` and treats
-anything else as no match, so a schema change, a deprecation notice on stdout, or an older `gh`
-fails toward opening the PR.
-
-### Disposable branches, only when you say so
-
-`HARNESS_PR_SKIP_BRANCHES` holds space-separated globs of branch names the rule ignores:
-
-```
-HARNESS_PR_SKIP_BRANCHES='scratch/* tmp/*' claude
-```
-
-**Empty by default.** A guessed pattern list would exempt `feat/add-health-check` on its way to
-catching `pr44-check`, and the branch that quietly stops being enforced is the one nobody notices.
-Most of the time you want the automatic guard above instead — it recognises the same integration
-branches without being told, because it looks at what is under review rather than at a name.
-
-Covered by `scripts/test-auto-pr-push-elsewhere-guard.sh` (8 cases: unreviewed work still
-proposed, open and merged matches skipped, closed-unmerged still proposed, a reused branch with
-new commits, the opt-out matching and not matching, and four shapes of unrecognised `gh` output
-that must all fail safe).
-
-### The PR's base is derived, not defaulted
-
-`gh pr create` was called with no `--base`, so GitHub silently used the repository's **default**
-branch. Meanwhile `HOOK_BASE` only ever looked for `main`/`master`. Two guesses, and nothing made
-them agree with each other or with reality.
-
-Observed 2026-08-17: `teamnebula-ai/nebos-v2#365` opened against `main` in a repo where every PR
-targets `dev`. The hook had also counted "commits ahead" against `origin/main`, so a branch cut
-from `dev` was reported as 2 ahead when it carried 1 commit.
-
-`HOOK_BASE` now scores candidate integration refs by **total divergence** and picks the nearest,
-which is the branch the work actually forked from:
-
-| | ahead | behind | total |
-|---|---|---|---|
-| cut from `main` → `main` | 1 | 0 | **1** |
-| cut from `main` → `dev` | 1 | 1 | 2 |
-| cut from `dev` → `dev` | 1 | 0 | **1** |
-| cut from `dev` → `main` | 2 | 0 | 2 |
-
-"Fewest commits ahead" is the obvious metric and it ties constantly — a branch cut from `main`
-with one commit is 1 ahead of both. Divergence separates them because it also counts what the
-candidate has that the branch does not. Derived per branch, so one repo can serve both flows.
-`HOOK_BASE_BRANCH` is then passed explicitly as `--base`, so the PR and the precondition can no
-longer disagree.
-
-**Remote-tracking refs are scored alone whenever any exist**, with local branch names only as a
-fallback. Mixing the tiers is a correctness bug, not a style preference: after a squash merge
-`origin/main` carries a commit the branch lacks while a stale local `main` does not, so the local
-ref wins on divergence and the "base already contains this tree" guard above stops firing. That
-guard is what prevents a second PR for already-merged work, so losing it reopens the llm-jury#18
-duplicate. `test-auto-pr-push-merged-guard.sh` case 4 caught exactly this during development.
-
-Both `enforce-pr-*` Stop hooks interpolate `$HOOK_BASE` into their block message, so their
-"N commits ahead of X" line becomes accurate as a side effect.
-
-Covered by `scripts/test-auto-pr-push-base.sh` (5 cases: forked-from-dev, forked-from-main in the
-same repo, a main-only repo, the ahead-count agreeing with the base, and the stale-local-ref trap).
-
-### A fix pushed over a rejection goes back to the reviewer
-
-GitHub does not clear `CHANGES_REQUESTED` when the author pushes a fix, and it does not re-notify
-the reviewer. The review request is spent, the red state stands, and the PR looks the same from
-outside whether the work was done or not.
-
-On **2026-08-31** a sweep of `teamnebula-ai` found **eleven** open PRs holding `CHANGES_REQUESTED`,
-and roughly two thirds had already been fixed in an earlier session. They were waiting on nothing
-but a re-request. Two sessions also wrote the same fix for `hyperscale#94` in parallel, because
-neither could see the work was already done.
-
-After a successful push onto a branch that already has an open PR, `auto-pr-push.sh` now
-re-requests review. Deliberately narrow, because a review request is a notification to a person:
-
-- **Only reviewers whose current state is `CHANGES_REQUESTED`**, not the default roster. A
-  rejection is a conversation with one person. Routing the fix to someone else makes them
-  re-derive context the original reviewer already has, and leaves that reviewer's request looking
-  ignored. Latest-state-per-person, so someone who rejected and later approved is not re-asked.
-- **Never the PR author.** GitHub answers 422, and a self-rejection would otherwise ping you about
-  your own branch.
-- **Once per head SHA.** This hook runs after every Bash call; without the stamp under
-  `~/.cache/claude-code-harness/` one session would notify the reviewer dozens of times.
-- **A failed re-request is loud**, appended to `auto-pr-push-failures.log`. The silent version of
-  that failure is the original bug: a fixed PR nobody has been told about is indistinguishable
-  from an unfixed one.
-
-Covered by `scripts/test-auto-pr-push-rerequest.sh` (7 cases, pushing against a local bare remote
-because the re-request runs after the push that `AUTO_PR_PUSH_DRYRUN` returns before).
 
 ### `rejected-prs.sh` — which rejections are actually waiting on you
 
@@ -1309,74 +955,11 @@ one-line `awk` away after the fact. Run `scripts/test-kernel-zone-watchdog.sh` t
 verify parsing, both thresholds, snapshot contents, and the cooldown; it touches only
 a temp directory.
 
-## Per-Repo Harness
+## Optional hooks
 
-`scripts/init-codex-harness.sh` creates an idempotent `.codex-harness/` directory in a
-git repository:
-
-```
-.codex-harness/
-├── agents/context.json
-├── config.json
-├── features/{active.json,archive.json}
-├── impact/{change-log.json,dependency-graph.json}
-├── memory/{learned,episodic,semantic,procedural}/...
-├── prd/analyst-prompts.json
-├── session-briefing.md
-└── sessions/.current-session-id
-```
-
-If the target repo does not already have `AGENTS.md`, the script also seeds a small
-project-level starter.
-
-### The scaffold stays out of git
-
-`.gitignore` excludes `.claude-harness/` entirely, and `.claude/settings.local.json`
-with it. The claude-harness plugin writes three narrower rules of its own
-(`sessions/`, `memory/compaction-backups/`, `memory/working/`) on the assumption that
-the rest of the tree is worth sharing. On this repo it is not: the scaffold has sat
-at `"techStack": "Unknown"` with every memory file empty since 2026-08-25, so
-committing it would add 76 KB of empty JSON and a machine-local session id to the
-history. Seventeen of the twenty repos under `~/projects` already track none of it.
-
-Narrow the rule if someone populates the tree. `.claude/settings.local.json` stays
-ignored either way, since it carries hooks that execute local paths.
-
-## Durable Cognee writes (retired 2026-09-04)
-
-The outbox, drainer and verification wrapper that lived here existed only because Cognee
-acknowledged a write before persisting it and exposed no point lookup. Memory moved to
-claude-mem on 2026-09-04, whose worker queues every write durably before any AI work, so the
-whole subsystem is gone. The last copies are in git history at the commit before this section
-was rewritten, and the operational post-mortem is in `~/.claude/CLAUDE.md` § Memory.
-
-## Optional Hooks
-
-Codex supports lifecycle hooks including `SessionStart`, `Stop`, tool hooks, and
-compaction hooks. This harness includes `examples/hooks.json.example` for users who
-want auto-init behavior similar to the old Claude SessionStart hook. Codex requires
-non-managed hooks to be reviewed and trusted; inspect them with `/hooks` after install.
-
-The `scripts/hooks/` directory is the canonical runtime for hooks shared by Claude Code
-and Codex. Point each tool's config at this directory instead of keeping executable
-copies under `~/.claude` and `~/.codex`. Both run the same automatic PR tracker and the
-local Ollama diff reviewer. Thin Stop-hook adapters preserve each tool's JSON contract:
-
-| Behavior | Claude Code | Codex |
-|----------|-------------|-------|
-| Push branches and open draft PRs | `auto-pr-push.sh` | `auto-pr-push.sh` |
-| Enforce one PR per work branch | `enforce-pr-claude.sh` | `enforce-pr-codex.sh` |
-| Review the current diff with Ollama | `local-diff-review.sh` | `local-diff-review-codex.sh` |
-| Sample OAuth login expiry | `oauth-expiry-monitor.sh` | n/a |
-| Write a session memory | claude-mem plugin hooks | claude-mem plugin hooks |
-
-**`codex-hyperswarm-leftoff.sh` was removed on 2026-09-05.** It distilled a Codex session's
-left-off state into HyperSwarm through `hyperswarm capture --runtime mem0_session`. HyperSwarm was
-decommissioned on 2026-08-27 and Mem0 on 2026-09-04, so both its store and its capture backend
-were gone, but the hook stayed registered in `~/.codex/hooks.json` and fired at the end of every
-Codex session — logging `FATAL: venv python missing` to `/tmp/hs-codex-push.log` and capturing
-nothing. claude-mem's own Codex hooks cover this now. The registration was removed with the
-script.
+No hook in this repository installs itself. The machine-global PR tracker, the PR enforcer and
+the Ollama diff reviewer were removed on 2026-10-09 after their registrations were retired; PR
+tracking is the explicit `scripts/track-branch-pr.sh` command above. What remains is opt-in:
 
 #### Login-expiry monitor
 
@@ -1414,42 +997,10 @@ synthetic credential instead of reading the keychain. Run
 path, a forward roll, the regression and expiring alerts, `--quiet`, a malformed
 credential blob, and the shape of the emitted hook JSON.
 
-#### Duplicate-PR guard#### Duplicate-PR guard after a squash merge
-
-The hook decided whether a branch still needed a PR by asking `gh pr list --state open`.
-After a **squash** merge the branch's PR is `MERGED`, not open, so that count came back 0
-and the hook opened a *second* PR for work already sitting on the base — while its push
-re-created the remote branch the merge had just deleted. The "commits ahead of base"
-precondition cannot catch this either: a squash merge rewrites the commits, so the
-branch's own commits are never ancestors of the base and the branch looks permanently
-ahead.
-
-Seen live on 2026-07-31: `Screddyice/llm-jury#18` was opened ten seconds after `#17`
-squash-merged, carrying the same three commits and an empty diff against `main`. Left
-alone this recurs on every squash merge where the session has not yet switched branches.
-
-Two guards now run before the push:
-
-| Guard | Cost | Catches |
-|---|---|---|
-| base already contains this tree (`git diff --quiet <base> HEAD`) | local, free | the branch adds nothing, once the local base ref has caught up |
-| this exact commit is already merged (`gh pr list --state merged` head SHA) | one API call | the race above, where the local base ref is still pre-merge |
-
-The second is the load-bearing one, and it is keyed on the **merged head SHA** rather
-than the branch name, so reusing a branch for new commits after its PR merged still
-opens a fresh PR. This brings the automatic hook in line with `track-branch-pr.sh`,
-which already refused to add a second review history to a closed or merged PR.
-
-Because Claude Code and Codex both run this same script — Claude via settings, Codex via
-`~/.codex/hooks.json` — the guard applies to both. Run
-`scripts/test-auto-pr-push-merged-guard.sh` after changing it.
-The old top-level `scripts/codex-local-diff-review.sh` remains as a compatibility entry
-point. Run `scripts/test-shared-hooks.sh` after changing shared logic or an adapter.
-
 ## Workspace root (multi-org)
 
 When this harness is installed on a multi-org machine (e.g. Shawn's `~/projects`), hooks and
-skills are **user-global**. Opening Claude Code or Codex from the workspace root or
+skills are **user-global**. Opening Claude Code from the workspace root or
 from any org/repo under it uses the same harness. Workspace docs: `~/projects/CLAUDE.md`,
 `~/projects/AGENTS.md`. Org folders only add thin pointers; git `origin` selects company
 credentials.
@@ -1457,92 +1008,6 @@ credentials.
 | Harness | Workspace entry points |
 |---------|------------------------|
 | Claude Code | `~/projects/CLAUDE.md`, `~/projects/.claude/skills` → `~/.claude/skills` |
-| Codex | `~/.codex/AGENTS.md` + `~/projects/AGENTS.md`; skills under `~/.codex/skills` (agents skills linked); hooks in `~/.codex/hooks.json`; zsh `codex` loads `~/projects/.env` |
-
-## Retired: Grok harness support
-
-The Grok Build TUI, `~/.grok`, and this repo's Grok slice — `scripts/install-grok-harness.sh`,
-`scripts/grok/`, `examples/grok/`, and `enforce-pr-grok.sh` — were removed on 2026-08-18.
-
-One finding from that host still governs this repo: never import a harness's full hook chain
-into a second harness's per-tool-call path. Doing that ran the Ollama diff reviewer on every
-Grok tool call and kernel-panicked this Mac twice on 2026-07-31, which is why the reviewer's
-resident cost is capped below.
-
-## Local Ollama diff reviewer
-
-### GPU cost
-
-The reviewer runs on `Stop`, so it fires once per turn. It used to default to
-`gemma3:12b` with no rate limit, which meant a 13 GB load onto the GPU dozens of
-times in a working session. Two defaults changed on 2026-07-31:
-
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `LOCAL_REVIEW_MODEL` | `qwen3.5:4b` | Small model instead of `gemma3:12b`'s ~13 GB |
-| `LOCAL_REVIEW_KEEP_ALIVE` | `30s` | Unload after the review instead of holding GB between turns |
-| `LOCAL_REVIEW_COOLDOWN_SECONDS` | `1200` | Skip if this repo was reviewed less than 20 minutes ago |
-| `LOCAL_REVIEW` | `1` | Set to `0` to disable the reviewer entirely |
-
-#### Admission before background inference
-
-The reviewer runs `llmjury preflight --models <review-model> --num-ctx 24576`
-before asking Ollama for a completion. Install a LLM-Jury version with the
-`preflight` command first; a missing/older CLI, failed probe, exclusive Qwen
-ownership, or insufficient memory skips the review. `LOCAL_REVIEW_PREFLIGHT`
-can point to the CLI executable when it is not on PATH.
-
-The reviewer and cooperating councils hold the same nonblocking kernel lock,
-`~/.cache/llmjury/local-compute.lock`, through admission and inference. Set
-`LLMJURY_LOCAL_LOCK` consistently across clients to override it. Direct Ollama
-callers outside this protocol can still compete for memory. `scripts/qwen` joins
-the protocol: while it owns the 27B, this reviewer skips.
-
-A skipped or failed review does not consume the diff hash or start its cooldown.
-Only a nonempty successful response records those markers, so the next turn can
-retry after memory pressure clears. `LOCAL_REVIEW_DUMP_PROMPT=1` remains an
-inference-free prompt inspection path. Run
-`scripts/test-local-diff-review-cooldown.sh` for fake-HTTP coverage of admission,
-locking, cooldown and retry behavior; it never loads a model.
-
-#### Measure the whole runner footprint
-
-This table originally claimed the small model cost "~3 GB, and loads fast enough to stay
-resident between turns". Both halves of that were wrong, and expensively so.
-
-~3 GB is the model's **weights**. Ollama sizes the KV cache as `num_ctx ×
-OLLAMA_NUM_PARALLEL`, and the reviewer asks for `num_ctx 24576`, so at 4 parallel slots
-the tag measured **7.5 GB resident** with `ollama ps`. Keeping that resident between
-turns then denied the memory to everything else on the same Ollama server. Alongside an
-llm-jury council it over-committed a 36 GB Mac and panicked it twice on 2026-07-31
-(`watchdog timeout: no checkins from watchdogd`) — wired GPU allocations cannot be paged
-out, so the host starves its kernel watchdog rather than raising a catchable OOM.
-
-Two corrections followed. `keep_alive` is now short by default: with a 20 minute
-cooldown the next review is far away, so lingering trades a few seconds of reload for
-several GB held hostage. And the default tag dropped the `-64k` suffix — same model ID,
-but the plain tag cannot silently fall back to a 64k context if `num_ctx` is ever
-dropped from the request.
-
-Measure both `ollama ps` and the runner's OS memory footprint when changing the
-model or context. The former excludes the llama-server host prompt cache, which
-can add up to 8 GiB per runner by default. The shared LLM-Jury preflight reserves
-that bound and checks desktop memory pressure. Lower its client estimate only
-after verifying the active Ollama server uses a smaller cache limit.
-
-The cooldown collapses a burst of rapid turns into one review over the
-accumulated diff. It is keyed per repository and checked *before* the diff-hash
-marker is written, so a skipped turn does not mark that diff as already
-reviewed; an unchanged diff is still reviewed once the cooldown expires. A
-missing or corrupt stamp reads as "never reviewed" and lets the review proceed,
-so the reviewer cannot be wedged shut by a bad cache file.
-
-Findings still arrive mid-session. The Claude Code hook sets `asyncRewake`, so
-the review runs in the background and wakes the session when it flags
-something; moving the reviewer to `SessionEnd` would leave no session to wake.
-
-Run `scripts/test-local-diff-review-cooldown.sh` after changing the cooldown or
-cache-key logic.
 
 ## Selecting local Qwen models (`scripts/qwen`)
 
@@ -1588,8 +1053,8 @@ LLM-Jury's memguard already names this model: `EXCLUSIVE_MODELS` is exactly
 compute, and they learn that two ways, from a lease file under
 `~/.cache/llmjury/compute-leases` or from the model appearing in Ollama's `/api/ps`.
 `scripts/qwen` publishes the lease, because Ollama needs tens of seconds to load
-this model and a Stop hook fires in far less. It also holds
-`~/.cache/llmjury/local-compute.lock`, the same nonblocking lock the reviewer
+this model and a competing job starts in far less. It also holds
+`~/.cache/llmjury/local-compute.lock`, the same nonblocking lock the council
 takes, so the two never race.
 
 The shared lease path is retained for compatibility. memguard's other readers
@@ -1762,87 +1227,6 @@ Run `scripts/test-qwen.sh` after changing admission, locking, lease handling, or
 the agent commands. Its checks stub Ollama, launchd, both memory probes and
 both agent binaries, so no case loads a model or starts a session.
 
-## claude-harness guard patch
-
-`scripts/hooks/harness-guard-patch.sh` runs on `SessionStart` and keeps one rule in
-the claude-harness plugin's `PreToolUse` guard from denying safe commands. It is a
-no-op once the patch is in.
-
-### What the upstream rule did
-
-The plugin blocks recursive deletion of a repo's `.claude-harness` state, which is
-right. The pattern was not: it matched the delete command anywhere in the command
-string, after any whitespace. Two things it was never aimed at got denied:
-
-- `git rm -r --cached .claude-harness`, which drops index entries and leaves every
-  file on disk. That is exactly how you stop tracking the scaffold.
-- Any script whose **comment or heredoc** merely contained the phrase. The tool call
-  was refused before a byte was written, so a script that deleted nothing could not
-  even be created. That is how this was found.
-
-### What replaces it
-
-The delete command has to sit in command position: the start of a line, after a
-separator or shell keyword, or behind `sudo`/`xargs` and their common options.
-Anchoring that way loses `git rm`, which does delete from the working tree, so
-that gets its own rule with `--cached` exempted.
-
-| Command | Before | After |
-|---------|--------|-------|
-| a bare recursive delete of the directory | deny | deny |
-| the same after `&&`, `if`, `sudo -u`, or `xargs -0` | deny | deny |
-| `git rm -r` on it, no `--cached` | deny | deny |
-| `git rm -r --cached` on it | deny | **allow** |
-| the phrase inside a comment, heredoc, or quoted text | deny | **allow** |
-| a backtick command substitution deleting the directory | deny | deny |
-
-That last row is its own small lesson. Backtick command substitution is still active
-inside double quotes, so the guard treats a backtick before the delete command the
-same way it treats `$(`.
-
-### Why it is reapplied every session
-
-The plugin is a clone of `panayiotism/claude-harness-marketplace` and a sync
-overwrites the file, the same reason `gstack-browser-shim.sh` runs on `SessionStart`.
-That clone's `hooks/hooks.json` already carries an unrelated local quoting fix, so
-local patching is the existing arrangement rather than a new one.
-
-The patch text lives beside the script as `harness-guard-patch.before` and
-`.after`, matched and replaced literally. If upstream rewrites the rule, the script
-reports it and changes nothing rather than guessing. Upstreaming this is the real fix.
-
-```bash
-scripts/hooks/harness-guard-patch.sh          # patch every installed copy, quietly
-scripts/hooks/harness-guard-patch.sh --check  # report status, exit 1 if stale
-scripts/test-harness-guard.sh                 # 31 checks, no installed plugin touched
-```
-
-Apply mode always exits 0: a guard one release out of date is a smaller problem than
-a hook that fails every new session. `--check` returns the real verdict, which is what
-the tests assert against.
-
-## Migration Audit
-
-`scripts/audit-codex-migration.sh` checks the workspace without changing it. It reports:
-
-- `CLAUDE.md` files without a sibling `AGENTS.md`.
-- `AGENTS.md` files larger than Codex's default 32 KiB instruction budget.
-- `.claude-harness/` directories without `.codex-harness/` siblings.
-- Missing `CLAUDE.md` fallback or an undersized instruction budget in Codex config.
-
-The fallback is transitional. Codex prefers `AGENTS.md` when both files exist, so repos
-can be adapted one at a time without losing local instructions in the meantime.
-Legacy-only instruction and harness paths are informational when the fallback is active;
-pass `--strict` as the second argument to make them fail the audit. Third-party, vendored,
-and embedded skill trees are excluded by default because their instruction files are owned
-upstream and should not be rewritten by a workspace migration.
-
-Use the explicit initializer when you want predictable behavior:
-
-```bash
-scripts/init-codex-harness.sh /path/to/repo
-```
-
 ## MCP And Apps
 
 ### Document and presentation authoring
@@ -1899,31 +1283,22 @@ cannot affect the session that writes the file: plugin enablement resolves at st
 first session in a freshly cloned client repo still captures and every later one does not; the
 systemMessage says so.
 
-## The capture gate has to survive a branch switch (2026-09-04)
+## The capture gate does not depend on this checkout
 
-`memory-capture-gate.sh` keeps Team Nebula, Reddy2help and Breaking Hits sessions out of
-claude-mem by writing `enabledPlugins["claude-mem@thedotmack"] = false` into the repo's
-`.claude/settings.local.json`, chosen by git **origin remote** rather than folder.
+The gate is registered as a `SessionStart` hook at the fixed path
+`~/.claude/scripts/memory-capture-gate.sh`. That file is `scripts/hooks/memory-capture-gate-wrapper.sh`,
+and it runs the implementation installed beside it at `~/.claude/scripts/memory-capture-gate.impl.sh`,
+a copy of `scripts/hooks/memory-capture-gate.sh`. It prints a loud `systemMessage` when the
+implementation is missing.
 
-It was registered as a `SessionStart` hook at a fixed path in `~/.claude/scripts/`, and that path
-was a one-line wrapper that `exec`'d this repo's copy. This repo is a working tree that moves
-between branches, and the script only ever existed on its own feature branch — so for weeks the
-hook exec'd a file that was not there, exited non-zero, and the gate never ran. Nothing surfaced
-it: a gate that fails open looks exactly like a gate that found nothing to do. TMN sessions were
-captured the whole time, which is how `nebos-v2` worktrees and a dozen `nebby-eval-*` sandboxes
-reached the memory hub.
+It used to `exec` this repo's copy. This repo is a working tree that moves between branches, and
+for weeks before 2026-09-04 the checkout sat on a branch without the script, so the gate never ran
+and TMN sessions were captured. A gate that fails open looks the same as a gate with nothing to
+do. After changing the gate here, copy both files into `~/.claude/scripts/`.
 
-The wrapper (`scripts/hooks/memory-capture-gate-wrapper.sh`, installed at
-`~/.claude/scripts/memory-capture-gate.sh`) now prefers this repo's copy, refreshes a fallback at
-`~/.claude/scripts/memory-capture-gate.impl.sh` every time it can reach it, runs the fallback when
-it cannot, and prints a loud `systemMessage` if neither exists. Editing the harness copy is still
-the way to change behaviour; the fallback is only there so a branch switch cannot silently disarm
-the gate.
+The excluded orgs are `teamnebula-ai`, `Reddy2help` and `BH-Repos`. RS21 needs no entry: those
+repos live under `teamnebula-ai`.
 
-**BH-Repos was added to the excluded orgs** in the same change. Breaking Hits is the one actual
-client engagement in the tree, and its source has less business in a personal cloud memory service
-than TMN's or R2H's does. RS21 needs no entry: those repos live under `teamnebula-ai`, which the
-org pattern already matches.
 ## Publishing environment into the macOS GUI domain (`scripts/set-gui-env.sh`)
 
 A Dock-launched app inherits launchd's environment, not a shell's. Nothing in `~/.zshrc` and
@@ -1954,7 +1329,7 @@ The script also publishes derived, non-secret values. It reads `LLMJURY_OLLAMA_P
 `OLLAMA_NUM_PARALLEL` in Ollama's own launchd unit (`OLLAMA_PLIST` overrides the path). Ollama
 exports that setting to its server process and nowhere else, and llm-jury's memguard charges KV as
 `num_ctx x` this number, falling back to Ollama's default of 4 when it cannot see the real one. A
-GUI-launched session running the council or the diff reviewer therefore overestimates and refuses
+GUI-launched session running the council therefore overestimates and refuses
 work without it. An absent, malformed, or zero value unsets the variable instead of publishing a
 wrong one: memguard's conservative default is the safe direction, a bad number is not. The secret
 loop and this block are independent, so a missing env file no longer skips the derived value.
@@ -2068,21 +1443,15 @@ sweep across six files that were not clean.
 
 Bash and Python. No `package.json`, no build step, nothing to compile.
 
-Claude Code and Codex both run the hook implementations that live here.
-`~/.claude/settings.json` and `~/.codex/hooks.json` point at these paths, and the
-same-named files under `~/.claude/scripts/` are one-line compat wrappers that `exec`
-into this repo. Edit the implementation here. A change to a wrapper gets overwritten
-the next time someone reinstalls it.
+Nothing on this machine runs a hook straight out of this checkout. The live copies are
+`~/.claude/scripts/` (capture gate, `mcp-headers.py`), the `com.screddy.gui-env` LaunchAgent
+(`scripts/set-gui-env.sh`), and the `~/.local/bin` wrappers for `qwen`, `gbrowse` and `swarm`.
 
-Run the syntax check before you register anything, because a hook that exits non-zero
-blocks the tool call that triggered it:
+Run the checks before you install a changed script:
 
 ```bash
-bash -n scripts/hooks/<hook>.sh
-./scripts/test-auto-pr-push-base.sh
-./scripts/test-auto-pr-push-merged-guard.sh
-./scripts/test-auto-pr-push-elsewhere-guard.sh
+bash scripts/verify.sh
+bash scripts/audit-stale-instructions.sh
 ```
 
-`CLAUDE.md` carries the agent instructions. The hook-by-hook table lives under
-Optional Hooks above.
+`CLAUDE.md` carries the agent instructions.
