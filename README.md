@@ -28,6 +28,7 @@ claude-code-harness/
 │   ├── hooks/                        # capture gate, manual team-context sync, login-expiry and browse watchdogs
 │   ├── mcp-headers.py                # MCP auth headers read from the environment at call time
 │   ├── set-gui-env.sh                # publishes named keys into the macOS GUI domain
+│   ├── team-context-pull.sh          # pulls team-context and re-applies personal settings
 │   ├── swarm/                        # cross-CLI parallel agent dispatch engine
 │   ├── test-swarm.sh                 # swarm pytest suite runner
 │   ├── track-branch-pr.sh             # pushes a branch and opens/updates its draft PR
@@ -53,6 +54,39 @@ scripts/hooks/team-context-autosync.sh status   # branch, pause state, pending, 
 scripts/hooks/team-context-autosync.sh now      # sync immediately
 scripts/test-team-context-autosync.sh           # run after changing the script
 ```
+
+## Claude starts in bypass-permissions mode
+
+Typing `claude` opens a session with `permissions.defaultMode` set to `bypassPermissions` and
+`skipDangerousModePermissionPrompt` on, so no tool call waits for approval and there is no
+startup confirmation. Shift+Tab still switches modes inside a session.
+
+Both config dirs carry it, because which one loads depends on how Claude starts:
+
+| Launch | Settings file read |
+|---|---|
+| `claude` in a shell (`.zshrc` exports `CLAUDE_CONFIG_DIR`) | `~/TeamNebula/team-context/settings.json` |
+| Desktop app, or any process without that variable | `~/.claude/settings.json` |
+
+team-context's `settings.json` is tracked and shared with the team, so the personal values live
+in `~/.claude/team-context-settings.overlay.json` (template:
+`examples/team-context-settings.overlay.json`) and never get committed there.
+`scripts/team-context-pull.sh` pulls team-context `main` and layers the overlay back on;
+`apply` re-layers it without pulling. A local edit that is in neither the tracked file nor the
+overlay stops the pull, so nothing is lost silently.
+
+```bash
+cp scripts/team-context-pull.sh ~/.claude/scripts/
+cp examples/team-context-settings.overlay.json ~/.claude/team-context-settings.overlay.json
+~/.claude/scripts/team-context-pull.sh apply
+scripts/test-team-context-pull.sh
+```
+
+What this gives up: permission prompts and the auto-mode classifier no longer stop merges,
+pushes, deletes or sends. The team-context PR guard is a hook, not a permission rule, so it still
+checks `git push` and `gh pr create`. RS21 and the other rules in `~/.claude/CLAUDE.md` still
+apply, but nothing in the harness enforces them. To go back, set `defaultMode` to `auto` in both
+places and rerun `apply`.
 
 ## Who This Is For
 
