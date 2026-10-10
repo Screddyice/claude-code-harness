@@ -18,3 +18,7 @@
 
 # Claude Code - Local settings
 .claude/settings.local.json
+
+# Legion - seeded into every ~/projects repo by the _projects_legion_seed chpwd hook in ~/.zshrc;
+# per-machine swarm limits, recreated on cd, so never committed here
+legion.toml

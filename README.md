@@ -528,7 +528,9 @@ The brief is skipped under `--tools mcp`, where most of what it describes is una
 ## Claude status line
 
 `scripts/statusline.sh` is the canonical source for Claude's optional status line. It prints the
-session model, the working directory, and the shell and legion worker counts. A model served
+session model, the working directory, and the shell and legion worker counts. Each repo's
+`legion.toml` is seeded by the `_projects_legion_seed` hook in `~/.zshrc` whenever you `cd` in, so
+this repo ignores it rather than tracking a per-machine copy. A model served
 locally shows as `QWEN LOCAL`; every other model shows its own name.
 
 Installing is a separate step from merging, so compare the hashes before you trust what
