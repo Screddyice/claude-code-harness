@@ -17,8 +17,8 @@
     <key>StartInterval</key>
     <integer>3600</integer>
     <key>StandardOutPath</key>
-    <string>/Users/screddy/.learning-corpus/gui-env.log</string>
+    <string>/Users/screddy/.local/state/gui-env.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/screddy/.learning-corpus/gui-env.log</string>
+    <string>/Users/screddy/.local/state/gui-env.log</string>
 </dict>
 </plist>

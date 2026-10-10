@@ -9,6 +9,8 @@ Codex has a separate source of truth in [`Screddyice/codex-harness`](https://git
 Keep Codex configuration and Codex plugin manifests there. This repository does not
 install or register Codex plugins.
 
+Runtime logs for the GUI environment LaunchAgent live under `~/.local/state/`; the example stays independent of optional learning or project-specific directories.
+
 ## What's Inside
 
 ```
