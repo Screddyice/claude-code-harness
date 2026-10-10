@@ -5,12 +5,17 @@ import os
 from pathlib import Path
 import sys
 
-MODELS = "qwen3.5:4b,phi4-mini:3.8b"
-CONTEXT = "8192"
+# Keep LLM-Jury state in its own cache.
+os.environ.setdefault("LLMJURY_ROUTER_STATE", str(Path.home() / ".cache/llmjury/router-state.json"))
+os.environ.setdefault("LLMJURY_COMPUTE_LEASE_DIR", str(Path.home() / ".cache/llmjury/compute-leases"))
+
+MODELS = "qwen3.5:4b,phi4-mini:3.8b"  # two-model local council (2026-10-09)
+CONTEXT = "8192"  # raised back from 4096 now that both models admit at 8192 (2026-10-09)
 SOLVE_OPTIONS = ("--task", "--tests", "--entry-point", "--cases", "--backend", "--k",
                  "--frontier-k", "--jobs", "--num-ctx", "--mem-check", "--think",
                  "--models", "--best", "--json", "--frontier", "--frontier-backend",
-                 "--brain", "--brain-url", "--brain-model", "--help")
+                 "--brain", "--brain-url", "--brain-model", "--analyst-model",
+                 "--no-analyst", "--analyst-max-tokens", "--help")
 
 
 def option_name(argument):
@@ -40,6 +45,9 @@ def optimized_options(args):
     if not supplied("--num-ctx"):
         result += ["--num-ctx", CONTEXT]
     if not supplied("--frontier") and not supplied("--frontier-backend"):
+        # Frontier escalation goes through Codex (subscription auth), NOT OpenRouter.
+        # OpenRouter is reserved for JEV only; llm-jury must not route generation
+        # through it. (Reverted the OpenRouter DeepSeek experiment, 2026-10-09.)
         result += ["--frontier", os.environ.get("LLMJURY_CODEX_MODEL", "gpt-5.6-sol"), "--frontier-backend", "codex"]
     return result
 

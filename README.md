@@ -575,6 +575,7 @@ cd claude-code-harness
 # Check the repository and installed Claude plugin boundary.
 scripts/audit-claude-harness.sh --installed
 scripts/verify.sh
+scripts/test-audit-claude-harness.sh   # the audit uses grep, so it works without ripgrep
 
 # Run the local Claude plugin tests before making an installation change.
 scripts/test-statusline.sh
@@ -1078,6 +1079,11 @@ The model files total about 5.5 GiB, compared with 12.2 GiB for Gemma 12B + Llam
 8B. Runtime memory also includes KV and prompt caches. This installer changes
 no memory policy or service configuration; macOS and Ollama retain their existing
 controls. Smaller models may need Codex fallback more often.
+
+Frontier escalation goes through the authenticated Codex CLI (`--frontier-backend codex`), never
+OpenRouter, which this machine reserves for JEV. The wrapper also keeps LLM-Jury's router state and
+compute leases under `~/.cache/llmjury/`. `scripts/local-council.py` is the source for the installed
+`~/.local/bin/local-council`; change it here, then rerun the installer.
 
 Original executable paths live in `~/.config/llmjury/local-council.json`. To undo
 the defaults, restore each `llmjury`/`jury` symlink to its saved path.
