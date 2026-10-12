@@ -1,0 +1,1303 @@
+#!/bin/bash
+# Coverage for scripts/qwen's admission path. Nothing here loads a model: Ollama,
+# the memory probes and launchd are all stubbed, which is the only way to assert
+# what the guard does when memory is short without actually making it short.
+set -u
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+QWEN="$ROOT/scripts/qwen"
+FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/qwen-test.XXXXXX")
+trap 'rm -rf "$FIXTURE"' EXIT
+
+failures=0
+pass() { printf 'ok   %s\n' "$1"; }
+fail() { printf 'FAIL %s\n     %s\n' "$1" "${2:-}"; failures=$((failures + 1)); }
+
+STUB="$FIXTURE/bin"
+mkdir -p "$STUB"
+REAL_PS=$(command -v ps)
+# Everything the wrapper shells out to, except the six stubbed below. Linking the
+# real binaries keeps the test honest: only Ollama and the memory probes are fake.
+for tool in bash sed awk grep tr cat find wc date python3 jq id sleep seq mkdir dirname rm mv env cut ls sort ps stat cp; do
+  path=$(command -v "$tool") || continue
+  ln -sf "$path" "$STUB/$tool"
+done
+
+# --- stubs ------------------------------------------------------------------
+# Each reads its answer from the fixture, so a case sets the world by writing
+# files rather than by editing the stub.
+
+cat > "$STUB/curl" <<'EOF'
+#!/bin/bash
+url=""
+for arg in "$@"; do case "$arg" in http*) url=$arg ;; esac; done
+case "$url" in
+  https://openrouter.ai/*)
+    printf '%s\n' "$*" >> "$FIXTURE/jev-probe.log"
+    [ -f "$FIXTURE/jev-online" ]; exit $? ;;
+  */api/version) echo '{"version":"0.0.0-test"}' ;;
+  */api/tags)    cat "$FIXTURE/tags.json" ;;
+  */api/ps)      cat "$FIXTURE/ps.json" ;;
+  # claude-mem's worker, on its own port. Up only when the fixture says so.
+  */api/health)
+    [ -f "$FIXTURE/mem-up" ] || exit 1
+    printf '{"status":"ok","pid":%d}\n' "$$" ;;
+  *)             exit 1 ;;
+esac
+EOF
+
+cat > "$STUB/ollama" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$FIXTURE/ollama.log"
+case "$1" in
+  run) printf 'RAN %s\n' "$*" ;;
+  cp)
+    jq --arg src "$2" --arg dest "$3" '
+      (.models[] | select(.name == $src)) as $source |
+      .models = ([.models[] | select(.name != $dest)] + [$source | .name = $dest])
+    ' "$FIXTURE/tags.json" > "$FIXTURE/tags.next" && mv "$FIXTURE/tags.next" "$FIXTURE/tags.json" ;;
+
+  stop)
+    [ ! -f "$FIXTURE/stop-fails" ] || exit 42
+    if [ ! -f "$FIXTURE/stop-keeps-resident" ]; then
+      jq --arg name "$2" '.models = [.models[]? | select(.name != $name)]' \
+        "$FIXTURE/ps.json" > "$FIXTURE/ps.next" && mv "$FIXTURE/ps.next" "$FIXTURE/ps.json"
+    fi ;;
+esac
+# The wrapper execs into `ollama run`, so this is where the lease must still be
+# published: a lease that only exists before the exec protects nothing.
+if [ "$1" = run ] && [ -n "$(find "$FIXTURE/leases" -maxdepth 1 -name '*.json' 2>/dev/null)" ]; then
+  echo "LEASE_PRESENT" >> "$FIXTURE/ollama.log"
+fi
+exit 0
+EOF
+
+cat > "$STUB/memory_pressure" <<'EOF'
+#!/bin/bash
+echo "System-wide memory free percentage: $(cat "$FIXTURE/free_pct")%"
+EOF
+
+cat > "$STUB/vm_stat" <<'EOF'
+#!/bin/bash
+if [ -f "$FIXTURE/vm_stat" ]; then cat "$FIXTURE/vm_stat"; exit; fi
+echo 'Mach Virtual Memory Statistics: (page size of 16384 bytes)'
+echo "Pages free: $((38654705664 * $(cat "$FIXTURE/free_pct") / 100 / 16384))."
+echo 'Pages speculative: 0.'
+echo 'Pages purgeable: 0.'
+echo 'File-backed pages: 0.'
+EOF
+
+cat > "$STUB/sysctl" <<'EOF'
+#!/bin/bash
+case "$*" in
+  *hw.memsize*)                        echo 38654705664 ;;
+  *kern.memorystatus_vm_pressure_level*) cat "$FIXTURE/pressure" ;;
+  *) exit 1 ;;
+esac
+EOF
+
+cat > "$STUB/pgrep" <<'EOF'
+#!/bin/bash
+[ -f "$FIXTURE/simulator" ] && exit 0
+exit 1
+EOF
+
+cat > "$STUB/lsof" <<'EOF'
+#!/bin/bash
+[ -r "$FIXTURE/holder.pid" ] && cat "$FIXTURE/holder.pid"
+EOF
+
+rm -f "$STUB/ps"
+cat > "$STUB/ps" <<EOF
+#!/bin/bash
+if [ -f "\$FIXTURE/stale-owner" ]; then
+  case "\$*" in
+    *"command="*)
+      name=qwen
+      [ ! -f "\$FIXTURE/uppercase-owner" ] || name=Qwen
+      printf 'node %s/%s --continue\\n' "\$FIXTURE" "\$name"; exit 0 ;;
+  esac
+fi
+exec "$REAL_PS" "\$@"
+EOF
+
+cat > "$STUB/launchctl" <<'EOF'
+#!/bin/bash
+if [ -f "$FIXTURE/server-context" ]; then
+  printf 'OLLAMA_CONTEXT_LENGTH => %s\n' "$(cat "$FIXTURE/server-context")"
+fi
+exit 0
+EOF
+
+# claude-mem starts its worker through node. The stub records that it was called
+# and brings the fake worker up, so the wrapper's readiness poll can succeed.
+cat > "$STUB/node" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$FIXTURE/node.log"
+env > "$FIXTURE/node.env"
+: > "$FIXTURE/mem-up"
+exit 0
+EOF
+
+# Both agent stubs dump argv and the environment they were handed, which is the
+# only thing worth asserting: the wrapper's whole job is to exec them correctly.
+cat > "$STUB/claude" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$FIXTURE/claude.argv"
+env > "$FIXTURE/claude.env"
+exit 0
+EOF
+
+cat > "$STUB/codex" <<'EOF'
+#!/bin/bash
+if [ "$*" = 'mcp list --json' ]; then
+  echo '[{"name":"jev","transport":{"type":"stdio"}},{"name":"cmem","transport":{"type":"streamable_http"}},{"name":"other","transport":{"type":"stdio"}}]'
+  exit 0
+fi
+printf '%s\n' "$@" > "$FIXTURE/codex.argv"
+env > "$FIXTURE/codex.env"
+exit 0
+EOF
+
+cat > "$STUB/qwen-code" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$FIXTURE/qwen-code.argv"
+env > "$FIXTURE/qwen-code.env"
+# Keep the generated settings for assertions after the wrapper cleans up.
+if [ -n "${QWEN_CODE_SYSTEM_DEFAULTS_PATH:-}" ]; then
+  cp "$QWEN_CODE_SYSTEM_DEFAULTS_PATH" "$FIXTURE/code-config.json"
+  sed "s|^QWEN_CODE_SYSTEM_DEFAULTS_PATH=.*|QWEN_CODE_SYSTEM_DEFAULTS_PATH=$FIXTURE/code-config.json|" \
+    "$FIXTURE/qwen-code.env" > "$FIXTURE/code.env.next"
+  mv "$FIXTURE/code.env.next" "$FIXTURE/qwen-code.env"
+fi
+find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' > "$FIXTURE/qwen-code.leases" 2>/dev/null
+# A goal test lists one Goal status per attempt; each call consumes the first.
+if [ -s "$FIXTURE/goal-statuses" ]; then
+  status=$(sed -n 1p "$FIXTURE/goal-statuses")
+  sed 1d "$FIXTURE/goal-statuses" > "$FIXTURE/goal-statuses.next"
+  mv "$FIXTURE/goal-statuses.next" "$FIXTURE/goal-statuses"
+  lease=$(find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null)
+  printf '%s lease=%s argv=%s\n' "$status" "${lease:+yes}" "$*" >> "$FIXTURE/goal-calls"
+  printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"read_file","input":{"file_path":"src/app.py"}}]}}\n'
+  printf '{"type":"stream_event","event":{"type":"goal_state","goal_state":{"goal":{"status":"%s","lastReason":"stub reason %s"}}}}\n' "$status" "$status"
+  [ "$status" = complete ] || exit 1
+fi
+exit 0
+EOF
+
+chmod +x "$STUB"/*
+
+MODEL=qwen3.8:27b-obliterated
+
+reset_world() {
+  rm -f "$FIXTURE/vm_stat" "$FIXTURE/jev-online" "$FIXTURE/jev-probe.log"
+  printf '{"models":[{"name":"%s","size":17716740000,"digest":"heavy"},{"name":"qwen3.5:4b-64k","size":2500000000,"digest":"small"},{"name":"qwen3.5:4b-256k","size":2500000000,"digest":"small"}]}\n' "$MODEL" > "$FIXTURE/tags.json"
+  echo '{"models":[]}' > "$FIXTURE/ps.json"
+  echo 1 > "$FIXTURE/pressure"
+  echo 95 > "$FIXTURE/free_pct"
+  rm -f "$FIXTURE/simulator" "$FIXTURE/ollama.log" \
+        "$FIXTURE/stop-fails" "$FIXTURE/stop-keeps-resident" \
+        "$FIXTURE/claude.argv" "$FIXTURE/claude.env" \
+        "$FIXTURE/codex.argv" "$FIXTURE/codex.env" \
+        "$FIXTURE/qwen-code.argv" "$FIXTURE/qwen-code.env" "$FIXTURE/qwen-code.leases" \
+        "$FIXTURE/node.log" "$FIXTURE/node.env" "$FIXTURE/mem-up" \
+        "$FIXTURE/holder.pid" "$FIXTURE/stale-owner" \
+        "$FIXTURE/goal-statuses" "$FIXTURE/goal-calls"
+  # A claude-mem install the wrapper can find: newest version wins, and an
+  # orphaned one is skipped even when it sorts higher.
+  rm -rf "$FIXTURE/mem-cache"
+  mkdir -p "$FIXTURE/mem-cache/13.24.5/scripts" \
+           "$FIXTURE/mem-cache/13.24.23/scripts" \
+           "$FIXTURE/mem-cache/13.24.99/scripts"
+  for v in 13.24.5 13.24.23 13.24.99; do
+    : > "$FIXTURE/mem-cache/$v/scripts/worker-service.cjs"
+    : > "$FIXTURE/mem-cache/$v/scripts/bun-runner.js"
+  done
+  : > "$FIXTURE/mem-cache/13.24.99/.orphaned_at"
+  rm -rf "$FIXTURE/leases" "$FIXTURE/state"
+  mkdir -p "$FIXTURE/leases" "$FIXTURE/state" "$FIXTURE/.codex"
+  cat > "$FIXTURE/.codex/config.toml" <<'TOML'
+[mcp_servers.jev]
+command = "not-used"
+[mcp_servers.cmem]
+url = "https://example.invalid/mcp"
+[mcp_servers.other]
+command = "not-used"
+TOML
+}
+
+run_qwen() {
+  env -i PATH="$STUB" HOME="$FIXTURE" FIXTURE="$FIXTURE" \
+    OLLAMA_HOST=127.0.0.1:11434 \
+    QWEN_MODEL="${TEST_QWEN_MODEL-$MODEL}" \
+    QWEN_STATE_DIR="$FIXTURE/state" \
+    QWEN_EVICTION_TIMEOUT="${QWEN_EVICTION_TIMEOUT:-30}" \
+    QWEN_STALE_SESSION_SECONDS="${QWEN_STALE_SESSION_SECONDS:-1800}" \
+    LLMJURY_COMPUTE_LEASE_DIR="$FIXTURE/leases" \
+    LLMJURY_LOCAL_LOCK="$FIXTURE/compute.lock" \
+    CMEM_PRO_TOKEN=test-token-not-real \
+    QWEN_CLAUDE_MEM_CACHE="$FIXTURE/mem-cache" \
+    CLAUDE_MEM_WORKER_PORT=37799 \
+    QWEN_MEMORY="${QWEN_MEMORY:-1}" \
+    JEV_OPENROUTER_API_KEY="${TEST_JEV_KEY-}" \
+    QWEN_JEV_COMMAND="$STUB/jev-mcp" \
+    QWEN_JEV="${QWEN_JEV:-1}" QWEN_OFFLINE="${QWEN_OFFLINE:-0}" \
+    QWEN_CODE_BIN="$STUB/qwen-code" \
+    QWEN_FAST_MODEL="${QWEN_FAST_MODEL-}" \
+    bash "$QWEN" "$@" 2>&1 </dev/null
+}
+
+claude_env() { grep -m1 "^$1=" "$FIXTURE/claude.env" | cut -d= -f2-; }
+codex_disables() { grep -qxF "mcp_servers.$1.enabled=false" "$FIXTURE/codex.argv"; }
+claude_argv_has() { grep -qxF -- "$1" "$FIXTURE/claude.argv"; }
+
+# A launcher stub only supplies an executable path. Probe tests never call it.
+ln -sf "$STUB/qwen-code" "$STUB/jev-mcp"
+
+# --- cases ------------------------------------------------------------------
+
+# Automatic JEV attachment, offline skipping and opt-outs on each client.
+for entry in code codex claude; do
+  reset_world
+  : > "$FIXTURE/jev-online"
+  TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" >/dev/null
+  case "$entry" in
+    code) online=$(jq -r '.mcpServers.jev.command // empty' "$FIXTURE/code-config.json")
+      if jq -e '.tools.visible | index("mcp__jev__jev_decide")' "$FIXTURE/code-config.json" >/dev/null; then pass "Qwen Code exposes the exact JEV schema upfront"; else fail "Qwen Code visible JEV schema"; fi ;;
+    codex) online=$(grep 'mcp_servers=.*jev.*command' "$FIXTURE/codex.argv" || true) ;;
+    claude) online=$(grep 'mcpServers.*jev.*command' "$FIXTURE/claude.argv" || true) ;;
+  esac
+  if [[ "$online" == *"jev-mcp"* ]] && grep -q 'jev_decide' "$FIXTURE/$([ "$entry" = code ] && echo qwen-code || echo "$entry").argv"; then
+    pass "$entry attaches JEV and routing guidance online"
+  else
+    fail "$entry attaches JEV online" "$online"
+  fi
+  if grep -q -- '--max-time 2 --retry 0' "$FIXTURE/jev-probe.log" &&
+     ! grep -q 'test-jev-not-real' "$FIXTURE/$([ "$entry" = code ] && echo qwen-code || echo "$entry").argv"; then
+    pass "$entry bounds its probe and keeps credentials out of argv"
+  else fail "$entry bounds probe without credential args"; fi
+
+  reset_world
+  out=$(TEST_JEV_KEY=test-jev-not-real run_qwen "$entry")
+  case "$entry" in
+    code) offline=$(jq -r '(.mcp.excluded | index("jev")) != null and (.mcpServers.jev == null)' "$FIXTURE/code-config.json") ;;
+    codex) offline=$(! grep -q 'mcp_servers=.*jev.*command' "$FIXTURE/codex.argv" && echo true) ;;
+    claude) offline=$(! grep -q 'mcpServers.*jev.*command' "$FIXTURE/claude.argv" && echo true) ;;
+  esac
+  if [ "$offline" = true ] && [[ "$out" == *"connection unavailable"* ]]; then
+    pass "$entry continues locally when the connection fails"
+  else fail "$entry skips JEV offline" "$out"; fi
+
+  for opt in QWEN_JEV QWEN_OFFLINE none; do
+    reset_world
+    : > "$FIXTURE/jev-online"
+    case "$opt" in
+      QWEN_JEV) QWEN_JEV=0 TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" >/dev/null ;;
+      QWEN_OFFLINE) QWEN_OFFLINE=1 TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" >/dev/null ;;
+      none) TEST_JEV_KEY=test-jev-not-real run_qwen "$entry" --mcp none >/dev/null ;;
+    esac
+    if [ ! -e "$FIXTURE/jev-probe.log" ]; then pass "$entry honors $opt before probing";
+    else fail "$entry honors $opt"; fi
+  done
+  reset_world
+  run_qwen "$entry" >/dev/null
+  if [ ! -e "$FIXTURE/jev-probe.log" ]; then pass "$entry skips missing credentials before probing";
+  else fail "$entry probed without a credential"; fi
+done
+reset_world
+run_qwen codex >/dev/null
+if codex_disables jev && codex_disables other && ! codex_disables cmem; then
+  pass "Codex cmem disables inherited JEV offline and other saved servers"
+else fail "Codex saved-server exclusion"; fi
+reset_world
+run_qwen codex --mcp none >/dev/null
+if codex_disables jev && codex_disables other && codex_disables cmem; then
+  pass "Codex none disables saved servers despite table merging"
+else fail "Codex none exclusion"; fi
+reset_world
+: > "$FIXTURE/jev-online"
+TEST_JEV_KEY=test-jev-not-real run_qwen codex >/dev/null
+if codex_disables other && ! codex_disables jev && ! codex_disables cmem; then
+  pass "Codex cmem enables only memory and online JEV"
+else fail "Codex online allowlist"; fi
+reset_world
+: > "$FIXTURE/jev-online"
+TEST_JEV_KEY=test-jev-not-real run_qwen codex --mcp all >/dev/null
+if grep -qx 'mcp_servers.jev.enabled=true' "$FIXTURE/codex.argv"; then pass "Codex all enables installed JEV online";
+else fail "Codex all enables JEV"; fi
+reset_world
+TEST_JEV_KEY=test-jev-not-real run_qwen codex --mcp all >/dev/null
+if grep -qx 'mcp_servers.jev.enabled=false' "$FIXTURE/codex.argv"; then pass "Codex all disables inherited JEV offline";
+else fail "Codex all disables JEV"; fi
+reset_world
+QWEN_OFFLINE=1 run_qwen claude --mcp all >/dev/null
+if grep -qx 'mcp__jev__\*' "$FIXTURE/claude.argv"; then pass "Claude all blocks inherited JEV offline";
+else fail "Claude all blocks JEV"; fi
+reset_world
+: > "$FIXTURE/jev-online"
+printf 'complete\n' > "$FIXTURE/goal-statuses"
+TEST_JEV_KEY=test-jev-not-real run_qwen goal -y 'Verify the fixture' >/dev/null
+if jq -e '.mcpServers.jev.command' "$FIXTURE/code-config.json" >/dev/null && grep -q 'jev_decide' "$FIXTURE/qwen-code.argv"; then
+  pass "Qwen goals inherit automatic JEV guidance"
+else fail "Qwen goals inherit JEV"; fi
+if [ -z "$(find "$FIXTURE/state" -name 'jev-session-*.json')" ]; then pass "temporary JEV settings are removed after Qwen exits";
+else fail "JEV session settings cleanup"; fi
+
+reset_world
+printf 'PLAN_KEEP_7731: implement one step and verify it.\n' > "$FIXTURE/plan with spaces.md"
+run_qwen code --plan "$FIXTURE/plan with spaces.md" -p 'Build it' >/dev/null
+if grep -q 'PLAN_KEEP_7731' "$FIXTURE/qwen-code.argv" && grep -qx -- '--append-system-prompt' "$FIXTURE/qwen-code.argv"; then
+  pass "selected plan is passed as persistent context"
+else
+  fail "selected plan is passed as persistent context" "missing plan argument"
+fi
+reset_world
+out=$(run_qwen code --plan "$FIXTURE/missing-plan.md" -p 'Build it')
+if [[ "$out" == *"could not retain"* ]] && [ ! -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "missing plan refuses launch before client starts"
+else
+  fail "missing plan refuses launch" "$out"
+fi
+
+
+reset_world
+out=$(run_qwen --help)
+case "$out" in
+  *"qwen status"*) pass "--help prints usage without touching Ollama" ;;
+  *) fail "--help prints usage" "$out" ;;
+esac
+
+reset_world
+out=$(run_qwen status)
+case "$out" in
+  *"not loaded"*) pass "status reports an unloaded model" ;;
+  *) fail "status reports an unloaded model" "$out" ;;
+esac
+
+reset_world
+printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
+out=$(run_qwen status)
+case "$out" in
+  *"resident, 16.3 GB"*) pass "status reports resident size" ;;
+  *) fail "status reports resident size" "$out" ;;
+esac
+
+# An elevated pressure level is memguard's own refusal condition; a wired
+# over-commit panics the host rather than failing, so this must not be a warning.
+reset_world
+echo 2 > "$FIXTURE/pressure"
+out=$(run_qwen raw "hello")
+status=$?
+case "$status:$out" in
+  0:*) fail "elevated memory pressure refuses the load" "exited 0: $out" ;;
+  *"memory pressure is elevated"*) pass "elevated memory pressure refuses the load" ;;
+  *) fail "elevated memory pressure refuses the load" "$out" ;;
+esac
+
+reset_world
+echo 20 > "$FIXTURE/free_pct"
+out=$(run_qwen raw "hello")
+case "$out" in
+  *"RAN run $MODEL hello"*) pass "Ollama owns model admission under normal pressure" ;;
+  *) fail "Ollama owns model admission under normal pressure" "$out" ;;
+esac
+
+# The launcher follows macOS pressure and leaves byte accounting to Ollama.
+reset_world
+echo 20 > "$FIXTURE/free_pct"
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-256k run_qwen raw "hello")
+if [[ "$out" == *"RAN run qwen3.5:4b-256k hello"* ]]; then
+  pass "normal pressure lets Ollama own model admission"
+else
+  fail "normal pressure must not apply a second byte budget" "$out"
+fi
+
+reset_world
+echo 32768 > "$FIXTURE/server-context"
+echo 50 > "$FIXTURE/free_pct"
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-256k run_qwen raw "hello")
+if [[ "$out" == *"RAN run qwen3.5:4b-256k hello"* ]]; then
+  pass "admission uses Ollama's active context cap instead of the model metadata window"
+else
+  fail "active Ollama context cap must control the memory estimate" "$out"
+fi
+
+reset_world
+cat > "$FIXTURE/vm_stat" <<'EOF'
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free: 65536.
+Pages speculative: 65536.
+Pages purgeable: 65536.
+File-backed pages: 655360.
+EOF
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen code -p "hello")
+if [ -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "reclaimable file cache admits 4B despite low unused RAM"
+else
+  fail "reclaimable file cache admits 4B despite low unused RAM" "$out"
+fi
+
+reset_world
+cat > "$FIXTURE/vm_stat" <<'EOF'
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free: 0.
+Pages speculative: 0.
+Pages purgeable: 0.
+File-backed pages: 0.
+EOF
+out=$(run_qwen code -p "hello")
+if [ -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "macOS owns exhausted reserve behavior"
+else
+  fail "macOS owns exhausted reserve behavior" "$out"
+fi
+
+reset_world
+cat > "$FIXTURE/vm_stat" <<'EOF'
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free: 262144.
+Pages speculative: 524288.
+Pages purgeable: 524288.
+File-backed pages: 1572864.
+EOF
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen code -p "hello")
+if [ -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "macOS owns page accounting"
+else
+  fail "macOS owns page accounting" "$out"
+fi
+
+reset_world
+echo 'unavailable' > "$FIXTURE/vm_stat"
+out=$(run_qwen code -p "hello")
+if [ -e "$FIXTURE/qwen-code.argv" ]; then
+  pass "Ollama remains usable when byte probes are unavailable"
+else
+  fail "Ollama remains usable when byte probes are unavailable" "$out"
+fi
+
+# --force remains a compatibility flag and cannot bypass macOS pressure.
+reset_world
+echo 20 > "$FIXTURE/free_pct"
+echo 4 > "$FIXTURE/pressure"
+out=$(run_qwen raw --force "hello")
+if [[ "$out" == *"host memory pressure is elevated"* ]] && [[ "$out" != *"RAN run"* ]]; then
+  pass "--force cannot bypass macOS pressure"
+else
+  fail "--force cannot bypass macOS pressure" "$out"
+fi
+
+reset_world
+touch "$FIXTURE/simulator"
+out=$(run_qwen raw "hello")
+case "$out" in
+  *"RAN run $MODEL hello"*) pass "macOS and Ollama own simulator co-residency" ;;
+  *) fail "macOS and Ollama own simulator co-residency" "$out" ;;
+esac
+
+reset_world
+run_qwen raw "hello" >/dev/null
+if grep -q '^LEASE_PRESENT$' "$FIXTURE/ollama.log"; then
+  pass "the compute lease is published before the exec, not after"
+else
+  fail "the compute lease is published before the exec" "$(cat "$FIXTURE/ollama.log")"
+fi
+
+# Co-residency is the failure this whole script exists to prevent, so a smaller
+# model already on the GPU is unloaded rather than tolerated.
+reset_world
+printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
+run_qwen raw "hello" >/dev/null
+if grep -q '^stop gemma3:12b$' "$FIXTURE/ollama.log"; then
+  pass "another resident model is unloaded first"
+else
+  fail "another resident model is unloaded first" "$(cat "$FIXTURE/ollama.log")"
+fi
+
+reset_world
+printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
+touch "$FIXTURE/stop-fails"
+out=$(run_qwen raw "hello")
+case "$out" in
+  *"failed to unload gemma3:12b"*"RAN run"*) fail "failed eviction refuses the load" "$out" ;;
+  *"failed to unload gemma3:12b"*) pass "failed eviction refuses the load" ;;
+  *) fail "failed eviction refuses the load" "$out" ;;
+esac
+
+reset_world
+printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
+touch "$FIXTURE/stop-keeps-resident"
+QWEN_EVICTION_TIMEOUT=0 out=$(run_qwen raw "hello")
+case "$out" in
+  *"timed out waiting for Ollama to unload: gemma3:12b"*"RAN run"*) fail "incomplete eviction refuses the load" "$out" ;;
+  *"timed out waiting for Ollama to unload: gemma3:12b"*) pass "incomplete eviction refuses the load" ;;
+  *) fail "incomplete eviction refuses the load" "$out" ;;
+esac
+
+reset_world
+printf '{"models":[{"name":"gemma3:12b","size":11000000000}]}\n' > "$FIXTURE/ps.json"
+run_qwen raw --keep-others "hello" >/dev/null
+if grep -q '^stop gemma3:12b$' "$FIXTURE/ollama.log"; then
+  fail "--keep-others leaves other models alone" "$(cat "$FIXTURE/ollama.log")"
+else
+  pass "--keep-others leaves other models alone"
+fi
+
+# Already resident does not need the full cold-load budget, but still checks pressure.
+reset_world
+echo 20 > "$FIXTURE/free_pct"
+printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
+out=$(run_qwen raw "hello")
+case "$out" in
+  *"attaching to the resident"*) pass "attaching to a resident model skips the guard" ;;
+  *) fail "attaching to a resident model skips the guard" "$out" ;;
+esac
+
+# A resident model must not bypass the host's warning/critical pressure gate.
+for mode in raw code; do
+  reset_world
+  echo 4 > "$FIXTURE/pressure"
+  printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
+  out=$(run_qwen "$mode" "hello")
+  if [[ "$out" == *"memory pressure is elevated"* ]]; then
+    pass "$mode refuses attachment under critical memory pressure"
+  else
+    fail "$mode must check pressure even for a resident model" "$out"
+  fi
+done
+
+# A 4B session remains conservative: it does not preempt another local owner.
+reset_world
+python3 - "$FIXTURE/compute.lock" <<'PY' &
+import fcntl, sys, time
+handle = open(sys.argv[1], "a")
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 1
+out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen raw "hello")
+kill "$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+case "$out" in
+  *"owns compute"*) pass "a held compute lock refuses the load" ;;
+  *) fail "a held compute lock refuses the load" "$out" ;;
+esac
+
+# A requested 27B session is the exclusive owner. It terminates a cooperating
+# local holder, waits for the kernel lock to clear, and then loads normally.
+reset_world
+python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
+import fcntl, os, signal, sys, time
+from pathlib import Path
+
+handle = open(sys.argv[1], "a")
+marker = Path(sys.argv[2])
+marker.write_text(str(os.getpid()), encoding="utf-8")
+
+def release_and_exit(_signum, _frame):
+    marker.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, release_and_exit)
+signal.signal(signal.SIGINT, release_and_exit)
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 1
+out=$(run_qwen raw "hello")
+wait "$holder" 2>/dev/null || true
+case "$out" in
+  *"preempting local compute owner pid"*"RAN run $MODEL hello"*)
+    pass "27B preempts a cooperating local owner and loads" ;;
+  *) fail "27B preempts a cooperating local owner and loads" "$out" ;;
+esac
+
+# An abandoned Qwen session is reclaimable after the stale threshold when its
+# model has already unloaded. A live model owner remains protected.
+reset_world
+python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
+import fcntl, os, signal, sys, time
+from pathlib import Path
+
+handle = open(sys.argv[1], "a")
+marker = Path(sys.argv[2])
+marker.write_text(str(os.getpid()), encoding="utf-8")
+
+def release_and_exit(_signum, _frame):
+    marker.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, release_and_exit)
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 1
+printf '{"active":true,"model":"%s","pid":%d,"source":"qwen","expires_at":%d}\n' \
+  "$MODEL" "$holder" "$(( $(date +%s) + 3600 ))" > "$FIXTURE/leases/qwen-$holder.json"
+touch "$FIXTURE/stale-owner"
+out=$(QWEN_STALE_SESSION_SECONDS=0 run_qwen raw "hello")
+wait "$holder" 2>/dev/null || true
+case "$out" in
+  *"reclaiming stale Qwen session pid"*"RAN run $MODEL hello"*)
+    pass "27B reclaims an abandoned Qwen session" ;;
+  *) fail "27B reclaims an abandoned Qwen session" "$out" ;;
+esac
+
+# A session past its 4-hour lease expiry has had the lease pruned while it still
+# holds the lock. It must stay reclaimable.
+reset_world
+python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
+import fcntl, os, signal, subprocess, sys, time
+from pathlib import Path
+
+handle = open(sys.argv[1], "a")
+marker = Path(sys.argv[2])
+marker.write_text(str(os.getpid()), encoding="utf-8")
+
+def release_and_exit(_signum, _frame):
+    marker.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, release_and_exit)
+child = subprocess.Popen(["sleep", "30"])
+Path(sys.argv[2] + ".child").write_text(str(child.pid), encoding="utf-8")
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 2
+rm -f "$FIXTURE/leases/qwen-$holder.json"
+touch "$FIXTURE/stale-owner"
+out=$(QWEN_STALE_SESSION_SECONDS=1 run_qwen raw "hello")
+wait "$holder" 2>/dev/null || true
+case "$out" in
+  *"reclaiming stale Qwen session pid"*"RAN run $MODEL hello"*)
+    pass "27B reclaims an abandoned Qwen session whose lease was pruned" ;;
+  *) fail "27B reclaims an abandoned Qwen session whose lease was pruned" "$out" ;;
+esac
+child=$(cat "$FIXTURE/holder.pid.child" 2>/dev/null)
+sleep 1
+if [ -n "$child" ] && ! kill -0 "$child" 2>/dev/null; then
+  pass "reclaiming a Qwen session also stops the CLI it spawned"
+else
+  [ -n "$child" ] && kill "$child" 2>/dev/null
+  fail "reclaiming a Qwen session also stops the CLI it spawned" "child ${child:-unknown} still running"
+fi
+rm -f "$FIXTURE/holder.pid.child"
+
+reset_world
+python3 - "$FIXTURE/compute.lock" "$FIXTURE/holder.pid" <<'PY' &
+import fcntl, os, signal, sys, time
+from pathlib import Path
+
+handle = open(sys.argv[1], "a")
+marker = Path(sys.argv[2])
+marker.write_text(str(os.getpid()), encoding="utf-8")
+
+def release_and_exit(_signum, _frame):
+    marker.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, release_and_exit)
+fcntl.flock(handle, fcntl.LOCK_EX)
+time.sleep(10)
+PY
+holder=$!
+sleep 1
+printf '{"active":true,"model":"%s","pid":%d,"source":"qwen","expires_at":%d}\n' \
+  "$MODEL" "$holder" "$(( $(date +%s) + 3600 ))" > "$FIXTURE/leases/qwen-$holder.json"
+touch "$FIXTURE/stale-owner"
+touch "$FIXTURE/uppercase-owner"
+out=$(QWEN_STALE_SESSION_SECONDS=999999 run_qwen raw "hello")
+rm -f "$FIXTURE/uppercase-owner"
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+case "$out" in
+  *"another Qwen session owns compute"*) pass "an active uppercase Qwen owner stays protected" ;;
+  *) fail "an active uppercase Qwen owner stays protected" "$out" ;;
+esac
+
+# `qwen raw` execs `ollama run`, which skips the EXIT trap, so its leases outlive the session; the next
+# run is what clears them, and only once the owning pid is gone.
+reset_world
+printf '{"active":true,"model":"%s","pid":999999,"source":"qwen","expires_at":%d}\n' \
+  "$MODEL" "$(( $(date +%s) + 3600 ))" > "$FIXTURE/leases/stale.json"
+printf '{"active":true,"model":"%s","pid":%d,"source":"qwen","expires_at":%d}\n' \
+  "$MODEL" "$$" "$(( $(date +%s) + 3600 ))" > "$FIXTURE/leases/live.json"
+run_qwen status >/dev/null
+if [ ! -f "$FIXTURE/leases/stale.json" ] && [ -f "$FIXTURE/leases/live.json" ]; then
+  pass "a dead lease is pruned and a live one is kept"
+else
+  fail "a dead lease is pruned and a live one is kept" "$(ls "$FIXTURE/leases")"
+fi
+
+# --- agent sessions ---------------------------------------------------------
+
+ALIAS=claude-haiku-4-5-20251001
+set_alias() {
+  jq --arg source "$1" --arg alias "$ALIAS" '
+    (.models[] | select(.name == $source)) as $model |
+    .models = ([.models[] | select(.name != $alias)] + [$model | .name = $alias])
+  ' "$FIXTURE/tags.json" > "$FIXTURE/tags.next" && mv "$FIXTURE/tags.next" "$FIXTURE/tags.json"
+}
+
+# Claude Code 2.1.267 refuses any model id outside its compiled catalog, whatever
+# ANTHROPIC_BASE_URL points at. Serving the same blobs under a catalog id is the
+# only thing that worked, so the alias is load-bearing, not cosmetic.
+reset_world
+run_qwen claude >/dev/null
+if grep -q "^cp $MODEL $ALIAS$" "$FIXTURE/ollama.log"; then
+  pass "a missing catalog-id alias is created from the canonical tag"
+else
+  fail "a missing catalog-id alias is created" "$(cat "$FIXTURE/ollama.log")"
+fi
+
+reset_world
+run_qwen claude >/dev/null
+if [ "$(claude_env ANTHROPIC_BASE_URL)" = "http://127.0.0.1:11434" ] &&
+   [ "$(claude_env ANTHROPIC_MODEL)" = "$ALIAS" ] &&
+   [ "$(claude_env ANTHROPIC_DEFAULT_HAIKU_MODEL)" = "$ALIAS" ] &&
+   [ "$(claude_env CLAUDE_CODE_SUBAGENT_MODEL)" = "$ALIAS" ]; then
+  pass "every model slot points at the one alias, so only one runner loads"
+else
+  fail "every model slot points at the one alias" "$(grep -E '^(ANTHROPIC|CLAUDE_CODE)' "$FIXTURE/claude.env" | tr '\n' ' ')"
+fi
+
+# retired router's tier-swapping under a live session is what got it deleted.
+reset_world
+run_qwen claude >/dev/null
+if [ "$(claude_env CLAUDE_CODE_NO_MODEL_FALLBACK)" = "1" ] &&
+   [ "$(claude_env CLAUDE_CODE_MAX_CONTEXT_TOKENS)" = "32768" ]; then
+  pass "fallback is off and the window is pinned to the model's context"
+else
+  fail "fallback is off and the window is pinned" "$(grep -E '^CLAUDE_CODE' "$FIXTURE/claude.env" | tr '\n' ' ')"
+fi
+
+reset_world
+run_qwen claude >/dev/null
+if grep -q '^ANTHROPIC_API_KEY=' "$FIXTURE/claude.env"; then
+  fail "the real API key is not handed to a local server" "ANTHROPIC_API_KEY was forwarded"
+else
+  pass "the real API key is not handed to a local server"
+fi
+
+# The token is referenced by name. A copied secret would show up here as a value.
+reset_world
+run_qwen claude >/dev/null
+mcp_arg=$(grep -m1 'mcpServers' "$FIXTURE/claude.argv" || true)
+if claude_argv_has "--strict-mcp-config" &&
+   printf '%s' "$mcp_arg" | grep -q 'Bearer \${CMEM_PRO_TOKEN}' &&
+   ! printf '%s' "$mcp_arg" | grep -q 'test-token-not-real'; then
+  pass "cmem is wired by env reference, with no token value in the argv"
+else
+  fail "cmem is wired by env reference" "$mcp_arg"
+fi
+
+reset_world
+run_qwen claude --mcp none >/dev/null
+if grep -q '{"mcpServers":{}}' "$FIXTURE/claude.argv"; then
+  pass "--mcp none loads no MCP servers at all"
+else
+  fail "--mcp none loads no MCP servers" "$(cat "$FIXTURE/claude.argv" | tr '\n' ' ')"
+fi
+
+reset_world
+run_qwen claude --mcp all >/dev/null
+if claude_argv_has "--strict-mcp-config"; then
+  fail "--mcp all leaves the user's own MCP config alone" "still passed --strict-mcp-config"
+else
+  pass "--mcp all leaves the user's own MCP config alone"
+fi
+
+# Tool schemas are the largest thing competing for a 32k window.
+reset_world
+run_qwen claude >/dev/null
+if claude_argv_has "--disallowed-tools"; then
+  pass "the Claude default applies its lean tool restrictions"
+else
+  fail "the Claude default applies its lean tool restrictions" "$(cat "$FIXTURE/claude.argv" | tr '\n' ' ')"
+fi
+
+reset_world
+run_qwen claude --tools all -p hi >/dev/null
+if claude_argv_has "--disallowed-tools"; then
+  fail "--tools all restricts nothing" "still passed --disallowed-tools"
+else
+  pass "--tools all restricts nothing"
+fi
+
+# The alias and the canonical tag are one model on one set of blobs. Unloading the
+# alias "to make room" would evict the session that is using it.
+reset_world
+set_alias "$MODEL"
+printf '{"models":[{"name":"%s:latest","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
+run_qwen claude >/dev/null
+if grep -q "^stop $ALIAS" "$FIXTURE/ollama.log"; then
+  fail "the alias is never unloaded as a foreign model" "$(cat "$FIXTURE/ollama.log")"
+else
+  pass "the alias is never unloaded as a foreign model"
+fi
+
+# An agent session loads the blobs under the alias. Reporting that as "not loaded"
+# plus a foreign resident model is how you end up holding 17 GB you think is free.
+reset_world
+set_alias "$MODEL"
+printf '{"models":[{"name":"%s:latest","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
+out=$(run_qwen status)
+case "$out" in
+  *"resident, 16.3 GB (as $ALIAS)"*) pass "status reports the alias as this model, not a foreign one" ;;
+  *) fail "status reports the alias as this model" "$out" ;;
+esac
+
+reset_world
+set_alias "$MODEL"
+run_qwen stop >/dev/null
+if grep -qx "stop $MODEL" "$FIXTURE/ollama.log" && grep -qx "stop $ALIAS" "$FIXTURE/ollama.log"; then
+  pass "stop unloads both the canonical tag and the alias"
+else
+  fail "stop unloads both tags" "$(cat "$FIXTURE/ollama.log" | tr '\n' ' ')"
+fi
+
+# Codex has no model-id allowlist, so it takes the real tag over Ollama's OpenAI
+# wire, and every setting is a -c override rather than an edit to config.toml.
+reset_world
+run_qwen codex >/dev/null
+if grep -qxF "model_provider=qwen" "$FIXTURE/codex.argv" &&
+   grep -qxF "model_providers.qwen.base_url=http://127.0.0.1:11434/v1" "$FIXTURE/codex.argv" &&
+   grep -qxF "model_providers.qwen.wire_api=responses" "$FIXTURE/codex.argv" &&
+   grep -qxF "$MODEL" "$FIXTURE/codex.argv"; then
+  pass "codex is pointed at Ollama's OpenAI wire with the real tag"
+else
+  fail "codex is pointed at Ollama's OpenAI wire" "$(cat "$FIXTURE/codex.argv" | tr '\n' ' ')"
+fi
+
+reset_world
+run_qwen codex >/dev/null
+cmem_arg=$(grep -m1 'mcp_servers=' "$FIXTURE/codex.argv" || true)
+if printf '%s' "$cmem_arg" | grep -q 'bearer_token_env_var' &&
+   ! printf '%s' "$cmem_arg" | grep -q 'test-token-not-real'; then
+  pass "codex gets cmem by env-var name, with no token value in the argv"
+else
+  fail "codex gets cmem by env-var name" "$cmem_arg"
+fi
+
+# --- standalone Qwen Code ----------------------------------------------------
+for entry in "" agent code; do
+  reset_world
+  run_qwen $entry >/dev/null
+  if [ -f "$FIXTURE/qwen-code.argv" ] && [ ! -f "$FIXTURE/claude.argv" ] && [ ! -f "$FIXTURE/codex.argv" ]; then
+    pass "${entry:-default} launches standalone Qwen Code"
+  else
+    fail "${entry:-default} launches standalone Qwen Code"
+  fi
+  if grep -qxF "$MODEL" "$FIXTURE/qwen-code.argv" &&
+     grep -qxF 'http://127.0.0.1:11434/v1' "$FIXTURE/qwen-code.argv" &&
+     grep -qxF 'OPENAI_API_KEY=ollama-local' "$FIXTURE/qwen-code.env" &&
+     grep -qxF "QWEN_HARNESS_ROOT=$ROOT" "$FIXTURE/qwen-code.env" &&
+     grep -q '^QWEN_CODE_SYSTEM_DEFAULTS_PATH=' "$FIXTURE/qwen-code.env"; then
+    pass "${entry:-default} pins local provider and context defaults"
+  else
+    fail "${entry:-default} pins local provider and context defaults"
+  fi
+done
+if jq -e '
+  (.model | has("maxToolCallsPerTurn") | not) and
+  (.model | has("skipLoopDetection") | not) and
+  .model.chatCompression.maxRecentFilesToRetain == 1 and
+  .context.autoCompactThreshold == 0.8 and
+  .context.clearContextOnIdle.toolResultsTotalCharsThreshold == 24000 and
+  .context.clearContextOnIdle.toolResultsNumToKeep == 3 and
+  .tools.truncateToolOutputThreshold == 8000 and
+  .tools.truncateToolOutputLines == 200
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "standalone Qwen defaults let a turn run and fit a 256K window"
+else
+  fail "standalone Qwen defaults let a turn run and fit a 256K window"
+fi
+if jq -e '
+  .fastModel == "${QWEN_FAST_MODEL}" and
+  ([.modelProviders.openai[].id] | index("${QWEN_SESSION_MODEL}") and index("${QWEN_FAST_MODEL}"))
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "side queries go to a registered fast model"
+else
+  fail "side queries go to a registered fast model"
+fi
+
+# A Qwen Code session must end the wrapper when Qwen Code exits. Falling through
+# would reach the raw-chat path and start `ollama run` with the session's prompt.
+reset_world
+run_qwen code "fix the tests" >/dev/null
+if [ -f "$FIXTURE/qwen-code.argv" ] && ! grep -q '^run ' "$FIXTURE/ollama.log" 2>/dev/null; then
+  pass "a Qwen Code session does not fall through to Ollama chat"
+else
+  fail "a Qwen Code session does not fall through to Ollama chat" "$(cat "$FIXTURE/ollama.log" 2>/dev/null)"
+fi
+
+# When the session model is its own side-query model, the provider list must not
+# register the same id twice; the side-query entry turns reasoning off.
+reset_world
+TEST_QWEN_MODEL= run_qwen code >/dev/null
+cfg=$(grep '^QWEN_CODE_SYSTEM_DEFAULTS_PATH=' "$FIXTURE/qwen-code.env" | cut -d= -f2-)
+if [ -s "$cfg" ] && [ "$(jq '.modelProviders.openai | length' "$cfg")" = 1 ] &&
+   [ "$(jq -r '.modelProviders.openai[0].id' "$cfg")" = '${QWEN_SESSION_MODEL}' ] &&
+   [ "$(jq -r '.modelProviders.openai[0].generationConfig.contextWindowSize' "$cfg")" = 262144 ]; then
+  pass "a 4B session registers its model once"
+else
+  fail "a 4B session registers its model once" "config=$cfg $(jq -c '[.modelProviders.openai[].id]' "$cfg" 2>&1)"
+fi
+reset_world
+run_qwen code >/dev/null
+cfg=$(grep '^QWEN_CODE_SYSTEM_DEFAULTS_PATH=' "$FIXTURE/qwen-code.env" | cut -d= -f2-)
+if jq -e '[.modelProviders.openai[].generationConfig.contextWindowSize] == [32768, 262144]' "$cfg" >/dev/null; then
+  pass "a 27B session keeps its 32K window and uses 256K for side queries"
+else
+  fail "a 27B session uses its selected context window"
+fi
+
+# --- qwen goal ------------------------------------------------------------------
+reset_world
+out=$(run_qwen 27b goal "make the tests pass"); status=$?
+case "$status:$out" in
+  0:*) fail "goal refuses to run unattended without -y" "exited 0: $out" ;;
+  *"needs -y"*) pass "goal refuses to run unattended without -y" ;;
+  *) fail "goal refuses to run unattended without -y" "$out" ;;
+esac
+
+reset_world
+printf 'complete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 0 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 1 ] &&
+   grep -q -- '-y -o stream-json /goal make the tests pass' "$FIXTURE/goal-calls" &&
+   grep -q 'goal complete on attempt 1' <<<"$out" && grep -q 'read_file src/app.py' <<<"$out"; then
+  pass "goal stops after a verified completion and shows each tool call"
+else
+  fail "goal stops after a verified completion" "status=$status $out $(cat "$FIXTURE/goal-calls" 2>/dev/null)"
+fi
+
+reset_world
+printf 'paused\nusage_limited\ncomplete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 0 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 3 ] &&
+   ! grep -q -- '--continue\|--resume' "$FIXTURE/goal-calls" &&
+   [ "$(grep -c 'lease=yes' "$FIXTURE/goal-calls")" -eq 3 ] &&
+   grep -q 'starting a fresh session' <<<"$out"; then
+  pass "a stalled goal retries in a fresh session while holding the lease"
+else
+  fail "a stalled goal retries in a fresh session" "status=$status $out $(cat "$FIXTURE/goal-calls" 2>/dev/null)"
+fi
+
+reset_world
+printf 'paused\npaused\npaused\npaused\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y --attempts 2 "make the tests pass"); status=$?
+if [ "$status" = 1 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 2 ] &&
+   grep -q 'not complete after 2 attempts' <<<"$out"; then
+  pass "goal gives up after --attempts and exits 1"
+else
+  fail "goal gives up after --attempts" "status=$status $out"
+fi
+
+reset_world
+printf 'blocked\ncomplete\n' > "$FIXTURE/goal-statuses"
+out=$(run_qwen 27b goal -y "make the tests pass"); status=$?
+if [ "$status" = 2 ] && [ "$(wc -l < "$FIXTURE/goal-calls")" -eq 1 ]; then
+  pass "a verified blocked goal stops without retrying"
+else
+  fail "a verified blocked goal stops without retrying" "status=$status $out"
+fi
+
+# --- side-query model ----------------------------------------------------------
+reset_world
+run_qwen code >/dev/null
+if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-256k' "$FIXTURE/qwen-code.env" &&
+   grep -qxF 'QWEN_DISABLE_AUTO_TITLE=1' "$FIXTURE/qwen-code.env"; then
+  pass "27B Qwen Code sends side queries to the 4B, with auto titles off"
+else
+  fail "27B Qwen Code sends side queries to the 4B" "$(grep -E 'QWEN_(FAST_MODEL|DISABLE_AUTO_TITLE)' "$FIXTURE/qwen-code.env" 2>/dev/null)"
+fi
+if jq -e '
+  .ui.enableFollowupSuggestions == false and
+  .experimental.emitToolUseSummaries == false
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "per-turn side queries are off, so the 4B is not loaded every turn"
+else
+  fail "per-turn side queries are off, so the 4B is not loaded every turn"
+fi
+if jq -e '
+  (.modelProviders.openai[] | select(.id == "${QWEN_FAST_MODEL}") | .generationConfig.extra_body.reasoning_effort) == "none"
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "the side-query model answers without thinking, inside the verifier's 30 s"
+else
+  fail "the side-query model answers without thinking, inside the verifier's 30 s"
+fi
+
+# An agent that attaches to an already-resident model still takes a free lock
+# and lease, because its own Goal verification can unload that model mid-run.
+reset_world
+printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$MODEL" > "$FIXTURE/ps.json"
+out=$(run_qwen code)
+if grep -q 'attaching to the resident' <<<"$out" && [ -s "$FIXTURE/qwen-code.leases" ]; then
+  pass "an attaching agent session holds the lease while it runs"
+else
+  fail "an attaching agent session holds the lease while it runs" "$out $(cat "$FIXTURE/qwen-code.leases" 2>/dev/null)"
+fi
+# The wrapper waits for Qwen Code instead of exec-ing it, so its EXIT trap
+# releases the lease as soon as the session ends.
+if [ -z "$(find "$FIXTURE/leases" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null)" ]; then
+  pass "a Qwen Code session releases its lease when it exits"
+else
+  fail "a Qwen Code session releases its lease when it exits" "$(ls "$FIXTURE/leases")"
+fi
+
+reset_world
+printf '{"models":[{"name":"%s","size":17716740000,"digest":"heavy"}]}\n' "$MODEL" > "$FIXTURE/tags.json"
+out=$(run_qwen code)
+if grep -qxF "QWEN_FAST_MODEL=$MODEL" "$FIXTURE/qwen-code.env"; then
+  pass "an unpulled side-query model falls back to the session model"
+else
+  fail "an unpulled side-query model falls back to the session model" "$out"
+fi
+
+reset_world
+TEST_QWEN_MODEL= run_qwen code >/dev/null
+if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-256k' "$FIXTURE/qwen-code.env" &&
+   grep -qxF 'QWEN_SESSION_MODEL=qwen3.5:4b-256k' "$FIXTURE/qwen-code.env"; then
+  pass "a 4B session is its own side-query model"
+else
+  fail "a 4B session is its own side-query model" "$(grep -E 'QWEN_(FAST|SESSION)_MODEL' "$FIXTURE/qwen-code.env")"
+fi
+if jq -e '
+  (.skills.disabledLevels | index("user") and index("bundled")) and
+  .memory.enableManagedAutoMemory == false and
+  .memory.enableManagedAutoDream == false and
+  .tools.toolSearch.threshold == 0 and
+  (.tools.eager | index("skill") | not) and
+  (.tools.eager | index("web_fetch") | not) and
+  (.permissions.deny | index("notebook_edit"))
+' "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "standalone Qwen defaults keep the startup prompt near 11K tokens"
+else
+  fail "standalone Qwen defaults keep the startup prompt near 11K tokens"
+fi
+reset_world
+run_qwen code --help >/dev/null
+if [ ! -s "$FIXTURE/ollama.log" ]; then
+  pass "code help does not load a model"
+else
+  fail "code help does not load a model"
+fi
+reset_world
+run_qwen 'build the app' >/dev/null
+if grep -qxF 'build the app' "$FIXTURE/qwen-code.argv"; then
+  pass "agent prompt remains one argument"
+else
+  fail "agent prompt remains one argument"
+fi
+reset_world
+mv "$STUB/qwen-code" "$STUB/qwen-code.saved"
+if out=$(run_qwen code); then
+  fail "missing Qwen Code fails with installation guidance" "$out"
+elif [[ "$out" == *"install-qwen-code.sh"* ]] && [ ! -s "$FIXTURE/ollama.log" ]; then
+  pass "missing Qwen Code fails before loading a model"
+else
+  fail "missing Qwen Code fails before loading a model" "$out"
+fi
+mv "$STUB/qwen-code.saved" "$STUB/qwen-code"
+
+reset_world
+out=$(run_qwen raw)
+case "$out" in
+  *"RAN run $MODEL"*) pass "raw opens chat without execution tools" ;;
+  *) fail "raw opens chat without execution tools" "$out" ;;
+esac
+
+# --- the session says what is answering --------------------------------------
+
+# Claude Code names every surface from the model id, and the id is a borrowed
+# catalog entry, so without these the session calls itself Haiku 4.5 throughout.
+reset_world
+run_qwen claude >/dev/null
+if [ "$(claude_env QWEN_SESSION_MODEL)" = "$MODEL" ] &&
+   [ "$(claude_env ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME)" = "$MODEL (local)" ] &&
+   [ "$(claude_env ANTHROPIC_DEFAULT_OPUS_MODEL_NAME)" = "$MODEL (local)" ]; then
+  pass "the session is labelled with the local model, not the catalog id"
+else
+  fail "the session is labelled with the local model" \
+       "$(grep -E '^(QWEN_SESSION_MODEL|ANTHROPIC_DEFAULT_.*_NAME)' "$FIXTURE/claude.env" | tr '\n' ' ')"
+fi
+
+# A slot left on a real Claude id 404s against Ollama the moment it is selected.
+reset_world
+run_qwen claude >/dev/null
+if [ "$(claude_env ANTHROPIC_DEFAULT_FABLE_MODEL)" = "$ALIAS" ]; then
+  pass "the fable slot points at the alias like every other slot"
+else
+  fail "the fable slot points at the alias" "$(claude_env ANTHROPIC_DEFAULT_FABLE_MODEL)"
+fi
+
+# --- claude-mem ---------------------------------------------------------------
+
+# claude-mem's worker is one daemon for the machine, and its observer spawns the
+# claude CLI with the DAEMON's environment. Started from inside this session it
+# would inherit ANTHROPIC_BASE_URL and answer every session's memory compression
+# from Ollama, so the wrapper starts it before that environment exists.
+reset_world
+run_qwen claude >/dev/null
+if grep -q 'worker-service.cjs start' "$FIXTURE/node.log" 2>/dev/null; then
+  pass "the claude-mem worker is started for a session that has none"
+else
+  fail "the claude-mem worker is started" "$(cat "$FIXTURE/node.log" 2>/dev/null)"
+fi
+
+reset_world
+run_qwen claude >/dev/null
+if grep -q '^ANTHROPIC_BASE_URL=' "$FIXTURE/node.env" 2>/dev/null; then
+  fail "the worker never inherits the local base url" "ANTHROPIC_BASE_URL reached the worker"
+else
+  pass "the worker never inherits the local base url"
+fi
+
+# Newest non-orphaned install, version-sorted: 13.24.5 must not beat 13.24.23,
+# and an orphaned 13.24.99 must not beat either.
+reset_world
+run_qwen claude >/dev/null
+if grep -q '13\.24\.23/scripts/worker-service.cjs start' "$FIXTURE/node.log" 2>/dev/null; then
+  pass "the newest non-orphaned claude-mem version is the one started"
+else
+  fail "the newest non-orphaned claude-mem version is started" "$(cat "$FIXTURE/node.log" 2>/dev/null)"
+fi
+
+reset_world
+touch "$FIXTURE/mem-up"
+run_qwen claude >/dev/null
+if [ -f "$FIXTURE/node.log" ]; then
+  fail "a healthy worker is left alone" "$(cat "$FIXTURE/node.log")"
+else
+  pass "a healthy worker is left alone"
+fi
+
+reset_world
+out=$(QWEN_MEMORY=0 run_qwen claude)
+if [ ! -f "$FIXTURE/node.log" ] && grep -q '{"mcpServers":{}}' "$FIXTURE/claude.argv"; then
+  pass "QWEN_MEMORY=0 is offline: no recall server and no worker"
+else
+  fail "QWEN_MEMORY=0 is offline" "$out"
+fi
+
+# An explicit --mcp is a decision, and outranks the blanket switch.
+reset_world
+QWEN_MEMORY=0 run_qwen claude --mcp all >/dev/null
+if claude_argv_has "--strict-mcp-config"; then
+  fail "an explicit --mcp outranks QWEN_MEMORY=0" "still passed --strict-mcp-config"
+else
+  pass "an explicit --mcp outranks QWEN_MEMORY=0"
+fi
+
+reset_world
+out=$(run_qwen claude --mcp bogus)
+case "$out" in
+  *"--mcp takes cmem, none or all"*) pass "an unknown --mcp value is refused" ;;
+  *) fail "an unknown --mcp value is refused" "$out" ;;
+esac
+
+# --- 4B default and explicit 27B selection -----------------------------------
+
+reset_world
+TEST_QWEN_MODEL= run_qwen 'build this project' >/dev/null
+if grep -qxF 'qwen3.5:4b-256k' "$FIXTURE/qwen-code.argv" &&
+   grep -qxF 'build this project' "$FIXTURE/qwen-code.argv"; then
+  pass "unconfigured qwen selects 4B and preserves the prompt"
+else
+  fail "unconfigured qwen selects 4B"
+fi
+if jq -e '[.modelProviders.openai[].generationConfig.contextWindowSize] == [262144, 262144]' \
+  "$ROOT/config/qwen-code-local.json" >/dev/null; then
+  pass "Qwen Code gives both 4B routes a 256K context window"
+else
+  fail "Qwen Code context window is 256K"
+fi
+reset_world
+TEST_QWEN_MODEL= run_qwen claude >/dev/null
+if [ "$(claude_env CLAUDE_CODE_MAX_CONTEXT_TOKENS)" = "262144" ]; then
+  pass "Claude sees the selected 4B model's 256K window"
+else
+  fail "Claude context window is 256K"
+fi
+
+for entry in '' code agent claude codex raw; do
+  reset_world
+  out=$(TEST_QWEN_MODEL=qwen3.5:4b-64k run_qwen 27b $entry hello)
+  case "$out" in
+    *"$MODEL"*) pass "27b ${entry:-default} overrides a saved 4B selection" ;;
+    *) fail "27b ${entry:-default} selects 27B" "$out" ;;
+  esac
+  if grep -qxF '27b' "$FIXTURE/qwen-code.argv" 2>/dev/null; then
+    fail "model selector is consumed before the agent prompt"
+  fi
+done
+
+reset_world
+TEST_QWEN_MODEL= run_qwen 27B code hello >/dev/null
+if grep -qxF "$MODEL" "$FIXTURE/qwen-code.argv"; then
+  pass "27B uppercase selector uses the heavy model"
+else
+  fail "27B uppercase selector uses the heavy model"
+fi
+
+reset_world
+set_alias "$MODEL"
+TEST_QWEN_MODEL= run_qwen claude >/dev/null
+if grep -qxF "cp qwen3.5:4b-256k $ALIAS" "$FIXTURE/ollama.log" &&
+   [ "$(claude_env QWEN_SESSION_MODEL)" = 'qwen3.5:4b-256k' ]; then
+  pass "Claude refreshes an idle 27B alias to 4B"
+else
+  fail "Claude refreshes an idle stale alias"
+fi
+
+reset_world
+set_alias "$MODEL"
+printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
+if out=$(TEST_QWEN_MODEL= run_qwen claude); then
+  fail "an active stale alias blocks a model switch" "$out"
+elif [ ! -s "$FIXTURE/ollama.log" ]; then
+  pass "an active stale alias is neither changed nor unloaded"
+else
+  fail "an active stale alias is left untouched" "$(cat "$FIXTURE/ollama.log")"
+fi
+
+reset_world
+set_alias "$MODEL"
+printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
+out=$(TEST_QWEN_MODEL= run_qwen status)
+case "$out" in
+  *"qwen3.5:4b-256k"*"not loaded"*"also resident: $ALIAS"*) pass "4B status does not claim a resident 27B alias" ;;
+  *) fail "4B status distinguishes a foreign alias" "$out" ;;
+esac
+TEST_QWEN_MODEL= run_qwen stop >/dev/null
+if grep -qxF "stop $ALIAS" "$FIXTURE/ollama.log"; then
+  fail "4B stop must not unload a 27B alias"
+else
+  pass "4B stop leaves the 27B alias alone"
+fi
+
+reset_world
+mkdir -p "$FIXTURE/state/qwen3.5_4b-64k"
+echo 1 > "$FIXTURE/state/qwen3.5_4b-64k/resident-bytes"
+echo 20 > "$FIXTURE/free_pct"
+out=$(run_qwen 27b raw hello)
+case "$out" in
+  *"RAN run qwen3.8:27b-obliterated hello"*) pass "Qwen admission does not use stale measurements" ;;
+  *) fail "Qwen admission does not use stale measurements" "$out" ;;
+esac
+mkdir -p "$FIXTURE/state/qwen3.5_4b-256k"
+echo 1 > "$FIXTURE/state/qwen3.5_4b-256k/resident-bytes"
+out=$(TEST_QWEN_MODEL= run_qwen raw hello)
+case "$out" in
+  *"RAN run qwen3.5:4b-256k hello"*) pass "4B admission uses its own recorded measurement" ;;
+  *) fail "4B measurement is usable" "$out" ;;
+esac
+
+printf '\n%s\n' "$([ "$failures" -eq 0 ] && echo 'all qwen checks passed' || echo "$failures qwen check(s) failed")"
+exit $(( failures > 0 ))

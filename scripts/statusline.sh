@@ -1,0 +1,88 @@
+#!/bin/bash
+# Custom Claude Code status line: shows model, working directory, and active session count.
+# Wire via "statusLine.command" in ~/.claude/settings.json.
+
+input=$(cat)
+
+# jq parses this payload. Without it the script used to print a bare
+# " . shells: 0" and exit 0 — no model, and no way to tell that was a failure
+# rather than a healthy session. A status line that cannot tell you the truth
+# has to say so.
+if ! command -v jq >/dev/null 2>&1; then
+  printf 'STATUSLINE BLIND · jq not found on PATH · no model or local-tier badge\n'
+  exit 0
+fi
+
+session_id=$(printf '%s' "$input" | jq -r '.session_id // empty')
+model=$(printf '%s' "$input" | jq -r '.model.display_name // empty')
+cwd=$(printf '%s' "$input" | jq -r '.cwd // empty')
+
+cwd_short="${cwd/#$HOME/~}"
+
+shells=0
+for f in "$HOME"/.claude/sessions/*.json; do
+  [ -f "$f" ] || continue
+  pid=$(basename "$f" .json)
+  kill -0 "$pid" 2>/dev/null || continue
+  ep=$(jq -r '.entrypoint // ""' "$f" 2>/dev/null)
+  [ "$ep" = "cli" ] && shells=$((shells+1))
+done
+
+# Legion worker counts for the legion run in THIS terminal's repo.
+# Walk up from cwd to the first .legion/state.json, then count in-flight
+# workers split by target: cloud (Modal), local (worktree), qwen (local-model).
+# Only shown while something is actually running.
+legion_part=""
+d="$cwd"
+while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "$HOME" ]; do
+  state="$d/.legion/state.json"
+  if [ -f "$state" ]; then
+    read -r cloud_n local_n qwen_n < <(jq -r '
+      [.tasks[]? | select(.status == "in_flight")] as $live
+      | [ ($live | map(select(.target == "cloud"))        | length),
+          ($live | map(select(.target == "local"))        | length),
+          ($live | map(select(.target == "local-model"))  | length) ]
+      | @tsv
+    ' "$state" 2>/dev/null)
+    cloud_n=${cloud_n:-0}; local_n=${local_n:-0}; qwen_n=${qwen_n:-0}
+    if [ $((cloud_n + local_n + qwen_n)) -gt 0 ]; then
+      legion_part="legion ☁$cloud_n 💻$local_n 🐦$qwen_n"
+    fi
+    break
+  fi
+  d=$(dirname "$d")
+done
+
+# A session pointed at Ollama is local whether or not the wrapper labelled it.
+base_url="${ANTHROPIC_BASE_URL:-}"
+local_model="${QWEN_SESSION_MODEL:-}"
+if [ -z "$local_model" ]; then
+  case "$base_url" in
+    *:11434|*:11434/|http://127.0.0.1:11434*|http://localhost:11434*) local_model="ollama" ;;
+  esac
+fi
+
+model_lc=$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')
+case "$model_lc" in
+  qwen|qwen-fast|qwen38-obliterated|qwen38-action)
+    model_part="QWEN LOCAL" ;;
+  *)
+    model_part="$model" ;;
+esac
+
+# Replaces the name rather than appending to it, for the same reason the failover
+# badge below does: during a local session the payload's name is the lie, and
+# printing "Haiku 4.5 · QWEN LOCAL" would show both halves as equals.
+if [ -n "$local_model" ]; then
+  case "$(printf '%s' "$local_model" | tr '[:upper:]' '[:lower:]')" in
+    *qwen*) model_part="QWEN LOCAL" ;;
+    *)      model_part="LOCAL · $local_model" ;;
+  esac
+fi
+
+parts="$model_part"
+[ -n "$cwd_short" ] && parts="$parts · $cwd_short"
+parts="$parts · shells: $shells"
+[ -n "$legion_part" ] && parts="$parts · $legion_part"
+
+printf '%s' "$parts"

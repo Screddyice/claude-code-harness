@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Resumable, checksum-verified Claude Code native updater.
+set -euo pipefail
+
+BUCKET="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
+VERSIONS_DIR="$HOME/.local/share/claude/versions"
+LINK="$HOME/.local/bin/claude"
+WORK="${TMPDIR:-/tmp}/claude-manual-update"
+RESULT="$HOME/.claude/.last-update-result.json"
+RETRY_DELAY="${CLAUDE_UPDATER_RETRY_DELAY:-5}"
+
+TARGET="latest"
+CHECK_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --check) CHECK_ONLY=1 ;;
+    -h|--help)
+      sed -n '2,20p' "$0"
+      exit 0
+      ;;
+    *) TARGET="$arg" ;;
+  esac
+done
+
+CURL=(curl --fail --location --silent --show-error --noproxy '*'
+  --connect-timeout 30)
+META_CURL=("${CURL[@]}" --retry 10 --retry-delay 5 --retry-all-errors)
+
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) PLATFORM="darwin-arm64" ;;
+  Darwin-x86_64) PLATFORM="darwin-x64" ;;
+  Linux-aarch64) PLATFORM="linux-arm64" ;;
+  Linux-x86_64) PLATFORM="linux-x64" ;;
+  *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+
+if [[ "$TARGET" == "latest" || "$TARGET" == "stable" ]]; then
+  VERSION="$("${META_CURL[@]}" "$BUCKET/$TARGET")"
+  echo "channel $TARGET -> $VERSION"
+else
+  VERSION="$TARGET"
+fi
+
+INSTALLED=""
+[[ -L "$LINK" ]] && INSTALLED="$(basename "$(readlink "$LINK")")"
+echo "installed: ${INSTALLED:-none}"
+echo "target:    $VERSION ($PLATFORM)"
+
+MANIFEST="$("${META_CURL[@]}" "$BUCKET/$VERSION/manifest.json")"
+read -r SHA SIZE <<<"$(printf '%s' "$MANIFEST" | python3 -c "
+import json,sys
+p = json.load(sys.stdin)['platforms']['$PLATFORM']
+print(p['checksum'], p['size'])
+")"
+echo "expected:  $SHA ($((SIZE / 1048576))MB)"
+
+record_success() {
+  local version_from="${INSTALLED:-none}"
+  mkdir -p "$(dirname "$RESULT")"
+  python3 - "$RESULT" "$version_from" "$VERSION" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import sys
+import tempfile
+
+result = pathlib.Path(sys.argv[1])
+payload = {
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+    "path": "native",
+    "outcome": "success",
+    "status": "success",
+    "version_from": sys.argv[2],
+    "version_to": sys.argv[3],
+    "error_code": None,
+}
+with tempfile.NamedTemporaryFile("w", dir=result.parent, delete=False) as handle:
+    json.dump(payload, handle, separators=(",", ":"))
+    handle.write("\n")
+    temp_name = handle.name
+os.replace(temp_name, result)
+PY
+}
+
+if [[ "$INSTALLED" == "$VERSION" ]]; then
+  if [[ -f "$VERSIONS_DIR/$VERSION" ]] \
+    && [[ "$(shasum -a 256 "$VERSIONS_DIR/$VERSION" | cut -d' ' -f1)" == "$SHA" ]]; then
+    echo "already installed and checksum-verified"
+    if [[ $CHECK_ONLY -eq 0 ]]; then
+      record_success
+      echo "recorded verified success for Claude doctor"
+    fi
+    exit 0
+  fi
+  echo "same version but checksum mismatch; reinstalling"
+fi
+
+if [[ $CHECK_ONLY -eq 1 ]]; then
+  echo "(--check: stopping before download)"
+  exit 0
+fi
+
+mkdir -p "$WORK" "$VERSIONS_DIR" "$(dirname "$LINK")"
+DL="$WORK/$VERSION.$PLATFORM"
+echo "downloading (resumable; safe to interrupt and re-run)..."
+downloaded="$(stat -f %z "$DL" 2>/dev/null || stat -c %s "$DL" 2>/dev/null || echo 0)"
+if [[ "$downloaded" == "$SIZE" ]]; then
+  echo "complete download already present; verifying it"
+else
+  attempt=1
+  while ! "${CURL[@]}" --continue-at - --progress-bar -o "$DL" \
+    "$BUCKET/$VERSION/$PLATFORM/claude" >&2; do
+    if [[ $attempt -ge 10 ]]; then
+      echo "download failed after $attempt attempts; partial file preserved at $DL" >&2
+      exit 1
+    fi
+    bytes="$(stat -f %z "$DL" 2>/dev/null || stat -c %s "$DL" 2>/dev/null || echo 0)"
+    echo "download interrupted; preserving $bytes bytes and retrying" >&2
+    attempt=$((attempt + 1))
+    sleep "$RETRY_DELAY"
+  done
+fi
+
+GOT="$(shasum -a 256 "$DL" | cut -d' ' -f1)"
+if [[ "$GOT" != "$SHA" ]]; then
+  echo "CHECKSUM MISMATCH; refusing to install" >&2
+  echo "expected $SHA" >&2
+  echo "got      $GOT" >&2
+  exit 1
+fi
+echo "checksum verified"
+
+chmod +x "$DL"
+mv -f "$DL" "$VERSIONS_DIR/.$VERSION.incoming"
+mv -f "$VERSIONS_DIR/.$VERSION.incoming" "$VERSIONS_DIR/$VERSION"
+ln -sfn "$VERSIONS_DIR/$VERSION" "$LINK"
+record_success
+
+echo "installed $VERSION -> $LINK"
+"$LINK" --version 2>/dev/null || true

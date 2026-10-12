@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# gbrowse — a thin wrapper over gstack's `browse` that makes headed sessions survive.
+#
+# WHY THIS EXISTS
+#   `browse handoff` opens a visible browser for the user to take over — log in,
+#   solve a CAPTCHA, clear an MFA prompt. In a Claude Code session it reliably
+#   destroys the thing it just created: the daemon dies within ~15s and the user's
+#   login goes with it. Observed 2026-08-14 driving the GoDaddy and Squarespace
+#   panels: five daemon deaths, three logins.
+#
+#   The cause is that handoff promotes a RUNNING daemon in place. In
+#   browse/src/browser-manager.ts (~line 1600) it swaps the Playwright context and
+#   sets `this.connectionMode = 'headed'` without restarting the process. The
+#   parent-process watchdog registered at boot (browse/src/server.ts:687-714) is
+#   still live and still pointed at whatever shell started the daemon. Claude Code's
+#   Bash tool kills that shell after every tool call, so on the next 15s poll the
+#   watchdog sees a dead parent, sees headed mode, and shuts the daemon down. In
+#   headless mode it would have deliberately stayed alive; promotion is what turns a
+#   tolerated condition into a fatal one.
+#
+#   A second path shares the predicate: the SIGTERM handler at server.ts:1369-1381
+#   also quits when runtime mode is headed, and it is gated by NEITHER
+#   BROWSE_PARENT_PID nor BROWSE_HEADED. So exporting BROWSE_PARENT_PID=0 only
+#   silences the poller, not this. That is why the env-var mitigation tried first
+#   was not enough.
+#
+#   `browse connect` does the right thing already: cli.ts:1062-1100 force-kills any
+#   existing daemon and cold-restarts with BROWSE_HEADED=1 + BROWSE_PARENT_PID=0, so
+#   no watchdog is ever registered, and cli.ts:341 spawns it detached (own process
+#   group) so the shell's SIGTERM never reaches it.
+#
+#   So: route handoff through connect. Cookies survive the restart because the
+#   Chromium profile under ~/.gstack/ is persistent — that is why the Squarespace
+#   login held across restarts once connect was used.
+#
+#   Upstream fix is a separate PR against garrytan/gstack. Patching the checkout
+#   locally is not durable: /gstack-upgrade runs `git reset --hard origin/main`.
+#
+# USAGE
+#   gbrowse handoff [message]   headed takeover that actually survives
+#   gbrowse doctor              daemon health: mode agreement, orphans, watchdog risk
+#   gbrowse <anything else>     passed straight through to `browse`
+set -uo pipefail
+
+# Same resolution order the /browse skill uses: repo-local build first, then global.
+_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+B=""
+[ -n "$_root" ] && [ -x "$_root/.claude/skills/gstack/browse/dist/browse" ] \
+  && B="$_root/.claude/skills/gstack/browse/dist/browse"
+[ -z "$B" ] && B="$HOME/.claude/skills/gstack/browse/dist/browse"
+
+if [ ! -x "$B" ]; then
+  echo "gbrowse: browse binary not found at $B" >&2
+  echo "  build it with: cd ~/.claude/skills/gstack && ./setup" >&2
+  exit 127
+fi
+
+STATE="${BROWSE_STATE_FILE:-$HOME/.gstack/browse.json}"
+
+_state_field() {
+  python3 -c "
+import json,sys
+try: print(json.load(open('$STATE')).get('$1',''))
+except Exception: print('')
+" 2>/dev/null
+}
+
+case "${1:-}" in
+# ─── handoff: connect instead of promoting in place ─────────────────────
+handoff)
+  shift
+  msg="${*:-Taking over — log in, then tell the agent to continue}"
+
+  # Preserve the page across the restart. connect starts a fresh browser, so
+  # without this the user lands on the welcome page instead of where they were.
+  url="$("$B" url 2>/dev/null | tail -1 | tr -d '[:space:]')"
+  case "$url" in http*) ;; *) url="" ;; esac
+
+  echo "gbrowse: opening a headed browser via connect (not handoff — see header)"
+  "$B" connect >/dev/null 2>&1 || {
+    echo "gbrowse: connect failed. Try: $B disconnect && gbrowse handoff" >&2
+    exit 1
+  }
+
+  if [ -n "$url" ]; then
+    "$B" goto "$url" >/dev/null 2>&1 || true
+    echo "gbrowse: restored $url"
+  fi
+  "$B" focus >/dev/null 2>&1 || true
+
+  mode="$("$B" status 2>/dev/null | awk '/^Mode:/{print $2}')"
+  pid="$("$B" status 2>/dev/null | awk '/^PID:/{print $2}')"
+  echo "gbrowse: headed (mode=${mode:-unknown} pid=${pid:-unknown}) — survives across tool calls"
+  echo
+  echo "  $msg"
+  echo
+  echo "  When done, the agent continues with: $B resume"
+  ;;
+
+# ─── doctor: surface the two failure shapes before they bite ────────────
+doctor)
+  echo "→ gbrowse doctor"
+  echo "   binary: $B"
+  echo "   state:  $STATE"
+
+  if [ ! -f "$STATE" ]; then
+    echo "   ! no state file — no daemon has been started yet"
+    exit 0
+  fi
+
+  s_pid="$(_state_field pid)"
+  s_port="$(_state_field port)"
+  s_mode="$(_state_field mode)"
+  echo "   on disk: pid=${s_pid:-?} port=${s_port:-?} mode=${s_mode:-?}"
+
+  if [ -n "$s_pid" ] && kill -0 "$s_pid" 2>/dev/null; then
+    echo "   ✓ pid $s_pid is alive"
+  else
+    echo "   ✗ pid ${s_pid:-?} is NOT running — state file is stale"
+    echo "     connect only kills what the state file knows about, so a daemon"
+    echo "     started on another port can survive a connect untouched."
+    exit 1
+  fi
+
+  live_mode="$("$B" status 2>/dev/null | awk '/^Mode:/{print $2}')"
+  echo "   live:    mode=${live_mode:-unreachable}"
+
+  # The divergence that makes this bug invisible. server.ts writes the state
+  # file's mode only during start(), so an in-place handoff promotion leaves
+  # disk saying "launched" while the process is headed and dying on a timer.
+  if [ "${live_mode:-}" = "headed" ] && [ "${s_mode:-}" != "headed" ]; then
+    echo
+    echo "   ✗ MODE DIVERGENCE: running headed, state file says '${s_mode:-?}'"
+    echo "     This is the handoff-promotion bug. A watchdog is still registered"
+    echo "     against a dead shell and will kill this daemon within ~15s, taking"
+    echo "     any login with it."
+    echo "     Fix: gbrowse handoff  (cold-restarts via connect, no watchdog)"
+    exit 1
+  fi
+
+  if [ "${live_mode:-}" = "headed" ]; then
+    echo "   ✓ headed and consistent — launched by connect, no watchdog registered"
+  else
+    echo "   ✓ headless — watchdog is registered but harmless (server stays alive)"
+  fi
+
+  # Orphans: other browse servers not described by the state file.
+  others="$(pgrep -f 'browse/src/server\.ts' 2>/dev/null | grep -v "^${s_pid}$" | tr '\n' ' ')"
+  if [ -n "${others// /}" ]; then
+    echo "   ! orphan browse servers not in the state file: $others"
+    echo "     these are invisible to connect and can hold ports or profiles"
+  fi
+  ;;
+
+# ─── everything else is plain browse ────────────────────────────────────
+*)
+  exec "$B" "$@"
+  ;;
+esac

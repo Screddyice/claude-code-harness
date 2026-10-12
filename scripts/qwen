@@ -1,0 +1,1096 @@
+#!/usr/bin/env bash
+# qwen — local Qwen 4B by default; `qwen 27b` selects the optional 27B.
+#
+# WHY THIS EXISTS
+#   The wrapper adds client setup, model aliases, leases, and a shared compute lock
+#   around Ollama. macOS owns memory pressure and Ollama owns model residency; the
+#   launcher does not maintain a second RAM budget.
+#
+#   The lease and lock coordinate cooperating local clients while a model loads.
+#   They do not replace macOS or Ollama's memory boundaries.
+#
+# USAGE
+#   qwen                       standalone Qwen Code agent on Qwen3.5 4B
+#   qwen 27b [command/prompt]   explicitly select Qwen3.8 27B
+#   qwen "build this project"  one-shot agent task, then exit
+#   git diff | qwen            read the prompt from stdin
+#   qwen status                what is resident, who owns compute
+#   qwen stop                  unload it now instead of waiting for keep_alive
+#   qwen claude [args]         a Claude Code session running on this model
+#   qwen agent  [args]         standalone Qwen Code (same as bare qwen)
+#   qwen code   [args]         standalone Qwen Code (same as bare qwen)
+#   qwen --plan FILE [args]    keep a bounded build plan in persistent context
+#   qwen goal -y "objective"   run a /goal headless until verified complete,
+#                              retrying in a fresh session (QWEN_GOAL_ATTEMPTS, default 3)
+#   qwen codex  [args]         a Codex session running on this model
+#   qwen raw [prompt]          plain Ollama chat, without execution tools
+#
+#   Qwen Code supplies file editing, shell commands, builds and session history.
+#   It connects directly to Ollama and does not launch Claude Code or Codex.
+#   Only `qwen raw` is chat-only: its descriptions of actions do not execute.
+#
+#   --mcp cmem|none|all        MCP selection (clients: cmem; Qwen Code: all)
+#   --tools mcp|lean|all       built-in tools for claude/codex (default: lean)
+#   qwen code --help           Qwen Code options, including MCP and approvals
+#   QWEN_MEMORY=0              disable claude-client memory integration
+#   QWEN_JEV=0 / QWEN_OFFLINE=1 skip the optional OpenRouter JEV sidecar
+#
+#   --force         compatibility flag; macOS/Ollama remain the memory authority
+#   --keep-others   leave other resident Ollama models alone (default: unload them)
+#   --keepalive D   how long Ollama holds the model after the session (e.g. 30s, 1h)
+#   Ollama's own --think, --verbose, --hidethinking, --nowordwrap, --format pass
+#   straight through.
+set -euo pipefail
+
+MODEL="${QWEN_MODEL:-qwen3.5:4b-256k}"
+# Qwen Code sends side queries (the Goal completion verifier, follow-up
+# suggestions) to this model. The verifier aborts after a fixed 30 s, and a cold
+# 11K-token verifier prompt takes the 27B ~40 s to read, so a 27B Goal could
+# never finish verified. The 4B reads it in seconds.
+FAST_MODEL="${QWEN_FAST_MODEL:-qwen3.5:4b-256k}"
+# Consume the model selector before dispatching an agent or passing a prompt.
+# An explicit CLI selection wins over a saved QWEN_MODEL override.
+case "${1:-}" in
+  27b|27B) MODEL="qwen3.8:27b-obliterated"; shift ;;
+esac
+GB=$((1024 ** 3))
+LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.cache/llmjury/compute-leases}"
+LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
+STALE_SESSION_SECONDS="${QWEN_STALE_SESSION_SECONDS:-1800}"
+MODEL_KEY="$(printf '%s' "$MODEL" | tr -c '[:alnum:]_.-' '_')"
+MEASURED="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/$MODEL_KEY/resident-bytes"
+model_context_for() {
+  case "$1" in
+    qwen3.5:4b-256k) printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-262144}" ;;
+    *) printf '%s\n' "${OLLAMA_CONTEXT_LENGTH:-32768}" ;;
+  esac
+}
+model_context() { model_context_for "$MODEL"; }
+AGENT_LABEL="${QWEN_OLLAMA_AGENT:-com.$(id -un).ollama}"
+# Claude Code refuses any model id outside its compiled catalog, whatever
+# ANTHROPIC_BASE_URL points at, so the local weights are served under a catalog id.
+# See cmd_claude for why this is the only way in and why nothing else worked.
+CLAUDE_MODEL_ID="${QWEN_CLAUDE_MODEL_ID:-claude-haiku-4-5-20251001}"
+# What a session should CALL this model. The id above is a catalog id borrowed to
+# get past Claude Code's model validation, so every surface that reads the id
+# says "Haiku 4.5" — the one thing on screen that is not true. The status line
+# reads QWEN_SESSION_MODEL (exported in cmd_claude) and prints this instead.
+MODEL_LABEL="${QWEN_MODEL_LABEL:-$MODEL (local)}"
+CMEM_URL="${QWEN_CMEM_URL:-https://cmem.ai/api/mcp}"
+# claude-mem's worker is a singleton daemon on one port per uid, matching
+# claude-mem's own default: 37700 + uid % 100.
+MEM_PORT="${CLAUDE_MEM_WORKER_PORT:-$(( 37700 + $(id -u) % 100 ))}"
+MEM_HOST="${CLAUDE_MEM_WORKER_HOST:-127.0.0.1}"
+MEM_CACHE="${QWEN_CLAUDE_MEM_CACHE:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/thedotmack/claude-mem}"
+
+host="${OLLAMA_HOST:-127.0.0.1:11434}"
+case "$host" in http://*|https://*) API="$host" ;; *) API="http://$host" ;; esac
+
+die() { printf 'qwen: %s\n' "$*" >&2; exit 1; }
+note() { [ "${QWEN_QUIET:-0}" = 1 ] || printf 'qwen: %s\n' "$*" >&2; }
+gb() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
+
+# Probes, not assertions: `set -o pipefail` would otherwise turn an unreachable
+# server into a fatal exit inside a plain assignment, so every caller of these
+# either guards with `|| true` or tests the captured value.
+api() { curl -fsS --max-time "${2:-10}" "$API$1" 2>/dev/null; }
+
+# --- Ollama -----------------------------------------------------------------
+
+server_up() { api /api/version 1 >/dev/null 2>&1; }
+
+start_server() {
+  server_up && return 0
+  launchctl kickstart "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    server_up && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Tag -> on-disk bytes, from /api/tags. Ollama answers ":latest" for a bare tag.
+disk_bytes() { disk_bytes_for "$MODEL"; }
+disk_bytes_for() {
+  api /api/tags 30 | jq -r --arg m "$1" \
+    '[.models[] | select(.name == $m or .name == ($m + ":latest")) | .size][0] // empty'
+}
+
+resident_names() { api /api/ps | jq -r '.models[]?.name // empty'; }
+
+# The alias tag and the canonical tag are one model on one set of blobs. Nothing
+# may treat the alias as a foreign model: unloading it "to make room" would evict
+# the very session that is using it.
+same_model() {
+  local name="${1%:latest}"
+  [ "$name" = "${MODEL%:latest}" ] || {
+    [ "$name" = "${CLAUDE_MODEL_ID%:latest}" ] && alias_matches_model
+  }
+}
+
+other_resident_names() {
+  local name
+  while read -r name; do
+    [ -n "$name" ] || continue
+    if same_model "$name"; then continue; fi
+    printf '%s\n' "$name"
+  done < <(resident_names)
+}
+
+tag_resident_bytes() {
+  api /api/ps | jq -r --arg m "${1%:latest}" \
+    '[.models[]? | select((.name | sub(":latest$";"")) == $m) | .size][0] // empty'
+}
+
+# `ollama cp` copies the manifest, not the weights: measured delta on this host
+# was 0 KB. Both tags share ID 2d93c6242422, and Ollama keeps one runner for them.
+alias_matches_model() {
+  api /api/tags 30 | jq -e --arg m "${MODEL%:latest}" --arg a "${CLAUDE_MODEL_ID%:latest}" '
+    [.models[]? | select((.name | sub(":latest$";"")) == $m) | .digest][0] as $model |
+    [.models[]? | select((.name | sub(":latest$";"")) == $a) | .digest][0] as $alias |
+    ($model != null and $model != "" and $model == $alias)
+  ' >/dev/null 2>&1
+}
+
+ensure_alias() {
+  alias_matches_model && return 0
+  # An old alias may still be serving another session. Changing its manifest
+  # while that runner is active would make name-based residency checks lie.
+  if [ -n "$(tag_resident_bytes "$CLAUDE_MODEL_ID" || true)" ]; then
+    die "$CLAUDE_MODEL_ID is resident with different or unknown weights; finish that session before selecting $MODEL"
+  fi
+  note "setting the Ollama alias $CLAUDE_MODEL_ID -> $MODEL (manifest copy, no extra disk)"
+  ollama cp "$MODEL" "$CLAUDE_MODEL_ID" >/dev/null 2>&1 ||
+    die "could not create the alias tag $CLAUDE_MODEL_ID"
+  alias_matches_model || die "the alias tag $CLAUDE_MODEL_ID does not match $MODEL"
+}
+
+# claude-mem's hosted recall. The token is referenced, never copied: Claude Code
+# expands ${VAR} inside --mcp-config (verified), and Codex takes an env var name,
+# so no secret value lands in a file, an argv or this repo.
+ensure_cmem_token() {
+  if [ -z "${CMEM_PRO_TOKEN:-}" ] && [ -r "$HOME/projects/.env" ]; then
+    CMEM_PRO_TOKEN=$(sed -n 's/^CMEM_PRO_TOKEN=//p' "$HOME/projects/.env" | head -1 | tr -d "\"'")
+    export CMEM_PRO_TOKEN
+  fi
+  [ -n "${CMEM_PRO_TOKEN:-}" ]
+}
+
+# claude-mem, from inside a session that is NOT talking to Anthropic.
+#
+# Recall is the easy half: the hosted cmem MCP is wired below like any other
+# server. Capture is the half that breaks, and it breaks globally.
+#
+# claude-mem's worker is ONE daemon for the whole machine, and its observer
+# compresses a session by spawning the `claude` CLI with the DAEMON's own
+# environment. Nothing in claude-mem strips ANTHROPIC_BASE_URL on the way
+# through. So if this session is the one whose SessionStart hook first starts
+# that daemon, the daemon inherits this wrapper's local base URL and auth token,
+# and from then on every memory compression on this machine — cloud sessions
+# included — is quietly answered by Ollama instead of Anthropic, until someone
+# notices and restarts it.
+#
+# Starting it HERE, before the exec that sets those variables, is the whole fix:
+# claude-mem's hook then finds a healthy worker and does nothing. If claude-mem
+# is not installed, or node is missing, this is a no-op — memory is not a reason
+# to refuse a session.
+mem_worker_up() {
+  curl -fsS --max-time 3 "http://$MEM_HOST:$MEM_PORT/api/health" 2>/dev/null |
+    jq -e '.status == "ok"' >/dev/null 2>&1
+}
+
+# Newest installed version that still has the worker and has not been orphaned by
+# an upgrade. Version-sorted, because 13.24.5 must not beat 13.24.23.
+mem_worker_script() {
+  local dir
+  for dir in $(ls -1 "$MEM_CACHE" 2>/dev/null | sort -Vr); do
+    [ -e "$MEM_CACHE/$dir/.orphaned_at" ] && continue
+    [ -f "$MEM_CACHE/$dir/scripts/worker-service.cjs" ] || continue
+    [ -f "$MEM_CACHE/$dir/scripts/bun-runner.js" ] || continue
+    printf '%s\n' "$MEM_CACHE/$dir/scripts"
+    return 0
+  done
+  return 1
+}
+
+# A worker that is already up but was born inside a local session is the exact
+# failure this function exists to prevent, and it outlives the session that
+# caused it. Say so; do not restart it. Killing the daemon drops the backoff that
+# keeps it from hammering a rate-limited provider, and that is the owner's call.
+warn_if_mem_worker_is_local() {
+  local pid
+  pid=$(curl -fsS --max-time 3 "http://$MEM_HOST:$MEM_PORT/api/health" 2>/dev/null |
+    jq -r '.pid // empty') || return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  local dump
+  dump=$(ps -E -o command= -p "$pid" 2>/dev/null | tr ' ' '\n' |
+    grep -m1 '^ANTHROPIC_BASE_URL=' || true)
+  [ -n "$dump" ] || return 0
+  case "${dump#ANTHROPIC_BASE_URL=}" in
+    "$API"|"$API"/*|*:11434|*:11434/*)
+      note "the claude-mem worker (pid $pid) is pointed at a local Ollama server, so"
+      note "  memory compression is running on the local model for EVERY session."
+      note "  Restart it yourself when you want it back on Anthropic." ;;
+  esac
+}
+
+ensure_memory_worker() {
+  [ "${QWEN_MEMORY:-1}" = 0 ] && return 0
+  if mem_worker_up; then warn_if_mem_worker_is_local; return 0; fi
+  local scripts
+  scripts=$(mem_worker_script) || return 0
+  command -v node >/dev/null 2>&1 || { note "claude-mem needs node; skipping the worker"; return 0; }
+  note "starting the claude-mem worker before the local env is set, so memory capture stays on Anthropic"
+  env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_MODEL \
+      -u ANTHROPIC_SMALL_FAST_MODEL -u CLAUDE_CODE_SUBAGENT_MODEL \
+    node "$scripts/bun-runner.js" "$scripts/worker-service.cjs" start >/dev/null 2>&1 || true
+  local _
+  for _ in $(seq 1 15); do
+    mem_worker_up && return 0
+    sleep 1
+  done
+  note "the claude-mem worker did not come up; this session will recall but may not capture"
+}
+
+resident_bytes() {
+  api /api/ps | jq -r --arg m "$MODEL" \
+    '[.models[]? | select(.name == $m or .name == ($m + ":latest")) | .size][0] // empty'
+}
+
+is_resident() {
+  [ -n "$(resident_bytes)" ] || {
+    alias_matches_model && [ -n "$(tag_resident_bytes "$CLAUDE_MODEL_ID")" ]
+  }
+}
+
+# --- memory -----------------------------------------------------------------
+
+# Darwin's level 1 is normal, 2 warning, 4 critical. `memory_pressure` without -Q
+# can deliberately *create* pressure, so -Q is not optional.
+pressure_level() { sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null; }
+
+check_pressure() {
+  local level
+  level=$(pressure_level) || die "cannot read host memory pressure; refusing the launch"
+  [ "$level" = 1 ] || die "host memory pressure is elevated or unknown (level $level); free memory first"
+}
+
+# Record the resident size for `qwen status`. Runs detached because the model is
+# still loading when the session starts, and closes fd 9 so the poller cannot keep
+# the compute lock after the user quits.
+record_resident() {
+  ( for _ in $(seq 1 60); do
+      size=$(resident_bytes 2>/dev/null || true)
+      case "$size" in
+        ''|*[!0-9]*) sleep 2 ;;
+        *) mkdir -p "$(dirname "$MEASURED")" && printf '%s\n' "$size" > "$MEASURED"; exit 0 ;;
+      esac
+    done ) >/dev/null 2>&1 9>&- &
+}
+
+# --- exclusive ownership ----------------------------------------------------
+
+lease_file=""
+lease_open() {
+  mkdir -p "$LEASE_DIR"
+  lease_file="$LEASE_DIR/qwen-$$.json"
+  printf '{"active":true,"model":"%s","pid":%d,"source":"qwen","expires_at":%d}\n' \
+    "$MODEL" "$$" "$(( $(date +%s) + 14400 ))" > "$lease_file"
+}
+lease_close() { if [ -n "$lease_file" ]; then rm -f "$lease_file"; fi; lease_file=""; }
+
+# This process execs into `ollama run`, which keeps the pid and so keeps the lease
+# accurate for exactly as long as the session lives — but skips the EXIT trap, so
+# the file outlives it. memguard already ignores a lease whose pid is gone; this
+# just stops the directory filling up with proof of that.
+lease_prune() {
+  local file pid expires now
+  now=$(date +%s)
+  for file in "$LEASE_DIR"/*.json; do
+    [ -e "$file" ] || continue
+    pid=$(jq -r '.pid // empty' "$file" 2>/dev/null || true)
+    expires=$(jq -r '.expires_at // 0' "$file" 2>/dev/null || echo 0)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "${expires%%.*}" -gt "$now" ] 2>/dev/null; then
+      continue
+    fi
+    rm -f "$file"
+  done
+}
+
+# The reviewer and cooperating councils take this same lock nonblocking. A 27B
+# launch is the explicit user request for the exclusive owner, so it preempts a
+# cooperating holder of this lock before taking it. The kernel releases the lock
+# if that holder is killed; there is no stale state to clean.
+take_lock() {
+  mkdir -p "$(dirname "$LOCK_PATH")"
+  exec 9>>"$LOCK_PATH"
+  python3 - <<'PY' || return 1
+import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (BlockingIOError, OSError):
+    sys.exit(1)
+PY
+}
+
+descendant_pids() {
+  ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
+    { parent[$1] = $2; order[NR] = $1 }
+    END {
+      found[root] = 1
+      do {
+        changed = 0
+        for (i = 1; i <= NR; i++) {
+          p = order[i]
+          if (!(p in found) && (parent[p] in found)) { found[p] = 1; changed = 1 }
+        }
+      } while (changed)
+      for (p in found) if (p != root) print p
+    }'
+}
+
+lock_holders() {
+  lsof -nP -t "$LOCK_PATH" 2>/dev/null || true
+}
+
+# Age comes from the process, not its lease file: lease_prune deletes a lease
+# once its 4-hour expiry passes, even while the session lives, and the sessions
+# most worth reclaiming are exactly the ones that old. ps prints [[dd-]hh:]mm:ss.
+qwen_session_age() {
+  local pid="$1" etime days=0 rest h=0 m=0 sec=""
+  etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
+  case "$etime" in ''|*[!0-9:-]*) return 1 ;; esac
+  case "$etime" in *-*) days=${etime%%-*}; rest=${etime#*-} ;; *) rest=$etime ;; esac
+  IFS=: read -r h m sec <<<"$rest"
+  [ -n "$sec" ] || { sec=$m; m=$h; h=0; }
+  printf '%s\n' $(( 10#$days * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$sec ))
+}
+
+qwen_session_is_stale() {
+  local pid="$1" age
+  case "$STALE_SESSION_SECONDS" in
+    ''|*[!0-9]*) die "QWEN_STALE_SESSION_SECONDS must be a non-negative integer" ;;
+  esac
+  # Reclaim only when Ollama confirms that no model is resident. If the probe
+  # fails, keep the owner and fail closed rather than guessing.
+  no_resident_models || return 1
+  age=$(qwen_session_age "$pid") || return 1
+  [ "$age" -ge "$STALE_SESSION_SECONDS" ]
+}
+
+no_resident_models() {
+  local names
+  names=$(resident_names) || return 1
+  [ -z "$names" ]
+}
+
+preempt_local_compute() {
+  [ "$MODEL" = "qwen3.8:27b-obliterated" ] || return 0
+  command -v lsof >/dev/null 2>&1 ||
+    die "lsof is required to identify the local-compute lock owner safely"
+
+  local holders pid command deadline remaining age
+  holders=$(lock_holders)
+  [ -n "$holders" ] || return 0
+
+  for pid in $holders; do
+    [ "$pid" = "$$" ] && continue
+    command=$(ps -o command= -p "$pid" 2>/dev/null || true)
+    case "$(printf '%s' "$command" | tr '[:upper:]' '[:lower:]')" in
+      */ollama|*/ollama\ *|ollama|ollama\ *)
+        die "another Ollama session owns compute (pid $pid); close it before starting $MODEL"
+        ;;
+      */scripts/qwen|*/scripts/qwen\ *|*/qwen|*/qwen\ *|*/qwen-code|*/qwen-code\ *)
+        if qwen_session_is_stale "$pid"; then
+          age=$(qwen_session_age "$pid" || printf 'unknown')
+          note "reclaiming stale Qwen session pid $pid (no model resident for ${age}s)"
+          # Qwen Code's launcher does not forward TERM to the CLI it spawns, so
+          # stopping only the lock holder left the real session running.
+          for child in $(descendant_pids "$pid"); do
+            kill -TERM "$child" 2>/dev/null || true
+          done
+        else
+          die "another Qwen session owns compute (pid $pid); close it before starting $MODEL"
+        fi
+        ;;
+    esac
+    note "preempting local compute owner pid $pid; future LLM-Jury runs use the frontier route"
+    kill -TERM "$pid" 2>/dev/null ||
+      die "could not terminate local compute owner pid $pid"
+  done
+
+  deadline=$(( $(date +%s) + ${QWEN_PREEMPT_TIMEOUT:-10} ))
+  while :; do
+    remaining=$(lock_holders)
+    [ -z "$remaining" ] && return 0
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      for pid in $remaining; do
+        [ "$pid" = "$$" ] && continue
+        command=$(ps -o command= -p "$pid" 2>/dev/null || true)
+        case "$(printf '%s' "$command" | tr '[:upper:]' '[:lower:]')" in
+          */ollama|*/ollama\ *|ollama|ollama\ *)
+            die "another Ollama session still owns compute (pid $pid); refusing to force-stop it"
+            ;;
+          */scripts/qwen|*/scripts/qwen\ *|*/qwen|*/qwen\ *|*/qwen-code|*/qwen-code\ *)
+            die "another Qwen session still owns compute (pid $pid); refusing to force-stop it"
+            ;;
+        esac
+        note "local compute owner pid $pid did not exit after TERM; sending KILL"
+        kill -KILL "$pid" 2>/dev/null ||
+          die "could not force-stop local compute owner pid $pid"
+      done
+      deadline=$(( $(date +%s) + 5 ))
+    fi
+    sleep 1
+  done
+}
+
+acquire_compute_lock() {
+  preempt_local_compute
+  take_lock || die "another local council or background review owns compute; retry when it finishes"
+}
+
+cleanup() { lease_close; if [ -n "${session_config:-}" ]; then rm -f "$session_config"; fi; }
+trap cleanup EXIT INT TERM
+
+# --- admission --------------------------------------------------------------
+
+stop_other_models() {
+  local name stopped=0 remaining deadline
+  while read -r name; do
+    note "unloading $name to make room (--keep-others keeps it)"
+    ollama stop "$name" >/dev/null 2>&1 || die "failed to unload $name; aborting before loading $MODEL"
+    stopped=1
+  done < <(other_resident_names)
+  [ "$stopped" = 1 ] || return 0
+
+  deadline=$(( $(date +%s) + ${QWEN_EVICTION_TIMEOUT:-30} ))
+  while :; do
+    remaining=$(other_resident_names || true)
+    [ -z "$remaining" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && die "timed out waiting for Ollama to unload: $(printf '%s' "$remaining" | tr '\n' ' ')"
+    sleep 1
+  done
+}
+
+admit() {
+  # macOS owns memory pressure and Ollama owns model residency. Do not invent a
+  # second byte budget here: it drifted from the active server settings and made
+  # a 4B model require --force despite fitting when loaded normally.
+  check_pressure
+  [ "$keep_others" = 1 ] || stop_other_models
+  note "macOS pressure is normal; Ollama owns model memory limits"
+}
+
+# --- subcommands ------------------------------------------------------------
+
+cmd_status() {
+  start_server || die "Ollama is not answering on $API"
+  local size under
+  size=$(resident_bytes || true)
+  under="$MODEL"
+  if [ -z "${size:-}" ] && alias_matches_model; then
+    # An agent session loads the same blobs under the catalog-id alias, which is
+    # this model resident, not some other model.
+    size=$(tag_resident_bytes "$CLAUDE_MODEL_ID" || true)
+    under="$CLAUDE_MODEL_ID"
+  fi
+  if [ -n "${size:-}" ]; then
+    printf '%-28s resident, %s GB (as %s)\n' "$MODEL" "$(gb "$size")" "$under"
+  else
+    printf '%-28s not loaded\n' "$MODEL"
+  fi
+  local others leases
+  others=$(other_resident_names || true)
+  if [ -n "$others" ]; then
+    printf 'also resident: %s\n' "$(printf '%s' "$others" | tr '\n' ' ')"
+  fi
+  leases=$(find "$LEASE_DIR" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ' || true)
+  printf 'compute leases: %s in %s\n' "$leases" "$LEASE_DIR"
+  if [ -s "$MEASURED" ]; then
+    printf 'measured resident: %s GB (from a previous run)\n' "$(gb "$(cat "$MEASURED")")"
+  else
+    printf 'measured resident: none yet; the first load records it\n'
+  fi
+  return 0
+}
+
+# Both tags, always. `qwen stop` that leaves the alias resident holds 17 GB while
+# reporting the model unloaded, which is the worst of both.
+cmd_stop() {
+  server_up || { note "Ollama is not running; nothing to unload"; return 0; }
+  ollama stop "$MODEL" >/dev/null 2>&1 || true
+  if alias_matches_model; then
+    ollama stop "$CLAUDE_MODEL_ID" >/dev/null 2>&1 || true
+  fi
+  note "unloaded $MODEL and any matching catalog alias"
+}
+
+# Shared setup for an agent session (Claude Code or Codex) on the local model.
+#
+# No failover is performed here; Ollama owns the local model session.
+# swapped tiers underneath a live session, which is what made it unreliable and got
+# it deleted on 2026-09-10. This does none of that: you ask for the local model,
+# you get the local model for the whole session, and CLAUDE_CODE_NO_MODEL_FALLBACK
+# stops Claude Code substituting another one behind your back. To go back to the
+# cloud, quit and start a plain `claude`.
+mcp_spec="cmem"
+tools_mode="lean"
+
+# Where this script lives, following the symlink `~/.local/bin/qwen` uses, so
+# the prompt below is found however it was invoked.
+QWEN_SOURCE_DIR="$(cd -- "$(dirname -- "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")/.." && pwd -P)"
+
+
+# JEV is an optional online decision tool; inference remains on Ollama.
+# Never copy a credential into generated settings or command-line arguments.
+jev_ready=0
+jev_command="${QWEN_JEV_COMMAND:-$HOME/.local/bin/jev-mcp}"
+jev_brief="JEV is unavailable or disabled in this session. Skip JEV and use the local model for semantic judgments. Do not retry failed JEV requests."
+prepare_jev() {
+  jev_ready=0
+  [ "$mcp_spec" != none ] || return 0
+  [ "${QWEN_JEV:-1}" != 0 ] && [ "${QWEN_OFFLINE:-0}" != 1 ] || return 0
+  [ -x "$jev_command" ] || return 0
+  # A missing or unsafe runtime credential should not break a local session.
+  python3 - <<'PYJEV' || return 0
+import os, stat, sys
+from pathlib import Path
+key = os.environ.get("JEV_OPENROUTER_API_KEY", "").strip()
+if key and not (key.startswith("${") and key.endswith("}")):
+    sys.exit(0)
+p = Path.home() / ".config/jev/runtime.env"
+try:
+    info, parent = p.lstat(), p.parent.stat()
+    ok = (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+          and stat.S_IMODE(info.st_mode) == 0o600
+          and parent.st_uid == os.getuid() and stat.S_IMODE(parent.st_mode) == 0o700)
+    # Only inspect presence. The launcher owns credential loading.
+    sys.exit(0 if ok and info.st_size else 1)
+except OSError:
+    sys.exit(1)
+PYJEV
+  # No credentials or task data in this public HEAD request. Bound DNS, connect
+  # and TLS together, and never retry. Offline startup costs at most two seconds.
+  curl -IfsS --connect-timeout 1 --max-time 2 --retry 0 \
+    https://openrouter.ai/api/v1/models -o /dev/null 2>/dev/null || {
+      note "JEV connection unavailable; continuing with local judgments"
+      return 0
+    }
+  jev_ready=1
+  jev_brief=$(cat "$QWEN_SOURCE_DIR/prompts/qwen-jev.md")
+}
+
+jev_json() {
+  jq -nc --arg command "$jev_command" \
+    '{command:$command,args:[],trust:true,timeout:35000}'
+}
+
+
+parse_agent_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force)       force=1; shift ;;
+      --keep-others) keep_others=1; shift ;;
+      --mcp)   [ $# -ge 2 ] || die "--mcp needs cmem, none or all"; mcp_spec=$2; shift 2 ;;
+      --tools) [ $# -ge 2 ] || die "--tools needs mcp, lean or all"; tools_mode=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  AGENT_ARGS=("$@")
+}
+
+agent_admit() {
+  if is_resident; then
+    check_pressure
+    note "attaching to the resident $MODEL"
+    # Residency does not last a whole agent session: a Goal verification swaps
+    # the 27B out for the side-query model, and a council
+    # that sees no 27B loaded and a free lock would take the GPU mid-run. Hold
+    # the lock and lease when nobody else does; another Qwen session that
+    # already holds them protects this one too.
+    if take_lock 2>/dev/null; then lease_open; fi
+    return 0
+  fi
+  disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
+  acquire_compute_lock
+  lease_open
+  admit
+  record_resident
+}
+
+# `qwen claude` — Claude Code with this model behind it.
+#
+# Ollama 0.32 serves the Anthropic Messages API at /v1/messages: correct envelope,
+# tool_use blocks, thinking blocks, SSE streaming, and it ignores the auth headers.
+# The wrapper talks to Ollama directly, so no translation proxy is needed.
+#
+# The model id is the catch. Claude Code 2.1.267 validates the session model against
+# its own compiled catalog and answers [claude-code:unrecognized_model] for anything
+# else, no matter where ANTHROPIC_BASE_URL points. Measured on this host, in order:
+# the raw tag `qwen3.8:27b-obliterated` was refused; a claude-shaped tag
+# `claude-qwen-27b` was refused; adding ANTHROPIC_CUSTOM_MODEL_OPTION was refused;
+# adding CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY was refused. Serving the same
+# blobs under a catalog id worked on the first try. Hence the alias.
+#
+# Every model slot points at that one alias on purpose. Claude Code resolves its
+# background work — subagents, the small fast model — separately from the main one,
+# and both other outcomes are wrong: a real Claude id 404s against Ollama, and a
+# second local tag loads a second 17 GB runner, which is the co-residency that
+# panics this host.
+cmd_claude() {
+  parse_agent_opts "$@"
+  command -v claude >/dev/null 2>&1 || die "claude is not on PATH"
+  start_server || die "Ollama did not come up on $API"
+  ensure_alias
+  agent_admit
+
+  local ctx
+  ctx=$(model_context)
+  local -a extra=()
+
+  # QWEN_MEMORY=0 is the true-offline switch: no recall server, and nothing
+  # started on claude-mem's behalf. An explicit --mcp still wins over it.
+  if [ "${QWEN_MEMORY:-1}" = 0 ] && [ "$mcp_spec" = cmem ]; then
+    mcp_spec=none
+    note "QWEN_MEMORY=0: no claude-mem recall in this session"
+  fi
+
+  prepare_jev
+  case "$mcp_spec" in
+    none) extra+=(--strict-mcp-config --mcp-config '{"mcpServers":{}}') ;;
+    all)
+      note "loading every MCP server in ~/.claude.json; their tool schemas will crowd a ${ctx}-token window"
+      if [ "$jev_ready" = 1 ]; then
+        extra+=(--mcp-config "$(jq -nc --argjson jev "$(jev_json)" '{mcpServers:{jev:$jev}}')")
+      else
+        extra+=(--disallowed-tools 'mcp__jev__*')
+      fi ;;
+    cmem)
+      ensure_cmem_token || die "CMEM_PRO_TOKEN is not set and not readable from ~/projects/.env; use --mcp none or --mcp all"
+      extra+=(--strict-mcp-config --mcp-config
+        "$(jq -nc --arg u "$CMEM_URL" --argjson ready "$jev_ready" --argjson jev "$(jev_json)" \
+          '{mcpServers:({cmem:{type:"http",url:$u,headers:{Authorization:"Bearer ${CMEM_PRO_TOKEN}"}}} +
+            if $ready == 1 then {jev:$jev} else {} end)}')") ;;
+    *) die "--mcp takes cmem, none or all (got \"$mcp_spec\")" ;;
+  esac
+
+  # Capture is a hook, not an MCP server, so it runs whatever --mcp says. What it
+  # must not do is give claude-mem's shared daemon this session's environment.
+  ensure_memory_worker
+
+  # Tool schemas are the largest thing competing with your actual work for these
+  # 32k tokens, so the Claude default keeps file/shell tools and MCP.
+  case "$tools_mode" in
+    mcp)  extra+=(--disallowed-tools "Bash Read Write Edit NotebookEdit Glob Grep WebFetch WebSearch Task TodoWrite") ;;
+    # WebSearch stays out: it is an Anthropic server-side tool, and this session
+    # talks to Ollama, so offering it would hand the model a tool that can only
+    # error. WebFetch is client-side -- Claude Code retrieves the page and the
+    # LOCAL model reads it -- so it works here and is how the model sees a URL.
+    lean) extra+=(--disallowed-tools "WebSearch Task NotebookEdit") ;;
+    all)  ;;
+    *) die "--tools takes mcp, lean or all (got \"$tools_mode\")" ;;
+  esac
+
+  # Tell the model what it actually has. A local model with tools and no
+  # briefing narrates actions it never took -- "pulling the repo now" with no
+  # tool call behind it -- because nothing in its context says the tools
+  # execute. Roughly 400 tokens against a 32K window, which is cheap next to a
+  # confidently invented answer.
+  local tools_brief="$QWEN_SOURCE_DIR/prompts/qwen-tools.md" combined_brief="$jev_brief"
+  if [ "$tools_mode" != "mcp" ] && [ -r "$tools_brief" ]; then
+    combined_brief="$(cat "$tools_brief")
+
+$jev_brief"
+  fi
+  extra+=(--append-system-prompt "$combined_brief")
+
+  note "claude on $MODEL as $CLAUDE_MODEL_ID, ${ctx}-token window, mcp=$mcp_spec tools=$tools_mode"
+  note "no failover: this session stays local until you quit it"
+  # ANTHROPIC_API_KEY is dropped rather than forwarded. A local server has no use
+  # for the real key and no reason to see it.
+  #
+  # QWEN_SESSION_MODEL says what is really answering. Claude Code derives every
+  # name it prints from the model id, and the id is a borrowed catalog entry, so
+  # left alone the session calls itself Haiku 4.5 from first prompt to last. The
+  # status line reads this variable — directly, or off this process when Claude
+  # Code spawns it — and prints the local model instead. The _NAME/_DESCRIPTION
+  # pairs relabel the same thing in /model, where the picker builds its own
+  # labels from these rather than from the catalog.
+  #
+  # The fable slot is pointed at the alias for the same reason the other three
+  # are: a slot left on a real Claude id is a 404 against Ollama the moment
+  # anything selects it, and a second local tag would load a second 17 GB runner.
+  exec env -u ANTHROPIC_API_KEY \
+    ANTHROPIC_BASE_URL="$API" \
+    ANTHROPIC_AUTH_TOKEN=ollama-local \
+    ANTHROPIC_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_FABLE_MODEL="$CLAUDE_MODEL_ID" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="$MODEL_LABEL" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="$MODEL_LABEL" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="$MODEL_LABEL" \
+    ANTHROPIC_DEFAULT_FABLE_MODEL_NAME="$MODEL_LABEL" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION="$MODEL_LABEL, served by Ollama" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION="$MODEL_LABEL, served by Ollama" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION="$MODEL_LABEL, served by Ollama" \
+    ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION="$MODEL_LABEL, served by Ollama" \
+    ANTHROPIC_SMALL_FAST_MODEL="$CLAUDE_MODEL_ID" \
+    CLAUDE_CODE_SUBAGENT_MODEL="$CLAUDE_MODEL_ID" \
+    QWEN_SESSION_MODEL="$MODEL" \
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" \
+    CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 \
+    CLAUDE_CODE_NO_MODEL_FALLBACK=1 \
+    claude "${extra[@]+"${extra[@]}"}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+}
+
+# `qwen codex` — Codex against the same server, through Ollama's OpenAI-compatible
+# /v1. Codex has no model-id allowlist, so it uses the real tag and needs no alias.
+# Every override is a -c flag: ~/.codex/config.toml is never edited, so a session
+# that dies leaves nothing pointing at a local model.
+cmd_codex() {
+  parse_agent_opts "$@"
+  local codex_bin
+  codex_bin=$(command -v codex) || die "codex is not on PATH"
+  start_server || die "Ollama did not come up on $API"
+  agent_admit
+
+  local -a extra=(
+    -c "model_providers.qwen.name=Qwen (local Ollama)"
+    -c "model_providers.qwen.base_url=$API/v1"
+    -c "model_providers.qwen.wire_api=responses"
+    -c "model_provider=qwen"
+    -m "$MODEL"
+  )
+  prepare_jev
+  local -a disabled_mcp=()
+  # Codex merges table overrides into its saved MCP config. Disable excluded
+  # saved entries explicitly; an empty mcp_servers table does not remove them.
+  if [ "$mcp_spec" != all ]; then
+    local saved_name saved_transport saved_names
+    saved_names=$(python3 - "$codex_bin" <<'PYMCP'
+import json, re, subprocess, sys
+try:
+    result = subprocess.run([sys.argv[1], "mcp", "list", "--json"],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        sys.exit(1)
+    for server in json.loads(result.stdout):
+        if not server.get("enabled", True):
+            continue
+        name = server["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            sys.exit(1)
+        kind = server["transport"]["type"]
+        if kind not in ("stdio", "streamable_http"):
+            sys.exit(1)
+        print(name + "\t" + kind)
+except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+    sys.exit(1)
+PYMCP
+) || die "could not read saved Codex MCP names; refusing an unfiltered session"
+    while IFS=$'\t' read -r saved_name saved_transport; do
+      [ -n "$saved_name" ] || continue
+      if [ "$mcp_spec" = cmem ] && { [ "$saved_name" = cmem ] || { [ "$saved_name" = jev ] && [ "$jev_ready" = 1 ]; }; }; then
+        continue
+      fi
+      # Plugin-provided entries need a valid transport in the override layer.
+      # Use inert endpoints, then disable them; no inherited credential values
+      # are copied into arguments and no excluded server starts.
+      if [ "$saved_transport" = stdio ]; then
+        disabled_mcp+=(-c "mcp_servers.$saved_name.command=\"/usr/bin/true\"")
+      else
+        disabled_mcp+=(-c "mcp_servers.$saved_name.url=\"https://example.invalid/mcp\"")
+      fi
+      disabled_mcp+=(-c "mcp_servers.$saved_name.enabled=false")
+    done <<< "$saved_names"
+  fi
+  case "$mcp_spec" in
+    none) ;;
+    all)
+      note "keeping every MCP server in ~/.codex/config.toml; their schemas will crowd the window"
+      if [ "$jev_ready" = 1 ]; then
+        extra+=(-c "mcp_servers.jev.command=$(jq -Rn --arg c "$jev_command" '$c')" -c 'mcp_servers.jev.env_vars=["JEV_OPENROUTER_API_KEY"]' -c 'mcp_servers.jev.enabled=true')
+      else
+        extra+=(-c 'mcp_servers.jev.enabled=false')
+      fi ;;
+    cmem)
+      ensure_cmem_token || die "CMEM_PRO_TOKEN is not set and not readable from ~/projects/.env; use --mcp none or --mcp all"
+      local mcp_inline="cmem = { url = $(jq -Rn --arg u "$CMEM_URL" '$u'), bearer_token_env_var = \"CMEM_PRO_TOKEN\" }"
+      if [ "$jev_ready" = 1 ]; then
+        mcp_inline="$mcp_inline, jev = { command = $(jq -Rn --arg c "$jev_command" '$c'), env_vars = [\"JEV_OPENROUTER_API_KEY\"], enabled = true }"
+      fi
+      extra+=(-c "mcp_servers={$mcp_inline}") ;;
+    *) die "--mcp takes cmem, none or all (got \"$mcp_spec\")" ;;
+  esac
+
+  extra+=(${disabled_mcp[@]+"${disabled_mcp[@]}"})
+  extra+=(-c "developer_instructions=$(jq -Rn --arg brief "$jev_brief" '$brief')")
+
+  note "codex on $MODEL, mcp=$mcp_spec; no failover, and ~/.codex/config.toml is untouched"
+  exec "$codex_bin" "${extra[@]}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+}
+
+# Standalone Qwen Code uses its own tool loop and configuration. The private
+# npm prefix avoids replacing this guard with the package's own `qwen` binary.
+code_bin() {
+  local bin="${QWEN_CODE_BIN:-$HOME/.local/share/qwen-code/node_modules/.bin/qwen}"
+  [ -x "$bin" ] || die "Qwen Code is missing; run scripts/install-qwen-code.sh from $QWEN_SOURCE_DIR"
+  printf '%s\n' "$bin"
+}
+
+# Starts Ollama, settles the side-query model and admits the session model.
+code_prepare() {
+  start_server || die "Ollama did not come up on $API"
+  # Ollama will not hold the 27B and the 4B together on this host: loading one
+  # evicts the other, so no extra admission headroom is needed. Each 4B call
+  # costs a 27B reload, which is why the config turns off the per-turn side
+  # queries (tool summaries, follow-up suggestions) and this turns off session
+  # titles, leaving Goal verification as the only one. A model that is not
+  # pulled falls back to the session model.
+  if [ "$FAST_MODEL" != "$MODEL" ] && [ -z "$(disk_bytes_for "$FAST_MODEL")" ]; then
+    note "side-query model $FAST_MODEL is not pulled; side queries use $MODEL"
+    FAST_MODEL="$MODEL"
+  fi
+  # Derive context accounting for the selected tags. The checked-in config is
+  # the 256K 4B default; explicit 27B and smaller tags use their own window.
+  # A single-model session registers its provider once.
+  CODE_CONFIG_PATH="$QWEN_SOURCE_DIR/config/qwen-code-local.json"
+  if [ "$FAST_MODEL" = "$MODEL" ] || [ "$MODEL" != qwen3.5:4b-256k ] ||
+     [ "$FAST_MODEL" != qwen3.5:4b-256k ]; then
+    local state="${QWEN_STATE_DIR:-$HOME/.cache/qwen}" fast_key
+    fast_key=$(printf '%s' "$FAST_MODEL" | tr -c '[:alnum:]_.-' '_')
+    mkdir -p "$state"
+    CODE_CONFIG_PATH="$state/qwen-code-local.${MODEL_KEY}.${fast_key}.json"
+    jq --argjson session_ctx "$(model_context)" \
+       --argjson fast_ctx "$(model_context_for "$FAST_MODEL")" \
+       --argjson single "$([ "$FAST_MODEL" = "$MODEL" ] && echo true || echo false)" \
+       '.modelProviders.openai[0].generationConfig.contextWindowSize = $session_ctx |
+        .modelProviders.openai[1].generationConfig.contextWindowSize = $fast_ctx |
+        if $single then .modelProviders.openai |= .[:1] else . end' \
+       "$QWEN_SOURCE_DIR/config/qwen-code-local.json" \
+      > "$CODE_CONFIG_PATH.$$" && mv -f "$CODE_CONFIG_PATH.$$" "$CODE_CONFIG_PATH" ||
+      die "could not write $CODE_CONFIG_PATH"
+  fi
+  agent_admit
+  prepare_jev
+  session_config="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/jev-session-$$.json"
+  mkdir -p "$(dirname "$session_config")"
+  jq --argjson ready "$jev_ready" --argjson jev "$(jev_json)" --arg selection "$mcp_spec" '
+    if $ready == 1 then .mcpServers.jev = $jev | .tools.visible = ((.tools.visible // []) + ["mcp__jev__jev_decide"] | unique)
+    else del(.mcpServers.jev) | .mcp.excluded = ((.mcp.excluded // []) + ["jev"] | unique) end |
+    if $selection == "none" then .mcp.allowed = []
+    elif $selection == "cmem" then .mcp.allowed = (["cmem"] + if $ready == 1 then ["jev"] else [] end)
+    else . end' "$CODE_CONFIG_PATH" > "$session_config" || die "could not prepare optional JEV settings"
+  CODE_CONFIG_PATH="$session_config"
+  CODE_JEV_ARGS=(--append-system-prompt "$jev_brief")
+  # Placeholder authentication only. Never hand an inherited cloud key to Ollama.
+  CODE_ENV=(
+    OPENAI_API_KEY=ollama-local OPENAI_BASE_URL="$API/v1" OPENAI_MODEL="$MODEL"
+    QWEN_SESSION_MODEL="$MODEL" QWEN_FAST_MODEL="$FAST_MODEL" QWEN_LOCAL_BASE_URL="$API/v1"
+    QWEN_DISABLE_AUTO_TITLE=1
+    QWEN_HARNESS_ROOT="$QWEN_SOURCE_DIR"
+    QWEN_CODE_SYSTEM_DEFAULTS_PATH="$CODE_CONFIG_PATH"
+  )
+  CODE_ARGS=(--auth-type openai --model "$MODEL" --openai-base-url "$API/v1")
+}
+
+cmd_code() {
+  mcp_spec=all
+  local bin plan_file="" plan_context=""
+  bin=$(code_bin) || exit 1
+  case "${1:-}" in
+    --help|-h|--version|-v) exec "$bin" "$@" ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --keep-others) keep_others=1; shift ;;
+      --mcp) [ $# -ge 2 ] || die "--mcp needs cmem, none or all"; mcp_spec=$2; shift 2 ;;
+      --plan)
+        [ $# -ge 2 ] || die "--plan needs a file path"
+        plan_file=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  if [ -n "$plan_file" ]; then
+    plan_context=$(python3 "$QWEN_SOURCE_DIR/scripts/qwen-plan-context.py" "$plan_file") ||
+      die "could not retain the build plan; select a readable UTF-8 plan of at most 24000 bytes"
+  fi
+  case "$mcp_spec" in cmem|none|all) ;; *) die "--mcp takes cmem, none or all" ;; esac
+  code_prepare
+  if [ -n "$plan_context" ]; then
+    CODE_JEV_ARGS=(--append-system-prompt "$plan_context
+
+$jev_brief")
+  fi
+  note "Qwen Code on $MODEL at $API (side queries: $FAST_MODEL); file and shell tools enabled"
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" "$bin" "${CODE_ARGS[@]}" "${CODE_JEV_ARGS[@]}" "$@"
+  local rc=$?
+  return "$rc"
+}
+
+# Prints a line per tool call and Goal status change from Qwen Code's
+# stream-json on stdin, and copies every raw line to the log in argv[1].
+GOAL_PROGRESS_PY=$(cat <<'PY'
+import json, os, sys
+log = open(sys.argv[1], "a")
+last = None
+for raw in sys.stdin:
+    log.write(raw); log.flush()
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        continue
+    kind = d.get("type")
+    if kind == "assistant":
+        for c in d.get("message", {}).get("content", []):
+            if c.get("type") != "tool_use":
+                continue
+            a = c.get("input") or {}
+            detail = a.get("file_path") or a.get("command") or a.get("pattern") or a.get("query") or ""
+            if a.get("file_path"):
+                detail = os.path.relpath(detail) if detail.startswith(os.getcwd()) else detail
+            print("  %s %s" % (c.get("name"), " ".join(str(detail).split())[:100]), flush=True)
+    elif kind == "stream_event" and d.get("event", {}).get("type") == "goal_state":
+        g = (d["event"].get("goal_state") or {}).get("goal") or {}
+        now = (g.get("status"), g.get("lastReason"))
+        if g and now != last:
+            last = now
+            reason = " ".join((g.get("lastReason") or "").split())[:200]
+            print("  goal %s%s" % (g.get("status"), ": " + reason if reason else ""), flush=True)
+    elif kind == "result" and d.get("is_error"):
+        msg = (d.get("error") or {}).get("message") or d.get("subtype")
+        print("  stopped: %s" % " ".join(str(msg).split())[:200], flush=True)
+PY
+)
+
+# The last Goal state's field in a stream-json log, skipping lines that are not JSON.
+goal_field() {
+  jq -Rrn --arg f "$1" '[inputs | fromjson? | select(.type == "stream_event" and .event.type == "goal_state")
+    | .event.goal_state.goal] | last | .[$f] // empty' "$2" 2>/dev/null
+}
+
+# Runs a Goal headless and starts a fresh session whenever an attempt ends
+# without a verified completion. A 27B session that stalls tends to stay stalled
+# when resumed, because its long history keeps the dead end in view; the same
+# objective in a new session reads the files again, and the files keep every
+# earlier attempt's edits.
+cmd_goal() {
+  mcp_spec=all
+  local bin objective="" yes=0 attempts="${QWEN_GOAL_ATTEMPTS:-3}" attempt=1 dir log status reason rc
+  bin=$(code_bin) || exit 1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mcp) [ $# -ge 2 ] || die "--mcp needs cmem, none or all"; mcp_spec=$2; shift 2 ;;
+      -y|--yolo) yes=1; shift ;;
+      --attempts) [ $# -ge 2 ] || die "--attempts needs a number"; attempts="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      --keep-others) keep_others=1; shift ;;
+      --) shift; objective="$*"; break ;;
+      -*) die "unknown goal option $1 (qwen goal -y [--attempts N] \"objective\")" ;;
+      *) objective="$*"; break ;;
+    esac
+  done
+  [ -n "$objective" ] || die 'usage: qwen [27b] goal -y [--attempts N] "objective with a checkable done condition"'
+  [ "$yes" = 1 ] || die "a goal runs unattended and needs -y, which approves every tool call (shell included) in $(pwd)"
+  case "$attempts" in ''|*[!0-9]*|0) die "--attempts must be a positive integer" ;; esac
+
+  case "$mcp_spec" in cmem|none|all) ;; *) die "--mcp takes cmem, none or all" ;; esac
+  code_prepare
+  dir="${QWEN_STATE_DIR:-$HOME/.cache/qwen}/goals/$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "$dir"
+  note "goal on $MODEL (side queries: $FAST_MODEL), up to $attempts fresh-session attempts; logs in $dir"
+  while :; do
+    log="$dir/attempt-$attempt.jsonl"
+    note "attempt $attempt/$attempts"
+    rc=0
+    env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${CODE_ENV[@]}" \
+      "$bin" "${CODE_ARGS[@]}" "${CODE_JEV_ARGS[@]}" -y -o stream-json "/goal $objective" </dev/null |
+      python3 -c "$GOAL_PROGRESS_PY" "$log" || rc=$?
+    status=$(goal_field status "$log")
+    reason=$(goal_field lastReason "$log")
+    case "$status" in
+      complete) note "goal complete on attempt $attempt: $reason"; return 0 ;;
+      blocked) note "goal blocked on attempt $attempt: $reason"; return 2 ;;
+    esac
+    if [ "$attempt" -ge "$attempts" ]; then
+      note "goal not complete after $attempts attempts (last: ${status:-no goal state}, exit $rc); logs in $dir"
+      return 1
+    fi
+    note "attempt $attempt ended ${status:-without a goal state}${reason:+: $reason}; starting a fresh session, which keeps this attempt's file changes"
+    attempt=$((attempt + 1))
+  done
+}
+
+# --- argument parsing -------------------------------------------------------
+
+case "${1:-}" in
+  -h|--help) sed -n '/^# USAGE/,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0 ;;
+esac
+
+command -v ollama >/dev/null 2>&1 || die "ollama is not on PATH"
+command -v jq >/dev/null 2>&1 || die "jq is required to read Ollama's API"
+lease_prune
+
+force=0
+keep_others=0
+run_args=()
+prompt=""
+
+# Normal invocation is the standalone coding agent. Plain chat is explicit.
+case "${1:-}" in
+  status)       cmd_status; exit 0 ;;
+  stop)         cmd_stop;   exit 0 ;;
+  claude)       shift; cmd_claude "$@" ;;
+  agent|code)   shift; cmd_code "$@"; exit $? ;;
+  goal)         shift; cmd_goal "$@"; exit $? ;;
+  -)            shift; cmd_code "$@"; exit $? ;;
+  codex)        shift; cmd_codex  "$@" ;;
+  raw)          shift; set -- "$@" ;;
+  *)            cmd_code "$@"; exit $? ;;
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)       force=1; shift ;;
+    --keep-others) keep_others=1; shift ;;
+    --keepalive|--format)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      run_args+=("$1" "$2"); shift 2 ;;
+    --think|--think=*|--verbose|--hidethinking|--nowordwrap)
+      run_args+=("$1"); shift ;;
+    --) shift; prompt="$*"; break ;;
+    -)  prompt="$(cat)"; shift ;;
+    -*) die "unknown option $1 (Ollama's own flags: --think --verbose --hidethinking --nowordwrap --format --keepalive)" ;;
+    *)  prompt="$*"; break ;;
+  esac
+done
+
+# A prompt on stdin with no explicit `-` is still a prompt.
+if [ -z "$prompt" ] && [ ! -t 0 ]; then prompt="$(cat)"; fi
+
+# --- run --------------------------------------------------------------------
+
+
+start_server || die "Ollama did not come up on $API (launchctl kickstart gui/$(id -u)/$AGENT_LABEL)"
+
+if is_resident; then
+  check_pressure
+  # Already loaded: this session costs no new memory, so it needs no guard, no
+  # lease (residency is memguard's own second source of truth) and no lock.
+  note "attaching to the resident $MODEL"
+else
+  disk_bytes >/dev/null || die "$MODEL is not pulled (ollama pull $MODEL)"
+  acquire_compute_lock
+  lease_open
+  admit
+  record_resident
+fi
+
+if [ -n "$prompt" ]; then
+  exec ollama run "${run_args[@]+"${run_args[@]}"}" "$MODEL" "$prompt"
+fi
+exec ollama run "${run_args[@]+"${run_args[@]}"}" "$MODEL"
