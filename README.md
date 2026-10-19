@@ -1195,6 +1195,12 @@ launcher reads `JEV_OPENROUTER_API_KEY` from its environment or its protected
 runtime file. Existing OpenAI accounts and the local admission, lease and lock
 checks still apply. `qwen raw` has no tools and uses local judgments.
 
+Claude runs `jev_decide` without a permission prompt when the overlay allows it.
+Keep `"allow": ["mcp__jev__jev_decide"]` under `permissions` in
+`~/.claude/team-context-settings.overlay.json` (the template includes it). Add it
+to the overlay rather than to team-context's tracked `settings.json`, so the rule
+survives `team-context-pull.sh` and stays off the shared team config.
+
 Qwen Code keeps its existing MCP selection by default; `--mcp cmem` restricts it
 to memory and available JEV, and `--mcp none` excludes MCP servers. Codex and
 Claude keep their `cmem` default, with online JEV added. In `--mcp all`, offline

@@ -1,6 +1,7 @@
 {
   "permissions": {
-    "defaultMode": "bypassPermissions"
+    "defaultMode": "bypassPermissions",
+    "allow": ["mcp__jev__jev_decide"]
   },
   "skipDangerousModePermissionPrompt": true
 }
