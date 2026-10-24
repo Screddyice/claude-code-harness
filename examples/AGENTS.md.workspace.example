@@ -1,8 +1,16 @@
 # Workspace AGENTS.md
 
-This file is a **template** for a multi-company Codex workspace directory such as
+This file is a **template** for a multi-company agent workspace directory such as
 `~/projects/`. Replace `<COMPANY_A>`, `<COMPANY_B>`, and `<COMPANY_C>` with your own
 organizations.
+
+## Current runtime and work state
+
+Follow the host's global instruction profile for current runtime, Corpus retrieval,
+JEV routing and automatic review. Read the nearest repository instructions before
+work. Use ClaudeMem `work_state_read(includeClosed=true)` / `work_state_write`
+for task state, one named list per task; close it only after verification.
+Do not recreate retired feature/checkpoint state to track work.
 
 ## Workspace Overview
 
@@ -40,17 +48,12 @@ Anti-patterns:
 - Do not commit `.env`, OAuth tokens, API keys, generated auth caches, or private logs.
 - Do not assume "the server" means the same host across companies.
 
-## Codex Configuration
+## Claude Configuration
 
-User-level Codex config lives at `~/.codex/config.toml`. Keep durable project guidance
-in `AGENTS.md`, not in one-off prompts.
-
-Recommended defaults:
-
-- Use workspace-write sandboxing for normal coding.
-- Use `on-request` approvals for interactive work.
-- Use company-specific MCP names and environment variables.
-- Register MCP servers with `codex mcp add`, then verify with `codex mcp list`.
+Claude uses `~/.claude/settings.json` by default. When `CLAUDE_CONFIG_DIR` is set,
+inspect that profile's settings and MCP registrations instead. Keep shared project
+instructions separate from personal overlays and credentials. Configure and verify
+each profile deliberately; a change in one does not prove another is configured.
 
 ## Per-Company Infrastructure Pattern
 

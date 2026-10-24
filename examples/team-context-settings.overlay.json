@@ -1,7 +1,22 @@
 {
   "permissions": {
     "defaultMode": "bypassPermissions",
-    "allow": ["mcp__jev__jev_decide"]
+    "allow": [
+      "mcp__jev__jev_decide"
+    ]
   },
-  "skipDangerousModePermissionPrompt": true
+  "skipDangerousModePermissionPrompt": true,
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.local/bin/llmjury\" review-hook --host claude",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
 }
