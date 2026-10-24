@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.local/bin/llmjury\" review-hook --host claude",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}

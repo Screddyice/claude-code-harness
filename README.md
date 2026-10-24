@@ -1,4 +1,4 @@
-> **claude-mem is the only memory layer on this machine.** See "Memory" below.
+> **Current profile: 2026-10-23.** ClaudeMem task state and native host memory are distinct; see the current profile below.
 
 # claude-code-harness
 
@@ -10,6 +10,24 @@ Keep Codex configuration and Codex plugin manifests there. This repository does 
 install or register Codex plugins.
 
 Runtime logs for the GUI environment LaunchAgent live under `~/.local/state/`; the example stays independent of optional learning or project-specific directories.
+
+## Current profile (2026-10-23)
+
+The current setup uses stock Claude Code, ClaudeMem work state, Corpus retrieval,
+JEV routing and optional Claude ↔ Codex review. The sanitized
+[global instructions](examples/CLAUDE.md.global.example) and
+[current profile](docs/current-harness.md) capture that setup without credentials,
+private organization context, sessions or memory databases.
+
+[The review-only hook example](examples/hooks.json.example) uses
+`llmjury review-hook --host claude`. Merge it into every intended active profile;
+install the CLI separately and preserve existing hooks. The settings overlay also
+retains this review registration when reapplied. An optional copy of the installed
+browser shim is included; it only runs when explicitly registered.
+
+The remaining sections document optional utilities and historical setup details;
+their presence does not mean the current profile installs them. Retired
+feature/checkpoint scaffolding is not required.
 
 ## What's Inside
 
