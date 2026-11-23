@@ -8,6 +8,15 @@ WATCHDOG="$HERE/kernel-zone-watchdog.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Never post real desktop notifications from a test run: the thresholds below are
+# 1 byte, so every live sample "crosses" them. A stub osascript on PATH records any
+# call that slips through, and KERNEL_ZONE_WATCHDOG_NO_NOTIFY turns notify() off.
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\necho "$*" >> "%s/osascript.calls"\n' "$TMP" > "$TMP/bin/osascript"
+chmod +x "$TMP/bin/osascript"
+export PATH="$TMP/bin:$PATH"
+export KERNEL_ZONE_WATCHDOG_NO_NOTIFY=1
+
 pass=0; fail=0
 ok()   { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
 bad()  { printf 'FAIL %s\n   %s\n' "$1" "${2:-}"; fail=$((fail+1)); }
@@ -92,6 +101,26 @@ grep -q '^growth:' <<< "$out" && ok "--report computes a growth rate" \
 # 10. Unknown options fail loudly rather than sampling silently
 run "$WATCHDOG" --bogus >/dev/null 2>&1
 [ $? -eq 64 ] && ok "unknown option exits 64" || bad "unknown option exits 64"
+
+# 11. KERNEL_ZONE_WATCHDOG_NO_NOTIFY=1 keeps an alert off the desktop
+rm -rf "$TMP/state" "$TMP/osascript.calls"
+KERNEL_ZONE_WATCHDOG_STATE="$TMP/state" KERNEL_ZONE_WARN_BYTES=1 KERNEL_ZONE_CRIT_BYTES=1 \
+  "$WATCHDOG" >/dev/null 2>&1
+if [ ! -e "$TMP/osascript.calls" ]; then
+  ok "NO_NOTIFY=1 suppresses desktop notifications"
+else
+  bad "NO_NOTIFY=1 suppresses desktop notifications" "$(cat "$TMP/osascript.calls")"
+fi
+
+# 12. Without the opt-out, an alert still notifies (via the stub, not the desktop)
+rm -rf "$TMP/state" "$TMP/osascript.calls"
+KERNEL_ZONE_WATCHDOG_NO_NOTIFY=0 KERNEL_ZONE_WATCHDOG_STATE="$TMP/state" \
+  KERNEL_ZONE_WARN_BYTES=1 KERNEL_ZONE_CRIT_BYTES=1 "$WATCHDOG" >/dev/null 2>&1
+if grep -q 'CRITICAL' "$TMP/osascript.calls" 2>/dev/null; then
+  ok "alerts still notify when NO_NOTIFY is unset"
+else
+  bad "alerts still notify when NO_NOTIFY is unset" "no osascript call recorded"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
