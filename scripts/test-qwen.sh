@@ -939,7 +939,7 @@ fi
 # When the session model is its own side-query model, the provider list must not
 # register the same id twice; the side-query entry turns reasoning off.
 reset_world
-TEST_QWEN_MODEL= run_qwen code >/dev/null
+TEST_QWEN_MODEL='' run_qwen code >/dev/null
 cfg=$(grep '^QWEN_CODE_SYSTEM_DEFAULTS_PATH=' "$FIXTURE/qwen-code.env" | cut -d= -f2-)
 if [ -s "$cfg" ] && [ "$(jq '.modelProviders.openai | length' "$cfg")" = 1 ] &&
    [ "$(jq -r '.modelProviders.openai[0].id' "$cfg")" = '${QWEN_SESSION_MODEL}' ] &&
@@ -1061,7 +1061,7 @@ else
 fi
 
 reset_world
-TEST_QWEN_MODEL= run_qwen code >/dev/null
+TEST_QWEN_MODEL='' run_qwen code >/dev/null
 if grep -qxF 'QWEN_FAST_MODEL=qwen3.5:4b-256k' "$FIXTURE/qwen-code.env" &&
    grep -qxF 'QWEN_SESSION_MODEL=qwen3.5:4b-256k' "$FIXTURE/qwen-code.env"; then
   pass "a 4B session is its own side-query model"
@@ -1205,7 +1205,7 @@ esac
 # --- 4B default and explicit 27B selection -----------------------------------
 
 reset_world
-TEST_QWEN_MODEL= run_qwen 'build this project' >/dev/null
+TEST_QWEN_MODEL='' run_qwen 'build this project' >/dev/null
 if grep -qxF 'qwen3.5:4b-256k' "$FIXTURE/qwen-code.argv" &&
    grep -qxF 'build this project' "$FIXTURE/qwen-code.argv"; then
   pass "unconfigured qwen selects 4B and preserves the prompt"
@@ -1219,7 +1219,7 @@ else
   fail "Qwen Code context window is 256K"
 fi
 reset_world
-TEST_QWEN_MODEL= run_qwen claude >/dev/null
+TEST_QWEN_MODEL='' run_qwen claude >/dev/null
 if [ "$(claude_env CLAUDE_CODE_MAX_CONTEXT_TOKENS)" = "262144" ]; then
   pass "Claude sees the selected 4B model's 256K window"
 else
@@ -1239,7 +1239,7 @@ for entry in '' code agent claude codex raw; do
 done
 
 reset_world
-TEST_QWEN_MODEL= run_qwen 27B code hello >/dev/null
+TEST_QWEN_MODEL='' run_qwen 27B code hello >/dev/null
 if grep -qxF "$MODEL" "$FIXTURE/qwen-code.argv"; then
   pass "27B uppercase selector uses the heavy model"
 else
@@ -1248,7 +1248,7 @@ fi
 
 reset_world
 set_alias "$MODEL"
-TEST_QWEN_MODEL= run_qwen claude >/dev/null
+TEST_QWEN_MODEL='' run_qwen claude >/dev/null
 if grep -qxF "cp qwen3.5:4b-256k $ALIAS" "$FIXTURE/ollama.log" &&
    [ "$(claude_env QWEN_SESSION_MODEL)" = 'qwen3.5:4b-256k' ]; then
   pass "Claude refreshes an idle 27B alias to 4B"
@@ -1259,7 +1259,7 @@ fi
 reset_world
 set_alias "$MODEL"
 printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
-if out=$(TEST_QWEN_MODEL= run_qwen claude); then
+if out=$(TEST_QWEN_MODEL='' run_qwen claude); then
   fail "an active stale alias blocks a model switch" "$out"
 elif [ ! -s "$FIXTURE/ollama.log" ]; then
   pass "an active stale alias is neither changed nor unloaded"
@@ -1270,12 +1270,12 @@ fi
 reset_world
 set_alias "$MODEL"
 printf '{"models":[{"name":"%s","size":17551390145}]}\n' "$ALIAS" > "$FIXTURE/ps.json"
-out=$(TEST_QWEN_MODEL= run_qwen status)
+out=$(TEST_QWEN_MODEL='' run_qwen status)
 case "$out" in
   *"qwen3.5:4b-256k"*"not loaded"*"also resident: $ALIAS"*) pass "4B status does not claim a resident 27B alias" ;;
   *) fail "4B status distinguishes a foreign alias" "$out" ;;
 esac
-TEST_QWEN_MODEL= run_qwen stop >/dev/null
+TEST_QWEN_MODEL='' run_qwen stop >/dev/null
 if grep -qxF "stop $ALIAS" "$FIXTURE/ollama.log"; then
   fail "4B stop must not unload a 27B alias"
 else
@@ -1293,7 +1293,7 @@ case "$out" in
 esac
 mkdir -p "$FIXTURE/state/qwen3.5_4b-256k"
 echo 1 > "$FIXTURE/state/qwen3.5_4b-256k/resident-bytes"
-out=$(TEST_QWEN_MODEL= run_qwen raw hello)
+out=$(TEST_QWEN_MODEL='' run_qwen raw hello)
 case "$out" in
   *"RAN run qwen3.5:4b-256k hello"*) pass "4B admission uses its own recorded measurement" ;;
   *) fail "4B measurement is usable" "$out" ;;

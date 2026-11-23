@@ -2,7 +2,7 @@
 # Read-only audit for the Claude harness and its plugin boundary.
 set -uo pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 claude_home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 failures=0
 

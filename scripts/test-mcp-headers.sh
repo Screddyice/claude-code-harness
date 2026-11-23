@@ -36,9 +36,18 @@ out=$(run ENV_KEY=env-value python3 "$SCRIPT" Authorization ENV_KEY Bearer)
 [ "$(printf '%s' "$out" | header Authorization)" = "Bearer env-value" ] \
   && ok "prefixes the scheme" || no "scheme" "$out"
 
-out=$(run python3 "$SCRIPT" x-api-key LAUNCHD_ONLY_KEY)
-[ "$(printf '%s' "$out" | header x-api-key)" = launchd-value ] \
-  && ok "falls back to launchctl" || no "launchctl fallback" "$out"
+# The launchctl fallback is macOS-only by design (mcp-headers.py checks
+# sys.platform). Elsewhere, such as the Linux CI agent, assert that the stub is
+# never consulted instead of expecting its value.
+if [ "$(uname -s)" = Darwin ]; then
+  out=$(run python3 "$SCRIPT" x-api-key LAUNCHD_ONLY_KEY)
+  [ "$(printf '%s' "$out" | header x-api-key)" = launchd-value ] \
+    && ok "falls back to launchctl" || no "launchctl fallback" "$out"
+else
+  out=$(run python3 "$SCRIPT" x-api-key LAUNCHD_ONLY_KEY 2>/dev/null); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] \
+    && ok "ignores launchctl off macOS" || no "launchctl ignored off macOS" "rc=$rc out=$out"
+fi
 
 out=$(run python3 "$SCRIPT" x-api-key FILE_KEY)
 [ "$(printf '%s' "$out" | header x-api-key)" = file-value ] \

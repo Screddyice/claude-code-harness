@@ -13,7 +13,6 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 0
 fi
 
-session_id=$(printf '%s' "$input" | jq -r '.session_id // empty')
 model=$(printf '%s' "$input" | jq -r '.model.display_name // empty')
 cwd=$(printf '%s' "$input" | jq -r '.cwd // empty')
 

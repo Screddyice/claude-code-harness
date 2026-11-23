@@ -53,6 +53,7 @@ FAST_MODEL="${QWEN_FAST_MODEL:-qwen3.5:4b-256k}"
 case "${1:-}" in
   27b|27B) MODEL="qwen3.8:27b-obliterated"; shift ;;
 esac
+# shellcheck disable=SC2034  # kept as the documented unit constant; not read yet
 GB=$((1024 ** 3))
 LEASE_DIR="${LLMJURY_COMPUTE_LEASE_DIR:-$HOME/.cache/llmjury/compute-leases}"
 LOCK_PATH="${LLMJURY_LOCAL_LOCK:-$HOME/.cache/llmjury/local-compute.lock}"
@@ -818,6 +819,7 @@ PYMCP
       fi ;;
     cmem)
       ensure_cmem_token || die "CMEM_PRO_TOKEN is not set and not readable from ~/projects/.env; use --mcp none or --mcp all"
+      # shellcheck disable=SC2155  # jq only quotes a literal here; splitting would not change the outcome
       local mcp_inline="cmem = { url = $(jq -Rn --arg u "$CMEM_URL" '$u'), bearer_token_env_var = \"CMEM_PRO_TOKEN\" }"
       if [ "$jev_ready" = 1 ]; then
         mcp_inline="$mcp_inline, jev = { command = $(jq -Rn --arg c "$jev_command" '$c'), env_vars = [\"JEV_OPENROUTER_API_KEY\"], enabled = true }"
@@ -1053,6 +1055,7 @@ case "${1:-}" in
   *)            cmd_code "$@"; exit $? ;;
 esac
 
+# shellcheck disable=SC2034  # --force is accepted for compatibility (see usage); macOS/Ollama decide memory
 while [ $# -gt 0 ]; do
   case "$1" in
     --force)       force=1; shift ;;
