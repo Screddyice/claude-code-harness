@@ -1580,3 +1580,28 @@ bash scripts/audit-stale-instructions.sh
 ```
 
 `CLAUDE.md` carries the agent instructions.
+
+## CI
+
+Crow runs `.woodpecker.yaml` on every push and pull request, on the linux/arm64 agent
+on Shawn's Mac. A green `ci/crow/...` status on the PR head is the merge check. The
+pipeline has two steps. The first runs `shellcheck -S warning` over every shell script,
+including the extensionless ones such as `scripts/qwen` and `scripts/gbrowse`. The second
+parses every script, runs `scripts/verify.sh` and both audits, then runs each
+`scripts/test-*` file.
+
+Three tests drive tools that only exist on macOS, so CI skips them and they still need a
+run on the Mac before you change the scripts they cover:
+`test-claude-resilient-updater.sh` (BSD `stat -f`), `test-kernel-zone-watchdog.sh`
+(`zprint`, `vm_stat`, `launchctl`) and `test-set-gui-env.sh` (`PlistBuddy`).
+`test-mcp-headers.sh` checks the `launchctl` fallback on macOS and, elsewhere, checks that
+the fallback is never consulted.
+
+To run the same pipeline locally:
+
+```bash
+DOCKER_HOST=unix://$HOME/.colima/default/docker.sock ~/.local/bin/crow exec --local \
+  --repo-path "$PWD" --backend-engine docker --pipeline-event push \
+  --commit-branch "$(git branch --show-current)" --commit-sha "$(git rev-parse HEAD)" \
+  --repo Screddyice/claude-code-harness .woodpecker.yaml
+```
