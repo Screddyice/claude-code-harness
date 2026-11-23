@@ -1026,7 +1026,12 @@ vm.pages.array                             48      2273042     104.1 MB
 **Thresholds are set far apart on purpose.** Idle `data.kalloc.1024` on this machine
 sits near 1,500 elements — about 2 MB. Warning fires at 1 GiB and critical at 6 GiB,
 both orders of magnitude above noise and hours ahead of the 20 GB that killed it.
-Override with `KERNEL_ZONE_WARN_BYTES` / `KERNEL_ZONE_CRIT_BYTES`.
+Override with `KERNEL_ZONE_WARN_BYTES` / `KERNEL_ZONE_CRIT_BYTES`. Set
+`KERNEL_ZONE_WATCHDOG_NO_NOTIFY=1` to keep alerts out of Notification Center (they still
+go to the system log and the snapshot directory). The test script sets it and puts a stub
+`osascript` on `PATH`. Its thresholds are 1 byte, so before this flag every test run
+showed real "Kernel zone leak — CRITICAL" notifications at normal zone sizes,
+with a temp-dir snapshot path.
 
 Crossing a threshold writes a snapshot under
 `~/.local/state/kernel-zone-watchdog/snapshots/` holding the full zone table, `vm_stat`,
